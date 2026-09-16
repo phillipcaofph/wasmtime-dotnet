@@ -23,32 +23,21 @@ namespace Wasmtime
             }
 
             var exports = new Export[(int)this.size];
-            for (int i = 0; i < (int)this.size; ++i)
+            for (var i = 0; i < (int)this.size; ++i)
             {
                 var exportType = this.data[i];
                 var externType = Native.wasm_exporttype_type(exportType);
 
-                switch ((WasmExternKind)Native.wasm_externtype_kind(externType))
+                var kind = (WasmExternKind)Native.wasm_externtype_kind(externType);
+                exports[i] = kind switch
                 {
-                    case WasmExternKind.Func:
-                        exports[i] = new FunctionExport(exportType, externType);
-                        break;
-
-                    case WasmExternKind.Global:
-                        exports[i] = new GlobalExport(exportType, externType);
-                        break;
-
-                    case WasmExternKind.Table:
-                        exports[i] = new TableExport(exportType, externType);
-                        break;
-
-                    case WasmExternKind.Memory:
-                        exports[i] = new MemoryExport(exportType, externType);
-                        break;
-
-                    default:
-                        throw new NotSupportedException("Unsupported export extern type.");
-                }
+                    WasmExternKind.Func   => new FunctionExport(exportType, externType),
+                    WasmExternKind.Global => new GlobalExport(exportType, externType),
+                    WasmExternKind.Table  => new TableExport(exportType, externType),
+                    WasmExternKind.Memory => new MemoryExport(exportType, externType),
+                    WasmExternKind.Tag    => new TagExport(exportType, externType),
+                    _ => throw new NotSupportedException($"Unsupported export extern type: {kind}.")
+                };
             }
 
             return exports;
@@ -78,21 +67,16 @@ namespace Wasmtime
             unsafe
             {
                 var name = Native.wasm_exporttype_name(exportType);
-                if (name->size == 0)
-                {
-                    Name = String.Empty;
-                }
-                else
-                {
-                    Name = Extensions.PtrToStringUTF8((IntPtr)name->data, checked((int)name->size));
-                }
+                Name = name->size == 0
+                     ? string.Empty
+                     : Extensions.PtrToStringUTF8((IntPtr)name->data, checked((int)name->size));
             }
         }
 
         /// <summary>
         /// The name of the export.
         /// </summary>
-        public string Name { get; private set; }
+        public string Name { get; }
 
         /// <inheritdoc/>
         public override string ToString()
@@ -269,6 +253,47 @@ namespace Wasmtime
         {
             [DllImport(Engine.LibraryName)]
             public static extern IntPtr wasm_externtype_as_tabletype_const(IntPtr type);
+        }
+    }
+
+    /// <summary>
+    /// Represents a tag exported from a WebAssembly module or instance.
+    /// </summary>
+    public class TagExport
+        : Export
+    {
+        /// <summary>
+        /// Parameter types of this tag
+        /// </summary>
+        public ValueKind[] Parameters { get; set; }
+
+        internal TagExport(IntPtr exportType, IntPtr externType) : base(exportType)
+        {
+            var tagType = Native.wasm_externtype_as_tagtype_const(externType);
+            if (tagType == IntPtr.Zero)
+            {
+                throw new InvalidOperationException();
+            }
+
+            var funcType = Native.wasm_tagtype_functype(tagType);
+            if (funcType == IntPtr.Zero)
+            {
+                throw new InvalidOperationException();
+            }
+
+            unsafe
+            {
+                Parameters = (*Function.Native.wasm_functype_params(funcType)).ToArray();
+            }
+        }
+
+        internal static class Native
+        {
+            [DllImport(Engine.LibraryName)]
+            public static extern IntPtr wasm_externtype_as_tagtype_const(IntPtr type);
+
+            [DllImport(Engine.LibraryName)]
+            public static extern IntPtr wasm_tagtype_functype(IntPtr tagType);
         }
     }
 }

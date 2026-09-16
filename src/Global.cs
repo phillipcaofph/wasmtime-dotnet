@@ -131,7 +131,7 @@ namespace Wasmtime
             }
             finally
             {
-                value.Release(store);
+                value.Dispose();
             }
         }
 
@@ -152,7 +152,7 @@ namespace Wasmtime
             }
             finally
             {
-                v.Release(store);
+                v.Dispose();
             }
         }
 
@@ -176,7 +176,7 @@ namespace Wasmtime
             }
             finally
             {
-                v.Release(store);
+                v.Dispose();
             }
         }
 
@@ -303,10 +303,7 @@ namespace Wasmtime
             /// <summary>
             /// Gets the mutability of the global.
             /// </summary>
-            public Mutability Mutability
-            {
-                get => _global.Mutability;
-            }
+            public Mutability Mutability => _global.Mutability;
 
             /// <summary>
             /// Gets the value of the global.
@@ -325,7 +322,7 @@ namespace Wasmtime
                 }
                 finally
                 {
-                    v.Release(_store);
+                    v.Dispose();
                 }
             }
 
@@ -350,7 +347,7 @@ namespace Wasmtime
                 }
                 finally
                 {
-                    v.Release(_store);
+                    v.Dispose();
                 }
             }
 
