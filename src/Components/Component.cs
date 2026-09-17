@@ -1,4 +1,5 @@
 ﻿using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -100,6 +101,23 @@ public class Component
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Creates a <see cref="Component"/> from a file in the WebAssembly text format.
+    /// </summary>
+    /// <param name="engine">The engine to use for the component.</param>
+    /// <param name="path">The path to the file.</param>
+    /// <returns>Returns a new <see cref="Component"/>.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if an argument is null.</exception>
+    public static Component FromTextFile(Engine engine, string path)
+    {
+        if (path is null)
+        {
+            throw new ArgumentNullException(nameof(path));
+        }
+
+        return FromText(engine, File.ReadAllText(path));
     }
 
     /// <summary>
@@ -248,5 +266,8 @@ public class Component
 
         [DllImport(Engine.LibraryName)]
         public static extern unsafe IntPtr wasmtime_component_get_export_index(Handle component, IntPtr instance_export_index, byte* name, nuint name_len);
+
+        [DllImport(Engine.LibraryName)]
+        public static extern unsafe IntPtr wasmtime_wat2wasm(byte* text, nuint len, out ByteArray bytes);
     }
 }

@@ -22,6 +22,10 @@ namespace Wasmtime.Tests
         public Component LoadComponent(string fileName) =>
             Component.FromText(Engine, File.ReadAllText(Path.Combine("Components", fileName)));
 
+        public Store CreateStore() => new Store(Engine);
+
+        public Component Strings() => LoadComponent("strings.wat");
+
         public void Dispose()
         {
             if (!(Store is null))

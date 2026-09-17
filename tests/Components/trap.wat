@@ -1,7 +1,4 @@
 ;; Component whose exported function always traps, used to test trap behaviour.
-;;
-;; Rebuild with:
-;;   wasm-tools parse tests/Components/trap.wat -o tests/Components/trap.wasm
 (component
   (core module $m
     (func (export "boom") (result i32)

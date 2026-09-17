@@ -21,6 +21,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "consumefuel", "examples\con
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "storedata", "examples\storedata\storedata.csproj", "{E8749BAF-9D8B-4CF9-ACFF-490E86D52A20}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "component", "examples\component\component.csproj", "{35CE1A43-6F41-4747-82DB-6BFEE10297EC}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -63,6 +65,10 @@ Global
 		{E8749BAF-9D8B-4CF9-ACFF-490E86D52A20}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{E8749BAF-9D8B-4CF9-ACFF-490E86D52A20}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{E8749BAF-9D8B-4CF9-ACFF-490E86D52A20}.Release|Any CPU.Build.0 = Release|Any CPU
+		{35CE1A43-6F41-4747-82DB-6BFEE10297EC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{35CE1A43-6F41-4747-82DB-6BFEE10297EC}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{35CE1A43-6F41-4747-82DB-6BFEE10297EC}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{35CE1A43-6F41-4747-82DB-6BFEE10297EC}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
