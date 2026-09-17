@@ -270,6 +270,54 @@ namespace Wasmtime.Tests
         }
 
         /// <summary>
+        /// Host function results are written with <see cref="ComponentValueMarshaller.WriteOwned"/>
+        /// and then freed by Wasmtime, so every heap payload must come from Wasmtime's allocator.
+        /// Freeing memory allocated by the wrong allocator corrupts the heap, so this deletes the
+        /// value after reading it back.
+        /// </summary>
+        [Fact]
+        public void OwnedWritesUseWasmtimesAllocator()
+        {
+            var values = new[]
+            {
+                ComponentValue.S32(7),
+                ComponentValue.String("a host-allocated string"),
+                ComponentValue.String(string.Empty),
+                ComponentValue.Enum("warning"),
+                ComponentValue.List(new[] { ComponentValue.String("a"), ComponentValue.String("b") }),
+                ComponentValue.Record(new[]
+                {
+                    new KeyValuePair<string, ComponentValue>("name", ComponentValue.String("x")),
+                    new KeyValuePair<string, ComponentValue>("value", ComponentValue.F64(1.5)),
+                }),
+                ComponentValue.Some(ComponentValue.String("boxed")),
+                ComponentValue.None(),
+                ComponentValue.Ok(ComponentValue.S32(1)),
+                ComponentValue.Err(ComponentValue.String("boom")),
+            };
+
+            foreach (var value in values)
+            {
+                var destination = Marshal.AllocHGlobal(ComponentValueMarshaller.ValueSize);
+                try
+                {
+                    unsafe
+                    {
+                        new Span<byte>((void*)destination, ComponentValueMarshaller.ValueSize).Clear();
+                    }
+
+                    ComponentValueMarshaller.WriteOwned(value, destination);
+                    AssertEquivalent(value, ComponentValueMarshaller.Read(destination), "$");
+                }
+                finally
+                {
+                    ComponentValueNative.wasmtime_component_val_delete(destination);
+                    Marshal.FreeHGlobal(destination);
+                }
+            }
+        }
+
+        /// <summary>
         /// A large list exercises the element stride, which a single-element list cannot: an
         /// over-estimated <see cref="ComponentValueMarshaller.ValueSize"/> still round-trips one
         /// element correctly but misaligns every element after the first.

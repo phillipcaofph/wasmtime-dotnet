@@ -156,6 +156,27 @@ internal static class ComponentValueMarshaller
     }
 
     /// <summary>
+    /// Writes a value into storage whose contents Wasmtime will free, as required for the
+    /// results of a host-defined function.
+    /// </summary>
+    /// <param name="value">The value to write.</param>
+    /// <param name="destination">A pointer to <see cref="ValueSize"/> bytes of storage.</param>
+    /// <remarks>
+    /// The value is first built with our own allocator and then deep-copied by Wasmtime, so that
+    /// every heap payload it ends up owning came from its own allocator. The extra copy is the
+    /// price of not having to mirror each vec constructor.
+    /// </remarks>
+    public static void WriteOwned(ComponentValue value, IntPtr destination)
+    {
+        using (var scope = new AllocationScope())
+        {
+            var scratch = scope.Allocate(ValueSize);
+            Write(value, scratch, scope);
+            ComponentValueNative.wasmtime_component_val_clone(scratch, destination);
+        }
+    }
+
+    /// <summary>
     /// Reads a value from native storage.
     /// </summary>
     /// <param name="source">A pointer to a <c>wasmtime_component_val_t</c>.</param>

@@ -22,6 +22,8 @@
 
   <ItemGroup>
     <None Update="Modules/*.wat" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Components/*.wat" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Components/*.wasm" CopyToOutputDirectory="PreserveNewest" />
     <EmbeddedResource Include="Modules/hello.wat" LogicalName="hello.wat" />
     <EmbeddedResource Include="Modules/hello.wasm" LogicalName="hello.wasm" />
   </ItemGroup>
