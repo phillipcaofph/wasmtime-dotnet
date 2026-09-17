@@ -99,6 +99,79 @@ $ dotnet run
 
 This should print `Hello from C#!`.
 
+## Components
+
+Types in the `Wasmtime.Components` namespace implement the
+[component model](https://component-model.bytecodealliance.org/). A component is
+loaded with `Component`, its imports are satisfied by a `ComponentLinker`, and
+values crossing the boundary are represented by `ComponentValue`.
+
+The component model must be enabled on the engine's `Config`:
+
+```c#
+using System;
+using Wasmtime;
+using Wasmtime.Components;
+
+using var engine = new Engine(new Config().WithComponentModel(true));
+using var component = Component.FromTextFile(engine, "greeter.wat");
+using var linker = new ComponentLinker(engine);
+using var store = new Store(engine);
+
+// Define the functions the component imports.
+using (var root = linker.Root())
+using (var host = root.AddInstance("host"))
+{
+    host.DefineFunction("name", (arguments, results) =>
+        results[0] = ComponentValue.String("WebAssembly"));
+}
+
+var instance = linker.Instantiate(store, component);
+var greet = instance.GetFunction("greet")!;
+
+Console.WriteLine(greet.Call()!.AsString());
+```
+
+Functions exported by an interface rather than by the world root are looked up
+with the interface name:
+
+```c#
+var process = instance.GetFunction("my:pkg/processor@1.0.0", "process")!;
+```
+
+A component function takes any number of parameters but has at most one result,
+so `Call` returns a single `ComponentValue`, or `null` when the function returns
+nothing. Note that a function declared in WIT as returning `result<_, E>` does
+have a result here, even though bindings generators usually present it as
+returning nothing.
+
+Values are created with the static factories on `ComponentValue` and read back
+with its typed accessors:
+
+```c#
+var record = ComponentValue.Record(new[]
+{
+    new KeyValuePair<string, ComponentValue>("value", ComponentValue.F64(36.6)),
+    new KeyValuePair<string, ComponentValue>("unit", ComponentValue.Enum("celsius")),
+});
+
+var reading = result.Field("value").AsF64();
+```
+
+`bool`, the integer and float types, `string`, `enum`, `list`, `tuple`,
+`record`, `option` and `result` are supported. `char`, `variant`, `flags`,
+`map` and resources are not yet implemented.
+
+Two behaviours are worth knowing about:
+
+- A trap leaves the whole `Store` unusable for further component calls, not just
+  the instance that trapped. A store cannot be reused after a trap.
+- `ComponentLinker.Root()` and `ComponentLinkerInstance.AddInstance()` take
+  exclusive access to what they came from, so the returned instance must be
+  disposed before the linker is used again.
+
+See `examples/component` for a complete example.
+
 ## Contributing
 
 ### Building

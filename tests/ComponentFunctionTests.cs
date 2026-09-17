@@ -213,5 +213,74 @@ namespace Wasmtime.Tests
                 .Should().Throw<WasmtimeException>()
                 .WithMessage("*cannot enter component instance*");
         }
+
+        private ComponentInstance InstantiateStrings(ComponentLinker linker, Store store)
+        {
+            using var component = fixture.Strings();
+            return linker.Instantiate(store, component);
+        }
+
+        [Theory]
+        [InlineData("world", "hi world")]
+        [InlineData("", "hi ")]
+        [InlineData("h\u00e9llo", "hi h\u00e9llo")]
+        [InlineData("\u4e16\u754c", "hi \u4e16\u754c")]
+        [InlineData("\ud83c\udf89", "hi \ud83c\udf89")]
+        public void ItPassesAndReturnsStrings(string name, string expected)
+        {
+            using var store = fixture.CreateStore();
+            using var linker = new ComponentLinker(fixture.Engine);
+            var greet = InstantiateStrings(linker, store).GetFunction("greet")!;
+
+            greet.Call(ComponentValue.String(name))!.AsString().Should().Be(expected);
+        }
+
+        /// <summary>
+        /// The guest reports the byte length it was given, so this fails if the argument was
+        /// encoded as anything other than UTF-8.
+        /// </summary>
+        [Theory]
+        [InlineData("abc", 3)]
+        [InlineData("h\u00e9llo", 6)]
+        [InlineData("\u4e16\u754c", 6)]
+        [InlineData("\ud83c\udf89", 4)]
+        [InlineData("", 0)]
+        public void ItPassesStringsAsUtf8(string name, int expectedByteLength)
+        {
+            using var store = fixture.CreateStore();
+            using var linker = new ComponentLinker(fixture.Engine);
+            var length = InstantiateStrings(linker, store).GetFunction("length")!;
+
+            length.Call(ComponentValue.String(name))!.AsS32().Should().Be(expectedByteLength);
+        }
+
+        [Fact]
+        public void ItReturnsALongStringFromTheGuest()
+        {
+            using var store = fixture.CreateStore();
+            using var linker = new ComponentLinker(fixture.Engine);
+            var greet = InstantiateStrings(linker, store).GetFunction("greet")!;
+
+            var name = new string('x', 10_000);
+
+            greet.Call(ComponentValue.String(name))!.AsString().Should().Be("hi " + name);
+        }
+
+        [Fact]
+        public void ItReturnsAListFromTheGuest()
+        {
+            using var store = fixture.CreateStore();
+            using var linker = new ComponentLinker(fixture.Engine);
+            var numbers = InstantiateStrings(linker, store).GetFunction("numbers")!;
+
+            numbers.ParameterCount.Should().Be(0);
+
+            var result = numbers.Call()!.AsList();
+
+            result.Should().HaveCount(3);
+            result[0].AsS32().Should().Be(10);
+            result[1].AsS32().Should().Be(20);
+            result[2].AsS32().Should().Be(30);
+        }
     }
 }

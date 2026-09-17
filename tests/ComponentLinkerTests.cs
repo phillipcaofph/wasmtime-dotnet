@@ -31,6 +31,8 @@ namespace Wasmtime.Tests
 
         public Component Trap() => Component.FromBytes(Engine, File.ReadAllBytes("Components/trap.wasm"));
 
+        public Component Strings() => Component.FromBytes(Engine, File.ReadAllBytes("Components/strings.wasm"));
+
         public void Dispose()
         {
             Engine.Dispose();

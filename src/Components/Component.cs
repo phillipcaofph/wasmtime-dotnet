@@ -1,4 +1,5 @@
 ﻿using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -65,8 +66,61 @@ public class Component
         }
     }
 
+    /// <summary>    /// Creates a <see cref="Component"/> from the WebAssembly text format.
+    /// </summary>
+    /// <param name="engine">The engine to use for the component.</param>
+    /// <param name="text">The component in the WebAssembly text format.</param>
+    /// <returns>Returns a new <see cref="Component"/>.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if an argument is null.</exception>
+    public static Component FromText(Engine engine, string text)
+    {
+        if (engine is null)
+        {
+            throw new ArgumentNullException(nameof(engine));
+        }
+
+        if (text is null)
+        {
+            throw new ArgumentNullException(nameof(text));
+        }
+
+        unsafe
+        {
+            var textBytes = Encoding.UTF8.GetBytes(text);
+            fixed (byte* ptr = textBytes)
+            {
+                var error = Native.wasmtime_wat2wasm(ptr, (nuint)textBytes.Length, out var componentBytes);
+                if (error != IntPtr.Zero)
+                {
+                    throw WasmtimeException.FromOwnedError(error);
+                }
+
+                using (var array = componentBytes)
+                {
+                    return FromBytes(engine, new ReadOnlySpan<byte>(array.data, checked((int)array.size)));
+                }
+            }
+        }
+    }
+
     /// <summary>
-    /// This function serializes compiled component artifacts as blob data.
+    /// Creates a <see cref="Component"/> from a file in the WebAssembly text format.
+    /// </summary>
+    /// <param name="engine">The engine to use for the component.</param>
+    /// <param name="path">The path to the file.</param>
+    /// <returns>Returns a new <see cref="Component"/>.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if an argument is null.</exception>
+    public static Component FromTextFile(Engine engine, string path)
+    {
+        if (path is null)
+        {
+            throw new ArgumentNullException(nameof(path));
+        }
+
+        return FromText(engine, File.ReadAllText(path));
+    }
+
+    /// <summary>    /// This function serializes compiled component artifacts as blob data.
     /// </summary>
     /// <returns>If the conversion is successful, the serialized compiled component.</returns>
     public byte[] Serialize()
@@ -211,5 +265,8 @@ public class Component
 
         [DllImport(Engine.LibraryName)]
         public static extern unsafe IntPtr wasmtime_component_get_export_index(Handle component, IntPtr instance_export_index, byte* name, nuint name_len);
+
+        [DllImport(Engine.LibraryName)]
+        public static extern unsafe IntPtr wasmtime_wat2wasm(byte* text, nuint len, out ByteArray bytes);
     }
 }
