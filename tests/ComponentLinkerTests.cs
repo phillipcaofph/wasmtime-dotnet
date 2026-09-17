@@ -7,28 +7,32 @@ using Xunit;
 namespace Wasmtime.Tests
 {
     /// <summary>
-    /// Fixture providing an engine and store with the component model enabled, plus the
-    /// component binaries built from the WAT sources in <c>tests/Components</c>.
+    /// Fixture providing an engine with the component model enabled, plus the component binaries
+    /// built from the WAT sources in <c>tests/Components</c>.
     /// </summary>
     public class ComponentFixture : IDisposable
     {
         public ComponentFixture()
         {
             Engine = new Engine(new Config().WithComponentModel(true));
-            Store = new Store(Engine);
         }
 
         public Engine Engine { get; }
 
-        public Store Store { get; }
+        /// <summary>
+        /// Creates a store. A trap poisons its store for all further component calls, so tests
+        /// take one each rather than sharing.
+        /// </summary>
+        public Store CreateStore() => new Store(Engine);
 
         public Component Tiny() => Component.FromBytes(Engine, File.ReadAllBytes("Components/tiny.wasm"));
 
         public Component HostImport() => Component.FromBytes(Engine, File.ReadAllBytes("Components/host-import.wasm"));
 
+        public Component Trap() => Component.FromBytes(Engine, File.ReadAllBytes("Components/trap.wasm"));
+
         public void Dispose()
         {
-            Store.Dispose();
             Engine.Dispose();
         }
     }
@@ -52,10 +56,11 @@ namespace Wasmtime.Tests
         [Fact]
         public void ItInstantiatesAComponentWithoutImports()
         {
+            using var store = fixture.CreateStore();
             using var linker = new ComponentLinker(fixture.Engine);
             using var component = fixture.Tiny();
 
-            var instance = linker.Instantiate(fixture.Store, component);
+            var instance = linker.Instantiate(store, component);
 
             instance.Should().NotBeNull();
         }
@@ -63,51 +68,55 @@ namespace Wasmtime.Tests
         [Fact]
         public void ItThrowsWhenAnImportIsNotDefined()
         {
+            using var store = fixture.CreateStore();
             using var linker = new ComponentLinker(fixture.Engine);
             using var component = fixture.HostImport();
 
-            linker.Invoking(l => l.Instantiate(fixture.Store, component))
+            linker.Invoking(l => l.Instantiate(store, component))
                 .Should().Throw<WasmtimeException>();
         }
 
         [Fact]
         public void ItInstantiatesWithHostFunctionsDefined()
         {
+            using var store = fixture.CreateStore();
             using var linker = new ComponentLinker(fixture.Engine);
             using var component = fixture.HostImport();
 
             DefineHost(linker);
 
-            linker.Instantiate(fixture.Store, component).Should().NotBeNull();
+            linker.Instantiate(store, component).Should().NotBeNull();
         }
 
         [Fact]
         public void ItSatisfiesUnknownImportsWithTraps()
         {
+            using var store = fixture.CreateStore();
             using var linker = new ComponentLinker(fixture.Engine);
             using var component = fixture.HostImport();
 
             linker.DefineUnknownImportsAsTraps(component);
 
-            linker.Instantiate(fixture.Store, component).Should().NotBeNull();
+            linker.Instantiate(store, component).Should().NotBeNull();
         }
 
         [Fact]
         public void ItThrowsWhenUsingTheLinkerWhileTheRootIsAlive()
         {
+            using var store = fixture.CreateStore();
             using var linker = new ComponentLinker(fixture.Engine);
             using var component = fixture.Tiny();
 
             var root = linker.Root();
 
-            linker.Invoking(l => l.Instantiate(fixture.Store, component))
+            linker.Invoking(l => l.Instantiate(store, component))
                 .Should().Throw<InvalidOperationException>();
             linker.Invoking(l => l.Root())
                 .Should().Throw<InvalidOperationException>();
 
             root.Dispose();
 
-            linker.Instantiate(fixture.Store, component).Should().NotBeNull();
+            linker.Instantiate(store, component).Should().NotBeNull();
         }
 
         [Fact]
@@ -166,10 +175,11 @@ namespace Wasmtime.Tests
         [Fact]
         public void ItThrowsForNullArguments()
         {
+            using var store = fixture.CreateStore();
             using var linker = new ComponentLinker(fixture.Engine);
 
             linker.Invoking(l => l.Instantiate(null!, fixture.Tiny())).Should().Throw<ArgumentNullException>();
-            linker.Invoking(l => l.Instantiate(fixture.Store, null!)).Should().Throw<ArgumentNullException>();
+            linker.Invoking(l => l.Instantiate(store, null!)).Should().Throw<ArgumentNullException>();
             linker.Invoking(l => l.DefineUnknownImportsAsTraps(null!)).Should().Throw<ArgumentNullException>();
 
             using var root = linker.Root();
