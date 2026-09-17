@@ -170,22 +170,47 @@ public class Component
         return new Component(handle);
     }
 
+    /// <summary>
+    /// Looks up an export of this component by name.
+    /// </summary>
+    /// <param name="name">The name of the export.</param>
+    /// <returns>The export index, or null if there is no such export.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="name"/> is null.</exception>
     public ComponentExport? GetExport(string name)
     {
-        var ret = Native.wasmtime_component_get_export_index(NativeHandle, null, name, (nuint)name.Length);
-        if (ret == IntPtr.Zero)
-            return null;
-
-        return new ComponentExport(ret);
+        return GetExport(name, null);
     }
 
-    public ComponentExport? GetExport(string name, ComponentExport instance_export_index)
+    /// <summary>
+    /// Looks up an export of this component by name, within an exported instance.
+    /// </summary>
+    /// <param name="name">The name of the export.</param>
+    /// <param name="instance_export_index">The instance export to look within, or null for the root.</param>
+    /// <returns>The export index, or null if there is no such export.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="name"/> is null.</exception>
+    public ComponentExport? GetExport(string name, ComponentExport? instance_export_index)
     {
-        var ret = Native.wasmtime_component_get_export_index(NativeHandle, instance_export_index.NativeHandle, name, (nuint)name.Length);
-        if (ret == IntPtr.Zero)
-            return null;
+        if (name is null)
+        {
+            throw new ArgumentNullException(nameof(name));
+        }
 
-        return new ComponentExport(ret);
+        // The parent is optional, and a null SafeHandle cannot be marshalled, so pass it as a raw pointer.
+        var parent = instance_export_index?.NativeHandle.DangerousGetHandle() ?? IntPtr.Zero;
+        var nameBytes = Encoding.UTF8.GetBytes(name);
+
+        unsafe
+        {
+            fixed (byte* namePtr = nameBytes)
+            {
+                var ret = Native.wasmtime_component_get_export_index(
+                    NativeHandle, parent, namePtr, (nuint)nameBytes.Length);
+
+                GC.KeepAlive(instance_export_index);
+
+                return ret == IntPtr.Zero ? null : new ComponentExport(ret);
+            }
+        }
     }
 
     internal class Handle
@@ -222,6 +247,6 @@ public class Component
         public static extern IntPtr wasmtime_component_deserialize_file(Engine.Handle engine, string path, out IntPtr handle);
 
         [DllImport(Engine.LibraryName)]
-        public static extern IntPtr wasmtime_component_get_export_index(Handle component, ComponentExport.Handle? instance_export_index, string name, nuint name_len);
+        public static extern unsafe IntPtr wasmtime_component_get_export_index(Handle component, IntPtr instance_export_index, byte* name, nuint name_len);
     }
 }
