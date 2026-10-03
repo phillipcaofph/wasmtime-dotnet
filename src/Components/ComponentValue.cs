@@ -465,6 +465,21 @@ public sealed class ComponentValue
 
 internal static class ComponentValueNative
 {
+    [DllImport(Engine.LibraryName)]
+    public static extern void wasm_byte_vec_new_uninitialized(IntPtr value, nuint size);
+
+    [DllImport(Engine.LibraryName)]
+    public static extern void wasmtime_component_vallist_new_uninit(IntPtr value, nuint size);
+
+    [DllImport(Engine.LibraryName)]
+    public static extern void wasmtime_component_valrecord_new_uninit(IntPtr value, nuint size);
+
+    [DllImport(Engine.LibraryName)]
+    public static extern void wasmtime_component_valtuple_new_uninit(IntPtr value, nuint size);
+
+    [DllImport(Engine.LibraryName)]
+    public static extern IntPtr wasmtime_component_val_new(IntPtr value);
+
     /// <summary>
     /// Performs a deep copy of <paramref name="src"/> into <paramref name="dst"/>. The contents
     /// of <paramref name="dst"/> are owned by Wasmtime and must be released with
