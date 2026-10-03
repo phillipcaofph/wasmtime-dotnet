@@ -50,11 +50,6 @@ internal static class ComponentValueMarshaller
         private readonly List<IntPtr> allocations = new List<IntPtr>();
         private bool disposed;
 
-        ~AllocationScope()
-        {
-            FreeAllocations();
-        }
-
         /// <summary>
         /// Allocates zeroed native memory whose lifetime is bound to this scope.
         /// </summary>
@@ -88,7 +83,6 @@ internal static class ComponentValueMarshaller
 
             disposed = true;
             FreeAllocations();
-            GC.SuppressFinalize(this);
         }
 
         private void FreeAllocations()
@@ -284,13 +278,19 @@ internal static class ComponentValueMarshaller
 
     private static void WriteName(string text, IntPtr destination, AllocationScope scope)
     {
-        var bytes = Encoding.UTF8.GetBytes(text);
+        var byteCount = Encoding.UTF8.GetByteCount(text);
 
         // A zero-length allocation would still need a non-null pointer, so always take at least one byte.
-        var buffer = scope.Allocate(Math.Max(bytes.Length, 1));
-        Marshal.Copy(bytes, 0, buffer, bytes.Length);
+        var buffer = scope.Allocate(Math.Max(byteCount, 1));
+        unsafe
+        {
+            fixed (char* textPtr = text)
+            {
+                Encoding.UTF8.GetBytes(textPtr, text.Length, (byte*)buffer, byteCount);
+            }
+        }
 
-        Marshal.WriteIntPtr(destination, (IntPtr)bytes.Length);
+        Marshal.WriteIntPtr(destination, (IntPtr)byteCount);
         Marshal.WriteIntPtr(destination + VectorDataOffset, buffer);
     }
 
