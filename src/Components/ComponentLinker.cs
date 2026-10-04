@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
 namespace Wasmtime.Components;
@@ -137,17 +139,150 @@ public class ComponentLinker
             throw new ArgumentNullException(nameof(component));
         }
 
-        var error = Native.wasmtime_component_linker_instantiate(
-            NativeHandle, store.Context.handle, component.NativeHandle, out var instance);
-
-        GC.KeepAlive(store);
-
-        if (error != IntPtr.Zero)
+        store.BeginComponentOperation();
+        try
         {
-            throw WasmtimeException.FromOwnedError(error);
+            var error = Native.wasmtime_component_linker_instantiate(
+                NativeHandle, store.Context.handle, component.NativeHandle, out var instance);
+
+            GC.KeepAlive(store);
+
+            if (error != IntPtr.Zero)
+            {
+                throw WasmtimeException.FromOwnedError(error);
+            }
+
+            return new ComponentInstance(store, instance);
+        }
+        finally
+        {
+            store.EndComponentOperation();
+        }
+    }
+
+    /// <summary>
+    /// Instantiates a component using Wasmtime's asynchronous component API.
+    /// </summary>
+    /// <param name="store">The store to instantiate the component in.</param>
+    /// <param name="component">The component to instantiate.</param>
+    /// <param name="cancellationToken">A token that cancels polling and disposes the native instantiation future.</param>
+    /// <returns>The instantiated component.</returns>
+    /// <exception cref="InvalidOperationException">The engine was not configured for async components.</exception>
+    /// <exception cref="WasmtimeException">An import could not be satisfied or instantiation failed.</exception>
+    /// <remarks>
+    /// The engine must be configured with <see cref="Config.WithComponentModelAsync(bool)"/>.
+    /// Do not use this store for any other operation until the returned task completes.
+    /// Cancellation disposes the native instantiation future; it does not roll back guest side effects.
+    /// Experimental: startup code can invoke managed host callbacks on native fibers and crash the process.
+    /// See <see cref="Config.WithComponentModelAsync(bool)"/> for compatibility limitations.
+    /// </remarks>
+    public async Task<ComponentInstance> InstantiateAsync(
+        Store store,
+        Component component,
+        CancellationToken cancellationToken = default)
+    {
+        if (store is null)
+        {
+            throw new ArgumentNullException(nameof(store));
         }
 
-        return new ComponentInstance(store, instance);
+        if (component is null)
+        {
+            throw new ArgumentNullException(nameof(component));
+        }
+
+        if (!store.IsComponentModelAsyncEnabled)
+        {
+            throw new InvalidOperationException(
+                "Asynchronous component instantiation requires an engine configured with WithComponentModelAsync(true).");
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        store.BeginComponentOperation();
+        var instanceBuffer = IntPtr.Zero;
+        var errorBuffer = IntPtr.Zero;
+        var future = IntPtr.Zero;
+        try
+        {
+            instanceBuffer = Marshal.AllocHGlobal(Marshal.SizeOf<ComponentInstance.Native.Instance>());
+            errorBuffer = Marshal.AllocHGlobal(IntPtr.Size);
+            Marshal.StructureToPtr(default(ComponentInstance.Native.Instance), instanceBuffer, false);
+            Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
+
+            future = Native.wasmtime_component_linker_instantiate_async(
+                NativeHandle,
+                store.Context.handle,
+                component.NativeHandle,
+                instanceBuffer,
+                errorBuffer);
+
+            if (future == IntPtr.Zero)
+            {
+                var error = Marshal.ReadIntPtr(errorBuffer);
+                if (error != IntPtr.Zero)
+                {
+                    Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
+                    throw WasmtimeException.FromOwnedError(error);
+                }
+
+                throw new InvalidOperationException("Wasmtime failed to create an asynchronous instantiation future.");
+            }
+
+            try
+            {
+                await ComponentFunction.PollFutureAsync(future, cancellationToken).ConfigureAwait(false);
+                ComponentFunction.Native.wasmtime_call_future_delete(future);
+                future = IntPtr.Zero;
+                var error = Marshal.ReadIntPtr(errorBuffer);
+                if (error != IntPtr.Zero)
+                {
+                    Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
+                    throw WasmtimeException.FromOwnedError(error);
+                }
+
+                var instance = Marshal.PtrToStructure<ComponentInstance.Native.Instance>(instanceBuffer);
+                return new ComponentInstance(store, instance);
+            }
+            finally
+            {
+                if (future != IntPtr.Zero)
+                {
+                    ComponentFunction.Native.wasmtime_call_future_delete(future);
+                    future = IntPtr.Zero;
+                }
+                var error = Marshal.ReadIntPtr(errorBuffer);
+                if (error != IntPtr.Zero)
+                {
+                    Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
+                    ComponentFunction.Native.wasmtime_error_delete(error);
+                }
+            }
+        }
+        finally
+        {
+            if (future != IntPtr.Zero)
+            {
+                ComponentFunction.Native.wasmtime_call_future_delete(future);
+            }
+            if (errorBuffer != IntPtr.Zero)
+            {
+                var error = Marshal.ReadIntPtr(errorBuffer);
+                if (error != IntPtr.Zero)
+                {
+                    ComponentFunction.Native.wasmtime_error_delete(error);
+                }
+                Marshal.FreeHGlobal(errorBuffer);
+            }
+            if (instanceBuffer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(instanceBuffer);
+            }
+
+            GC.KeepAlive(this);
+            GC.KeepAlive(component);
+            GC.KeepAlive(store);
+            store.EndComponentOperation();
+        }
     }
 
     /// <inheritdoc/>
@@ -191,6 +326,14 @@ public class ComponentLinker
             IntPtr context,
             Component.Handle component,
             out ComponentInstance.Native.Instance instance_out);
+
+        [DllImport(Engine.LibraryName)]
+        public static extern IntPtr wasmtime_component_linker_instantiate_async(
+            Handle linker,
+            IntPtr context,
+            Component.Handle component,
+            IntPtr instance_out,
+            IntPtr error_ret);
 
         [DllImport(Engine.LibraryName)]
         public static extern IntPtr wasmtime_component_linker_define_unknown_imports_as_traps(

@@ -136,6 +136,7 @@ namespace Wasmtime
                 throw new ArgumentNullException(nameof(engine));
             }
 
+            IsComponentModelAsyncEnabled = engine.IsComponentModelAsyncEnabled;
             this.data = data;
 
             // Allocate a weak GCHandle, so that it does not participate in keeping the Store alive.
@@ -351,6 +352,18 @@ namespace Wasmtime
         /// <inheritdoc/>
         public void Dispose()
         {
+            var state = System.Threading.Interlocked.CompareExchange(ref componentOperationState, 2, 0);
+            if (state == 1)
+            {
+                throw new InvalidOperationException(
+                    "A store cannot be disposed while a component operation is in progress.");
+            }
+
+            if (state == 2)
+            {
+                return;
+            }
+
             handle.Dispose();
         }
 
@@ -365,6 +378,28 @@ namespace Wasmtime
 
                 return handle;
             }
+        }
+
+        internal bool IsComponentModelAsyncEnabled { get; }
+
+        internal void BeginComponentOperation()
+        {
+            var state = System.Threading.Interlocked.CompareExchange(ref componentOperationState, 1, 0);
+            if (state == 2)
+            {
+                throw new ObjectDisposedException(typeof(Store).FullName);
+            }
+
+            if (state != 0)
+            {
+                throw new InvalidOperationException(
+                    "A component operation is already in progress on this store.");
+            }
+        }
+
+        internal void EndComponentOperation()
+        {
+            System.Threading.Volatile.Write(ref componentOperationState, 0);
         }
 
         /// <summary>
@@ -434,6 +469,7 @@ namespace Wasmtime
         private readonly Handle handle;
 
         private object? data;
+        private int componentOperationState;
 
         private static readonly Native.Finalizer Finalizer = (p) => GCHandle.FromIntPtr(p).Free();
         
