@@ -513,6 +513,51 @@ namespace Wasmtime
             return this;
         }
 
+        /// <summary>
+        /// Enables or disables asynchronous WebAssembly component execution.
+        /// </summary>
+        /// <param name="enabled">True to enable asynchronous component execution.</param>
+        /// <returns>The current configuration.</returns>
+        /// <remarks>
+        /// Experimental: native async execution uses fibers. Managed host callbacks on those fibers
+        /// are not established CLR-compatible and have caused process crashes in Linux stress tests.
+        /// Enabling this option does not establish that async execution is safe on a platform.
+        /// </remarks>
+        public Config WithComponentModelAsync(bool enabled)
+        {
+            Native.wasmtime_config_wasm_component_model_async_set(NativeHandle, enabled);
+            ComponentModelAsyncEnabled = enabled;
+            return this;
+        }
+
+        /// <summary>
+        /// Enables or disables additional asynchronous component-model built-ins.
+        /// </summary>
+        /// <param name="enabled">True to enable the additional built-ins.</param>
+        /// <returns>The current configuration.</returns>
+        /// <remarks>
+        /// This option requires asynchronous component execution to be enabled.
+        /// </remarks>
+        public Config WithComponentModelMoreAsyncBuiltins(bool enabled)
+        {
+            Native.wasmtime_config_wasm_component_model_more_async_builtins_set(NativeHandle, enabled);
+            return this;
+        }
+
+        /// <summary>
+        /// Enables or disables stackful coroutine support for asynchronous components.
+        /// </summary>
+        /// <param name="enabled">True to enable stackful coroutine support.</param>
+        /// <returns>The current configuration.</returns>
+        /// <remarks>
+        /// This option requires asynchronous component execution to be enabled.
+        /// </remarks>
+        public Config WithComponentModelAsyncStackful(bool enabled)
+        {
+            Native.wasmtime_config_wasm_component_model_async_stackful_set(NativeHandle, enabled);
+            return this;
+        }
+
         /// <inheritdoc/>
         public void Dispose()
         {
@@ -658,11 +703,21 @@ namespace Wasmtime
             public static extern void wasmtime_config_wasm_component_model_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);
 
             [DllImport(Engine.LibraryName)]
+            public static extern void wasmtime_config_wasm_component_model_async_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);
+
+            [DllImport(Engine.LibraryName)]
+            public static extern void wasmtime_config_wasm_component_model_more_async_builtins_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);
+
+            [DllImport(Engine.LibraryName)]
+            public static extern void wasmtime_config_wasm_component_model_async_stackful_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);
+
+            [DllImport(Engine.LibraryName)]
             public static extern void wasmtime_config_wasm_exceptions_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);
 
             // todo: void wasmtime_config_host_memory_creator_set(wasm_config_t *, wasmtime_memory_creator_t *)
         }
 
         private readonly Handle handle;
+        internal bool ComponentModelAsyncEnabled { get; private set; }
     }
 }
