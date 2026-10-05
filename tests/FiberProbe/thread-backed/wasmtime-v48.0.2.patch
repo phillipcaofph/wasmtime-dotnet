@@ -1,9 +1,9 @@
 diff --git a/crates/fiber/README.md b/crates/fiber/README.md
 new file mode 100644
-index 0000000000..9a7b0eb021
+index 0000000000..771efc8191
 --- /dev/null
 +++ b/crates/fiber/README.md
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,514 @@
 +# Experimental OS-thread-backed execution
 +
 +This branch is based on Wasmtime **v48.0.2**. It is a feasibility experiment for
@@ -190,7 +190,7 @@ index 0000000000..9a7b0eb021
 +
 +## P3 reads and resource-destructor lifecycle follow-up
 +
-+Twenty isolated regressions in
++Twenty-two isolated regressions in
 +[`concurrent/p3_thread_tests.rs`](../wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs)
 +exercise:
 +
@@ -222,6 +222,15 @@ index 0000000000..9a7b0eb021
 +  collects while the guest stack is parked; a stack-root count must be nonzero,
 +  and the guest checks the object's field after resuming. Both deferred
 +  reference counting and copying GC are covered.
++- An owned host resource crosses a guest async export and a P3
++  `stream<own<resource>>`, returns as an owned host resource on a migrated
++  scheduler poll, then passes through a guest async drop export. The test checks
++  distinct guest-worker/scheduler thread IDs and exactly-once destruction,
++  including Store teardown.
++- A `StreamReader<u32>` is forwarded from one guest instance into a second
++  guest instance by a concurrent host adapter. The adapter does not consume the
++  stream; the receiving guest reads and validates the value. The test checks
++  distinct worker threads for both guest instances and migrated producer polls.
 +
 +Each case runs in a subprocess with a 60-second timeout. Diagnostic counters
 +prove workers were started and zero workers remain both after the tested Store
@@ -240,11 +249,15 @@ index 0000000000..9a7b0eb021
 +
 +The earlier combined native suite passed 31/31 on Linux Arm64 and macOS Arm64
 +(explicit Unix signals), and the original fourteen cases passed ten repetitions
-+on each platform (140/140 each). The earlier 34-test P3 subset passed on Linux Arm64 and macOS Arm64. After
-+adding owned-resource stream coverage, the 35-test P3 subset passed 35/35 on
-+Linux Arm64 and under Linux x64 Docker emulation. The new resource-transfer case
-+passed ten serial repetitions on each architecture (20/20 total). The earlier
-+34-test Linux Arm64 suite passed ten serial repetitions (340/340). The
++on each platform (140/140 each). The earlier 34-test P3 subset passed on Linux
++Arm64 and macOS Arm64. After adding owned-resource stream coverage, the 35-test
++P3 subset passed 35/35 on Linux Arm64 and under Linux x64 Docker emulation; that
++case passed ten serial repetitions on each architecture (20/20 total). With the
++guest-instance forwarding case, the 36-test P3 subset passed 36/36 on Linux
++Arm64 and under Linux x64 Docker emulation; that case passed ten serial
++repetitions on each architecture (20/20 total). Neither new case has been run
++on macOS. The earlier 34-test Linux Arm64 suite passed ten serial repetitions
++(340/340). The
 +concurrent `thread_tests` module passed 10/10 on Linux Arm64 and ten serial
 +repetitions (100/100), including parked-root and parked-sibling trap cases.
 +It also passed 10/10 once under Linux x64 Docker emulation. The two new async
@@ -253,8 +266,8 @@ index 0000000000..9a7b0eb021
 +
 +This is selected lifecycle coverage, not full P3 soundness. The next follow-up
 +below covers selected writers/host consumers and multi-item backpressure.
-+Selected owned-resource transfer through a P3 stream is covered below;
-+guest-to-guest resource transfers, zero-length readiness,
++Selected owned-resource transfer and guest-instance stream-reader forwarding
++are covered above; guest-to-guest resource transfers, zero-length readiness,
 +callback-style exports and broader concurrent multi-task combinations remain
 +unproven.
 +`resource_concurrent` currently uses an exclusive borrowed-Store path upstream;
@@ -309,9 +322,9 @@ index 0000000000..9a7b0eb021
 +
 +Linux Arm64 and macOS Arm64 (explicit Unix signals) passed the earlier combined
 +43-test suite and ten serial repetitions of the original twelve writer cases
-+(120/120 per platform). The earlier macOS P3 suite passed 34/34; the new
-+owned-resource case has not been run on macOS. The updated 35-test Linux P3
-+suite passed 35/35 on Arm64 and under x64 Docker emulation. The two new async
++(120/120 per platform). The earlier macOS P3 suite passed 34/34; neither new
++P3 case has been run on macOS. The updated 36-test Linux P3 suite passed 36/36
++on Arm64 and under x64 Docker emulation. The two new async
 +cancel-write cases passed ten repetitions each (20/20, each including a healthy
 +Store control). Linux passed ten serial repetitions of the earlier 34-test P3
 +suite (340/340), including both new async cancel-write cases; Linux x64
@@ -326,8 +339,9 @@ index 0000000000..9a7b0eb021
 +
 +No production runtime fix was needed for these measured paths. These writer/
 +consumer tests use scalar `u32` payloads and selected cancellation paths;
-+selected owned-resource transfer has separate coverage above. Guest-to-guest
-+resource transfers, zero-length readiness, async cancel builtins beyond
++selected owned-resource transfer and guest-instance stream-reader forwarding
++have separate coverage above. Guest-to-guest resource transfers, zero-length
++readiness, async cancel builtins beyond
 +the selected guest cancel-read/cancel-write paths, and callback exports remain
 +unproven. Cancellation/error after consumption destroys the host consumer, but
 +does not guarantee delivery to an external downstream sink. The soundness/
@@ -1192,10 +1206,10 @@ index 079ce49e6e..f67a314045 100644
  /// Constant defined in the Component Model spec to indicate that the async
 diff --git a/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs
 new file mode 100644
-index 0000000000..97e4e85856
+index 0000000000..043fc58f40
 --- /dev/null
 +++ b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs
-@@ -0,0 +1,809 @@
+@@ -0,0 +1,810 @@
 +use super::thread_tests::{assert_tls_empty, assert_workers_stopped, isolated_test};
 +use crate::component::{
 +    Component, Destination, FutureProducer, FutureReader, Linker, Resource, ResourceType,
@@ -1212,6 +1226,7 @@ index 0000000000..97e4e85856
 +};
 +use std::thread::{self, ThreadId};
 +
++mod guest_to_guest;
 +mod resource_values;
 +mod writers;
 +
@@ -2005,6 +2020,186 @@ index 0000000000..97e4e85856
 +resource_test!(p3_concurrent_resource_pending_completion, true, Complete);
 +resource_test!(p3_concurrent_resource_pending_cancellation, true, Cancel);
 +resource_test!(p3_concurrent_resource_pending_error, true, Error);
+diff --git a/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests/guest_to_guest.rs b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests/guest_to_guest.rs
+new file mode 100644
+index 0000000000..ce97325bc7
+--- /dev/null
++++ b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests/guest_to_guest.rs
+@@ -0,0 +1,174 @@
++use super::*;
++
++const FORWARD_STREAM_COMPONENT: &str = r#"
++    (component
++        (import "mark" (func $mark-import))
++        (type $s (stream u32))
++        (type $forward-type (func async (param "reader" $s)))
++        (import "forward" (func $forward (type $forward-type)))
++        (core func $forward-core (canon lower (func $forward)))
++        (core func $mark-core (canon lower (func $mark-import)))
++        (core module $m
++            (import "" "forward" (func $forward (param i32)))
++            (import "" "mark" (func $mark))
++            (func (export "run") (param i32)
++                (call $mark)
++                (call $forward (local.get 0))))
++        (core instance $i (instantiate $m
++            (with "" (instance
++                (export "forward" (func $forward-core))
++                (export "mark" (func $mark-core))))))
++        (func (export "run") async (param "reader" $s)
++            (canon lift (core func $i "run"))))
++"#;
++
++const GUEST_STREAM_READER_COMPONENT: &str = r#"
++    (component
++        (import "mark" (func $mark-import))
++        (core func $mark-core (canon lower (func $mark-import)))
++        (core module $mem (memory (export "memory") 1))
++        (core instance $mem (instantiate $mem))
++        (type $s (stream u32))
++        (core func $read (canon stream.read $s
++            (memory (core memory $mem "memory"))))
++        (core func $drop (canon stream.drop-readable $s))
++        (core module $m
++            (import "" "mark" (func $mark))
++            (import "" "memory" (memory 1))
++            (import "" "read" (func $read (param i32 i32 i32) (result i32)))
++            (import "" "drop" (func $drop (param i32)))
++            (func (export "run") (param $reader i32)
++                (call $mark)
++                (call $read (local.get $reader) (i32.const 0) (i32.const 1))
++                i32.const 17
++                i32.ne
++                if unreachable end
++                (i32.load (i32.const 0))
++                i32.const 42
++                i32.ne
++                if unreachable end
++                (call $drop (local.get $reader))))
++        (core instance $i (instantiate $m
++            (with "" (instance
++                (export "mark" (func $mark-core))
++                (export "memory" (memory $mem "memory"))
++                (export "read" (func $read))
++                (export "drop" (func $drop))))))
++        (func (export "run") async (param "reader" $s)
++            (canon lift (core func $i "run")
++                (memory (core memory $mem "memory")))))
++"#;
++
++fn ready<T>(mut future: Pin<Box<impl Future<Output = Result<T>>>>) -> Result<T> {
++    match future
++        .as_mut()
++        .poll(&mut Context::from_waker(Waker::noop()))
++    {
++        Poll::Ready(result) => result,
++        Poll::Pending => panic!("guest component operation unexpectedly suspended"),
++    }
++}
++
++fn run_guest_to_guest_stream_transfer() -> Result<()> {
++    assert_tls_empty();
++    let engine = engine()?;
++    let forwarding_component = Component::new(&engine, FORWARD_STREAM_COMPONENT)?;
++    let reader_component = Component::new(&engine, GUEST_STREAM_READER_COMPONENT)?;
++    let mut store = Store::new(&engine, 101u32);
++
++    let reader_worker = Arc::new(Mutex::new(None));
++    let observed_reader_worker = reader_worker.clone();
++    let mut reader_linker = Linker::<u32>::new(&engine);
++    reader_linker.root().func_wrap("mark", move |_, (): ()| {
++        assert!(
++            observed_reader_worker
++                .lock()
++                .unwrap()
++                .replace(thread::current().id())
++                .is_none(),
++            "reader guest marker ran more than once"
++        );
++        Ok(())
++    })?;
++    let reader_instance = ready(Box::pin(
++        reader_linker.instantiate_async(&mut store, &reader_component),
++    ))?;
++    let reader_instance = Arc::new(Mutex::new(Some(reader_instance)));
++    let target_instance = reader_instance.clone();
++
++    let forwarding_worker = Arc::new(Mutex::new(None));
++    let observed_forwarding_worker = forwarding_worker.clone();
++    let mut linker = Linker::<u32>::new(&engine);
++    linker.root().func_wrap("mark", move |_, (): ()| {
++        assert!(
++            observed_forwarding_worker
++                .lock()
++                .unwrap()
++                .replace(thread::current().id())
++                .is_none(),
++            "forwarding guest marker ran more than once"
++        );
++        Ok(())
++    })?;
++    linker.root().func_wrap_concurrent(
++        "forward",
++        move |accessor, (stream,): (StreamReader<u32>,)| {
++            let target = accessor.with(|mut store| {
++                target_instance
++                    .lock()
++                    .unwrap()
++                    .as_ref()
++                    .expect("reader component instance missing")
++                    .get_typed_func::<(StreamReader<u32>,), ()>(&mut store, "run")
++            });
++            Box::pin(async move {
++                let target = target?;
++                target.call_concurrent(accessor, (stream,)).await
++            })
++        },
++    )?;
++    let forwarding_instance = ready(Box::pin(
++        linker.instantiate_async(&mut store, &forwarding_component),
++    ))?;
++
++    let observations = Arc::new(Observations::default());
++    let stream = StreamReader::new(&mut store, Producer(observations.clone()))?;
++    let run = forwarding_instance.get_typed_func::<(StreamReader<u32>,), ()>(&mut store, "run")?;
++    let mut call = Box::pin(run.call_async(&mut store, (stream,)));
++    drive(call.as_mut(), &observations, Finish::Complete, true)?;
++
++    let forwarding_worker = forwarding_worker
++        .lock()
++        .unwrap()
++        .expect("forwarding guest did not execute");
++    let reader_worker = reader_worker
++        .lock()
++        .unwrap()
++        .expect("reader guest did not execute");
++    assert_ne!(forwarding_worker, reader_worker);
++    assert_ne!(forwarding_worker, thread::current().id());
++    assert_ne!(reader_worker, thread::current().id());
++    assert_eq!(observations.completed.load(Ordering::SeqCst), 1);
++    assert_eq!(observations.drops.load(Ordering::SeqCst), 1);
++    drop(call);
++    drop(store);
++    assert_workers_stopped();
++    assert_tls_empty();
++    Ok(())
++}
++
++#[test]
++fn p3_stream_reader_forwarded_between_guest_instances() -> Result<()> {
++    isolated_test(
++        concat!(
++            "runtime::component::concurrent::p3_thread_tests::guest_to_guest::",
++            "p3_stream_reader_forwarded_between_guest_instances"
++        ),
++        || {
++            run_guest_to_guest_stream_transfer()?;
++            assert_workers_stopped();
++            run_guest_to_guest_stream_transfer()
++        },
++        2,
++    )
++}
 diff --git a/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests/resource_values.rs b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests/resource_values.rs
 new file mode 100644
 index 0000000000..6f1eaba931
