@@ -1,9 +1,9 @@
 diff --git a/crates/fiber/README.md b/crates/fiber/README.md
 new file mode 100644
-index 0000000000..d4c1a3b2b1
+index 0000000000..1c5a34e310
 --- /dev/null
 +++ b/crates/fiber/README.md
-@@ -0,0 +1,465 @@
+@@ -0,0 +1,494 @@
 +# Experimental OS-thread-backed execution
 +
 +This branch is based on Wasmtime **v48.0.2**. It is a feasibility experiment for
@@ -47,6 +47,35 @@ index 0000000000..d4c1a3b2b1
 +polled non-Send async instantiation remain supported. Existing async function,
 +resource-drop and component worker routes already require Send. Shared
 +sync/async initialization documents the additional unsafe async obligation.
++
++## Worker-handoff safety review
++
++A focused source review traced the experimental handoff through public async
++entrypoints, worker startup, each resume/suspend, cancellation, panic propagation
++and worker join:
++
++- Core and component `call_async` APIs require `Store` data to be `Send`.
++  Experimental async instantiation additionally enforces `AsyncStoreData: Send`,
++  including when its future is polled locally. The borrowed startup helper is
++  unsafe and its only async entrypoints carry that requirement.
++- The safe `on_fiber`/`make_fiber` wrappers require transferable Store state.
++  Internal unchecked startup is confined to those wrappers and async core
++  startup. The concurrent worker path also requires `T: Send`.
++- The worker receives an owned `Waker` and activation state through the
++  mutex/condition-variable handshake. `BlockingContext` takes the temporary
++  `Suspend` and polling-context pointers before every suspension, including
++  `ReleaseStore`; Wasmtime activation TLS is restored on the worker before guest
++  execution continues or cancellation unwinds. The resumer joins before the
++  borrowed Store access can be released by async cancellation.
++- A compile-fail doctest now checks that core `Func::call_async` rejects a
++  non-Send Store data type, alongside the async-instantiation checks.
++
++The review found no additional concrete violation in these traced paths. This
++is not a formal soundness proof: `RawFiber` and activation-state `Send`
++implementations remain unsafe, and the proof depends on every future suspension
++continuing to pass through the audited boundaries. It does not cover arbitrary
++host TLS, every possible Rust frame around nested execution, unsafe embedder
++code, FFI callbacks, Miri, sanitizers or native x64 hardware.
 +
 +Diagnostic exports identify the backend and support teardown/root-list probes:
 +
@@ -3863,7 +3892,7 @@ index 453b6dcf57..bcd3635858 100644
      }
  
 diff --git a/crates/wasmtime/src/runtime/fiber.rs b/crates/wasmtime/src/runtime/fiber.rs
-index 50f086f7d4..1ca5c010e4 100644
+index 50f086f7d4..ce39d6ea06 100644
 --- a/crates/wasmtime/src/runtime/fiber.rs
 +++ b/crates/wasmtime/src/runtime/fiber.rs
 @@ -17,8 +17,21 @@ use super::module::ModuleRegistry;
@@ -3902,16 +3931,41 @@ index 50f086f7d4..1ca5c010e4 100644
  
      /// The last fiber stack that was in use by the store.
      ///
-@@ -106,6 +123,8 @@ pub(crate) struct AsyncState {
- // `None`. Thus if a store is being sent across threads that's done because no
- // fibers are active, and once fibers are active everything will stick within
- // the same thread.
-+// For the thread backend the context is an owned Send Waker. The suspend pointer
-+// is used only by the worker and cleared before yielding Store access.
+@@ -99,14 +116,26 @@ pub(crate) struct AsyncState {
+     pub(crate) async_required: bool,
+ }
+ 
+-// SAFETY: it's known that `std::task::Context` is neither `Send` nor `Sync`,
+-// but despite this the storage here is purely temporary in getting these
+-// pointers across function frames. The actual types are not sent across threads
+-// as when a store isn't polling anything the pointer values are all set to
+-// `None`. Thus if a store is being sent across threads that's done because no
+-// fibers are active, and once fibers are active everything will stick within
+-// the same thread.
++// SAFETY: with stack-switching fibers, `current_future_cx` is a temporary raw
++// pointer to the polling Context. It is taken by `BlockingContext` before every
++// suspension and is therefore null whenever the Store can move between polls.
++// The exclusive Store borrow serializes every access to both pointer fields.
++#[cfg(not(wasmtime_thread_fibers))]
  unsafe impl Send for AsyncState {}
++#[cfg(not(wasmtime_thread_fibers))]
++unsafe impl Sync for AsyncState {}
++
++// SAFETY: the thread backend stores an owned Waker in `current_future_cx`.
++// `current_suspend` points into the worker's stack, but is only installed while
++// `resume_fiber` gives that worker exclusive access to the Store. Every
++// suspension goes through `BlockingContext`, which takes both pointers before
++// returning control (including ReleaseStore) to the scheduler. The stack-local
++// Suspend reference remains on the parked worker stack; it is not transferred
++// through the resume/yield messages. The exclusive Store borrow serializes
++// access even when successive polls run on different scheduler threads.
++#[cfg(wasmtime_thread_fibers)]
++unsafe impl Send for AsyncState {}
++#[cfg(wasmtime_thread_fibers)]
  unsafe impl Sync for AsyncState {}
  
-@@ -163,7 +182,52 @@ pub(crate) struct BlockingContext<'a, 'b> {
+ impl Default for AsyncState {
+@@ -163,7 +192,52 @@ pub(crate) struct BlockingContext<'a, 'b> {
      /// available. Upon resumption the context here is *optionally* provided.
      /// Cancellation is a case where it isn't passed back and a re-poll is a
      /// case where it's passed back.
@@ -3964,7 +4018,7 @@ index 50f086f7d4..1ca5c010e4 100644
  }
  
  impl<'a, 'b> BlockingContext<'a, 'b> {
-@@ -215,12 +279,20 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
+@@ -215,12 +289,20 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
          // fiber and for this fiber. The "take" pattern here ensures that if
          // this `BlockingContext` context acquires the pointers then there are
          // no other instances of these pointers in use anywhere else.
@@ -3986,7 +4040,7 @@ index 50f086f7d4..1ca5c010e4 100644
          };
          return f(&mut reset.store, &mut reset.cx);
  
-@@ -238,6 +310,7 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
+@@ -238,6 +320,7 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
                  debug_assert!(state.current_suspend.is_none());
                  state.current_suspend = Some(NonNull::from(&mut *self.cx.suspend));
  
@@ -3994,7 +4048,7 @@ index 50f086f7d4..1ca5c010e4 100644
                  if let Some(cx) = &mut self.cx.future_cx {
                      // SAFETY: while this is changing the lifetime to `'static`
                      // it should never be used while it's `'static` given this
-@@ -245,6 +318,10 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
+@@ -245,6 +328,10 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
                      state.current_future_cx =
                          Some(NonNull::from(unsafe { change_context_lifetime(cx) }));
                  }
@@ -4005,7 +4059,7 @@ index 50f086f7d4..1ca5c010e4 100644
              }
          }
      }
-@@ -301,7 +378,13 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
+@@ -301,7 +388,13 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
      {
          let mut future = core::pin::pin!(future);
          loop {
@@ -4020,7 +4074,7 @@ index 50f086f7d4..1ca5c010e4 100644
                  Poll::Ready(v) => break Ok(v),
                  Poll::Pending => self.suspend(StoreFiberYield::KeepStore)?,
              }
-@@ -321,15 +404,294 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
+@@ -321,15 +414,294 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
          // value given back.
          self.future_cx.take();
  
@@ -4323,7 +4377,7 @@ index 50f086f7d4..1ca5c010e4 100644
          }
          Ok(())
      }
-@@ -608,7 +970,10 @@ impl FiberResumeState {
+@@ -608,7 +980,10 @@ impl FiberResumeState {
          store: &mut StoreOpaque,
          fiber: &mut StoreFiber<'_>,
      ) -> PriorFiberResumeState {
@@ -4334,7 +4388,7 @@ index 50f086f7d4..1ca5c010e4 100644
          let mpk = swap_mpk_states(self.mpk);
          let async_guard_range = fiber
              .fiber()
-@@ -661,27 +1026,30 @@ impl StoreOpaque {
+@@ -661,27 +1036,30 @@ impl StoreOpaque {
          mem::replace(&mut self.fiber_async_state_mut().current_suspend, ptr)
      }
  
@@ -4370,7 +4424,7 @@ index 50f086f7d4..1ca5c010e4 100644
          let mpk = swap_mpk_states(self.mpk);
          // No need to save `_my_guard` since we can re-infer it from the fiber
          // that this state is attached to.
-@@ -725,9 +1093,17 @@ fn swap_mpk_states(mask: Option<ProtectionMask>) -> Option<ProtectionMask> {
+@@ -725,9 +1103,17 @@ fn swap_mpk_states(mask: Option<ProtectionMask>) -> Option<ProtectionMask> {
  fn resume_fiber<'a>(
      store: &mut StoreOpaque,
      fiber: &mut StoreFiber<'a>,
@@ -4389,7 +4443,7 @@ index 50f086f7d4..1ca5c010e4 100644
  
      struct Restore<'a, 'b> {
          store: &'b mut StoreOpaque,
-@@ -756,6 +1132,11 @@ fn resume_fiber<'a>(
+@@ -756,6 +1142,11 @@ fn resume_fiber<'a>(
          restore.fiber.fiber().unwrap().resume(result)
      };
  
@@ -4401,7 +4455,7 @@ index 50f086f7d4..1ca5c010e4 100644
      match &result {
          // The fiber has finished, so recycle its stack by disposing of the
          // underlying fiber itself.
-@@ -796,6 +1177,8 @@ fn resume_fiber<'a>(
+@@ -796,6 +1187,8 @@ fn resume_fiber<'a>(
  /// The returned `StoreFiber<'a>` structure is unconditionally `Send` but the
  /// send-ness is actually a function of `S`. When `S` is statically known to be
  /// `Send` then use the safe [`make_fiber`] function.
@@ -4410,7 +4464,7 @@ index 50f086f7d4..1ca5c010e4 100644
  pub(crate) unsafe fn make_fiber_unchecked<'a, S>(
      store: &mut S,
      fun: impl FnOnce(&mut S) -> Result<()> + Send + Sync + 'a,
-@@ -807,10 +1190,30 @@ where
+@@ -807,10 +1200,30 @@ where
      let engine = opaque.engine().clone();
      let executor = Executor::new(&engine)?;
      let id = opaque.id();
@@ -4443,7 +4497,7 @@ index 50f086f7d4..1ca5c010e4 100644
          let future_cx = match result {
              Ok(cx) => cx,
              // Cancelled before we started? Just return.
-@@ -858,7 +1261,13 @@ where
+@@ -858,7 +1271,13 @@ where
          let reset = ResetCurrentPointersToNull(store_ref);
  
          fun(reset.0)
@@ -4458,7 +4512,7 @@ index 50f086f7d4..1ca5c010e4 100644
      let fiber = match fiber {
          Ok(fiber) => fiber,
          Err((e, stack)) => {
-@@ -907,6 +1316,26 @@ pub(crate) async fn on_fiber<S, R>(
+@@ -907,6 +1326,26 @@ pub(crate) async fn on_fiber<S, R>(
      store: &mut S,
      func: impl FnOnce(&mut S) -> R + Send + Sync,
  ) -> Result<R>
@@ -4485,7 +4539,7 @@ index 50f086f7d4..1ca5c010e4 100644
  where
      S: AsStoreOpaque + ?Sized,
      R: Send + Sync,
-@@ -917,11 +1346,8 @@ where
+@@ -917,11 +1356,8 @@ where
  
      let mut result = None;
  
@@ -4499,7 +4553,7 @@ index 50f086f7d4..1ca5c010e4 100644
      let fiber = unsafe {
          make_fiber_unchecked(store, |store| {
              result = Some(func(store));
-@@ -1001,8 +1427,10 @@ impl<'b> Future for FiberFuture<'_, 'b> {
+@@ -1001,8 +1437,10 @@ impl<'b> Future for FiberFuture<'_, 'b> {
          // satisfied by the users of this in the `BlockingContext` structure
          // where the lifetime parameters there are always more constrained than
          // they are here.
@@ -4512,7 +4566,7 @@ index 50f086f7d4..1ca5c010e4 100644
  
          match resume_fiber(me.store, me.fiber.as_mut().unwrap(), Ok(cx)) {
              Ok(Ok(())) => Poll::Ready(Ok(None)),
-@@ -1033,6 +1461,7 @@ impl Drop for FiberFuture<'_, '_> {
+@@ -1033,6 +1471,7 @@ impl Drop for FiberFuture<'_, '_> {
  /// being used to determine whether it's actually safe or not. See docs on
  /// callers of this function. The purpose of this is to scope the `transmute` to
  /// as small an operation as possible.
@@ -4521,7 +4575,7 @@ index 50f086f7d4..1ca5c010e4 100644
      // SAFETY: See the function documentation, this is not safe in general.
      unsafe { mem::transmute::<&mut Context<'_>, &mut Context<'b>>(cx) }
 diff --git a/crates/wasmtime/src/runtime/instance.rs b/crates/wasmtime/src/runtime/instance.rs
-index 53fd54faed..cfa223b095 100644
+index 53fd54faed..d4914d45ec 100644
 --- a/crates/wasmtime/src/runtime/instance.rs
 +++ b/crates/wasmtime/src/runtime/instance.rs
 @@ -197,8 +197,12 @@ impl Instance {
@@ -4582,7 +4636,7 @@ index 53fd54faed..cfa223b095 100644
          let mut store = store.as_context_mut();
          let imports = pre_instantiate_raw(
              &mut store.0,
-@@ -958,6 +977,75 @@ impl<T: 'static> InstancePre<T> {
+@@ -958,6 +977,87 @@ impl<T: 'static> InstancePre<T> {
      }
  }
  
@@ -4622,6 +4676,18 @@ index 53fd54faed..cfa223b095 100644
 +/// let pre = Linker::<Rc<()>>::new(&engine).instantiate_pre(&component).unwrap();
 +/// let mut store = Store::new(&engine, Rc::new(()));
 +/// let _future = pre.instantiate_async(&mut store);
++/// ```
++///
++/// Async calls also require transferable Store data because Wasm runs on the
++/// worker thread even when the returned future is polled locally:
++///
++/// ```compile_fail,E0277
++/// use std::rc::Rc;
++/// use wasmtime::{Engine, Func, FuncType, Store};
++/// let engine = Engine::default();
++/// let mut store = Store::new(&engine, Rc::new(()));
++/// let func = Func::new(&mut store, FuncType::new([], []), |_, _, _| Ok(()));
++/// let _future = func.call_async(&mut store, &[], &mut []);
 +/// ```
 +pub trait AsyncStoreData: Send {}
 +#[cfg(wasmtime_thread_fibers)]
