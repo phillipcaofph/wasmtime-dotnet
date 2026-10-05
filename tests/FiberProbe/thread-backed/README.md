@@ -95,9 +95,10 @@ on each platform (140/140 each). The current 34-test P3 subset passed on Linux
 Arm64 and macOS Arm64; Linux passed ten serial repetitions (340/340). The
 concurrent `thread_tests` module passed 10/10 on Linux Arm64 and ten serial
 repetitions (100/100), including parked-root and parked-sibling trap cases.
-The two new async cancel-write cases also passed ten repetitions on macOS
-Arm64. Stock controls passed 3/3 on macOS. No production runtime fix was needed
-for these measured paths, and no managed matrix rerun is claimed.
+It also passed 10/10 once under Linux x64 Docker emulation. The two new async
+cancel-write cases passed ten repetitions on macOS Arm64 and under Linux x64
+emulation. Stock controls passed 3/3 on macOS. No production runtime fix was
+needed for these measured paths, and no managed matrix rerun is claimed.
 
 This does not prove all P3 paths. Selected writer/consumer and multi-item
 backpressure paths are now covered below; resource-bearing payloads,
@@ -140,9 +141,11 @@ combined native tests and **120/120** repeated original writer cases. The
 current 34-test P3 suite passed on Linux Arm64 and macOS Arm64. Linux passed ten
 serial repetitions of the full P3 suite (**340/340**), including the two new
 async cancel-write cases; those two cases also passed ten repetitions each on
-macOS Arm64. Each isolated case includes a fresh healthy Store control. Stock
-configuration controls passed 3/3 on macOS. No production runtime fix or
-managed stress-matrix rerun is claimed for this native-test-only follow-up.
+macOS Arm64. Linux x64 under Docker emulation passed the full P3 suite 34/34,
+and each new async cancel-write case passed ten repetitions. Each isolated case
+includes a fresh healthy Store control. Stock configuration controls passed
+3/3 on macOS. No production runtime fix or managed stress-matrix rerun is
+claimed for this native-test-only follow-up.
 
 Resource-bearing payloads, guest-to-guest transfers, zero-length readiness,
 async cancel builtins beyond the selected guest cancel-read/cancel-write paths,
@@ -175,7 +178,9 @@ combined tests plus **100/100** repeated panic cases. Stock controls passed
 3/3 on macOS. These counts cover the original ten panic cases. The new
 parked-sibling case passed the full 11-case panic module and ten additional
 serial repetitions on both Linux Arm64 and macOS Arm64 with explicit Unix
-signals. No production runtime fix or managed matrix rerun is claimed.
+signals. Linux x64 under Docker emulation passed the 11-case module and ten
+additional serial repetitions of the parked-sibling case. No production
+runtime fix or managed matrix rerun is claimed.
 
 These are single-panic unwind tests. Double panics during active unwinding,
 `panic=abort`, panicking hooks/payload destructors, an unstarted worker capture
@@ -480,7 +485,9 @@ The isolated managed runner's copy has the same hash. This follow-up did not
 rebuild/repeat the Linux managed matrix or the CLR GCStress runs.
 
 The unchecked borrowing, remaining TLS/P3 audits, pooled stacks, host backtraces,
-default macOS Mach handling and Windows validation remain open.
+default macOS Mach handling, Windows and native x64 hardware validation remain
+open. Selected Linux x64 Rust suites passed under Docker emulation; this does
+not substitute for native x64 hardware validation.
 
 ### Component/accessor TLS and same-Store parked-root follow-up
 
@@ -610,6 +617,8 @@ failure or prove that cross-thread host backtraces are preserved.
 
 The tested native dylib SHA-256 is
 `3a25fdf475b2511ffa9a989e6d1595164167650af93541890042d52d469c0884`.
-Windows and native x64 validation remain outstanding. Signal-mode success is
-not evidence that default Mach-port mode, other exception-handler integrations,
-profilers/debuggers or the unchecked cross-thread Rust transfers are safe.
+Windows and native x64 hardware validation remain outstanding. Selected Linux
+x64 Rust suites passed under Docker emulation only; this does not substitute
+for native x64 hardware validation. Signal-mode success is not evidence that
+default Mach-port mode, other exception-handler integrations, profilers/debuggers
+or the unchecked cross-thread Rust transfers are safe.
