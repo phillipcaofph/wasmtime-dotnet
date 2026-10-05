@@ -121,3 +121,10 @@ On macOS Arm64, the component suite including all 36 stress cases passed
 The Linux Arm64 .NET 9 Release component tests excluding this crash-isolated
 matrix passed 146/146. Neither result establishes fiber/CLR compatibility:
 Linux async managed-callback execution remains blocked by reproducible crashes.
+
+For the separate native-runtime experiment using real OS threads rather than
+alternate stacks, see [the thread-backed experiment](thread-backed/README.md).
+Its custom library is opt-in and does not replace the packaged runtime.
+On macOS that backend has a reproduced default Mach-port trap-handling failure.
+`WASMTIME_FIBER_MACOS_MACH_PORTS=0` explicitly selects Unix signals for diagnostic
+validation; it does not change production defaults or establish full compatibility.

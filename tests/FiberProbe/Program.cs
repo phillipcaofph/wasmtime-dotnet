@@ -21,6 +21,15 @@ internal static class Program
     private static int collections;
     private static int pendingPolls;
     private static int migrations;
+    private static int nestedCalls;
+    private static int recoveredTraps;
+    private static int lifecycleCycles;
+    private static int guestCollections;
+    private static int stackOverflows;
+    private static readonly ConcurrentDictionary<int, byte> callbackThreads = new();
+    private static readonly ConcurrentDictionary<int, byte> pollingThreads = new();
+    private static bool ThreadBackend =>
+        Environment.GetEnvironmentVariable("WASMTIME_THREAD_FIBER_EXPERIMENT") == "1";
     private static bool ThreadAffine =>
         Environment.GetEnvironmentVariable("WASMTIME_FIBER_DIAGNOSTIC_AFFINITY") == "1";
     private static bool ForceGc =>
@@ -37,14 +46,57 @@ internal static class Program
                 throw new ArgumentOutOfRangeException(nameof(iterations));
             }
             var elapsed = Stopwatch.StartNew();
+            if (ThreadBackend && (wasmtime_thread_fiber_started() != 0 || wasmtime_thread_fiber_live() != 0 ||
+                wasmtime_thread_fiber_tls_suspensions() != 0))
+            {
+                throw new InvalidOperationException("Thread backend counters were not zero before execution.");
+            }
 
-            using var engine = new Engine(new Config()
+            var config = new Config()
                 .WithComponentModel(true)
                 .WithComponentModelAsync(true)
-                .WithFuelConsumption(true));
-            using var component = Component.FromTextFile(engine, Path.Combine(AppContext.BaseDirectory, "fiber-probe.wat"));
+                .WithFuelConsumption(true);
+            bool? macosMachPorts = null;
+            var machPorts = Environment.GetEnvironmentVariable("WASMTIME_FIBER_MACOS_MACH_PORTS");
+            if (machPorts is not null)
+            {
+                if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX) || machPorts is not ("0" or "1"))
+                {
+                    throw new InvalidOperationException("WASMTIME_FIBER_MACOS_MACH_PORTS requires macOS and 0 or 1.");
+                }
+                macosMachPorts = machPorts == "1";
+                config.WithMacosMachPorts(macosMachPorts.Value);
+            }
+            if (scenario == "guest-gc")
+            {
+                config.WithGc(true);
+            }
+            using var engine = new Engine(config);
+            using var component = Component.FromTextFile(engine, Path.Combine(AppContext.BaseDirectory,
+                scenario == "guest-gc" ? "fiber-gc-probe.wat" : "fiber-probe.wat"));
 
-            if (scenario == "errors")
+            if (scenario == "stack-overflow")
+            {
+                await CheckStackOverflow(engine, iterations);
+            }
+            else if (scenario is "nested-sync" or "nested-async")
+            {
+                await CheckNested(engine, component, iterations, scenario == "nested-async");
+            }
+            else if (scenario == "lifecycle")
+            {
+                for (var i = 0; i < iterations; i++)
+                {
+                    await CheckCancellation(engine, component);
+                    await CheckErrors(engine, component);
+                    Interlocked.Increment(ref lifecycleCycles);
+                    if (ThreadBackend && wasmtime_thread_fiber_live() != 0)
+                    {
+                        throw new InvalidOperationException("Execution threads survived a lifecycle cycle.");
+                    }
+                }
+            }
+            else if (scenario == "errors")
             {
                 await CheckErrors(engine, component);
             }
@@ -58,13 +110,13 @@ internal static class Program
             }
             else
             {
-                var workers = scenario is "concurrent" or "concurrent-baseline" or "sync-control" ? 4 : 1;
+                var workers = scenario is "concurrent" or "concurrent-baseline" or "sync-control" or "guest-gc" ? 4 : 1;
                 using var barrier = new Barrier(workers);
                 await Task.WhenAll(Enumerable.Range(0, workers).Select(_ => Task.Run(() =>
                 {
                     using var store = new Store(engine);
                     store.Fuel = ulong.MaxValue;
-                    using var linker = CreateLinker(engine, false);
+                    using var linker = CreateLinker(engine, false, scenario == "guest-gc" ? store : null);
                     var instance = linker.Instantiate(store, component);
                     if (scenario != "sync-control")
                     {
@@ -94,7 +146,7 @@ internal static class Program
                 })));
             }
 
-            if (scenario is not ("errors" or "sync-control") && pendingPolls == 0)
+            if (scenario is not ("errors" or "sync-control" or "stack-overflow") && pendingPolls == 0)
             {
                 throw new InvalidOperationException("The probe never observed a pending native future.");
             }
@@ -102,6 +154,21 @@ internal static class Program
                 (callbacks == 0 || (ForceGc && collections == 0) || (!ThreadAffine && migrations == 0)))
             {
                 throw new InvalidOperationException("Callback/GC/thread-migration coverage was not exercised.");
+            }
+            var nativeThreadsStarted = ThreadBackend ? wasmtime_thread_fiber_started() : 0;
+            var nativeThreadsLive = ThreadBackend ? wasmtime_thread_fiber_live() : 0;
+            var nativeTlsSuspensions = ThreadBackend ? wasmtime_thread_fiber_tls_suspensions() : 0;
+            if (ThreadBackend && scenario is not ("errors" or "sync-control" or "stack-overflow") &&
+                nativeTlsSuspensions == 0)
+            {
+                throw new InvalidOperationException("No parked worker activation list was captured.");
+            }
+            if (ThreadBackend && ((scenario == "sync-control" ? nativeThreadsStarted != 0 : nativeThreadsStarted == 0) ||
+                nativeThreadsLive != 0 ||
+                callbackThreads.Keys.Any(pollingThreads.ContainsKey)))
+            {
+                throw new InvalidOperationException(
+                    $"Thread backend coverage/lifetime failure: started={nativeThreadsStarted}, live={nativeThreadsLive}.");
             }
 
             Console.WriteLine(JsonSerializer.Serialize(new
@@ -118,6 +185,18 @@ internal static class Program
                 gcStress = Environment.GetEnvironmentVariable("DOTNET_GCStress"),
                 threadAffine = ThreadAffine,
                 forcedGc = ForceGc,
+                threadBackend = ThreadBackend,
+                macosMachPorts,
+                nativeThreadsStarted,
+                nativeThreadsLive,
+                nativeTlsSuspensions,
+                callbackThreadCount = callbackThreads.Count,
+                pollingThreadCount = pollingThreads.Count,
+                nestedCalls,
+                recoveredTraps,
+                lifecycleCycles,
+                guestCollections,
+                stackOverflows,
                 status = "passed"
             }));
             return 0;
@@ -129,7 +208,7 @@ internal static class Program
         }
     }
 
-    private static ComponentLinker CreateLinker(Engine engine, bool throws)
+    private static ComponentLinker CreateLinker(Engine engine, bool throws, Store? collectGuest = null)
     {
         var linker = new ComponentLinker(engine);
         using var root = linker.Root();
@@ -140,11 +219,141 @@ internal static class Program
                 throw new InvalidOperationException("fiber-probe host failure");
             }
 
-            Interlocked.Increment(ref callbacks);
-            CheckRoots();
+            CheckManagedCallback();
+            if (collectGuest is not null)
+            {
+                collectGuest.GC();
+                Interlocked.Increment(ref guestCollections);
+            }
             results[0] = ComponentValue.S32(arguments[0].AsS32());
         });
         return linker;
+    }
+
+    private static void CheckManagedCallback()
+    {
+        Interlocked.Increment(ref callbacks);
+        if (ThreadBackend)
+        {
+            callbackThreads.TryAdd(Environment.CurrentManagedThreadId, 0);
+        }
+        CheckRoots();
+    }
+
+    private static async Task CheckStackOverflow(Engine engine, int iterations)
+    {
+        using var recursive = Component.FromText(engine, """
+            (component
+              (core module $m
+                (func $recurse (export "recurse")
+                  call $recurse
+                  nop))
+              (core instance $i (instantiate $m))
+              (func (export "recurse") (canon lift (core func $i "recurse"))))
+            """);
+        using var linker = new ComponentLinker(engine);
+        for (var i = 0; i < iterations; i++)
+        {
+            using var store = new Store(engine);
+            store.Fuel = ulong.MaxValue;
+            var function = linker.Instantiate(store, recursive).GetFunction("recurse")!;
+            try
+            {
+                await function.CallAsync();
+                throw new InvalidOperationException("Recursive guest did not trap on stack exhaustion.");
+            }
+            catch (WasmtimeException error) when (error.Message.Contains("call stack exhausted"))
+            {
+                Interlocked.Increment(ref stackOverflows);
+            }
+        }
+    }
+
+    private static async Task CheckNested(Engine engine, Component component, int iterations, bool asyncInner)
+    {
+        await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => Task.Run(async () =>
+        {
+            using var innerStore = new Store(engine);
+            innerStore.Fuel = ulong.MaxValue;
+            using var innerLinker = CreateLinker(engine, false);
+            var inner = innerLinker.Instantiate(innerStore, component);
+            if (asyncInner)
+            {
+                EnableYield(innerStore);
+            }
+            var innerRun = inner.GetFunction("run")!;
+            var innerSpin = inner.GetFunction("spin")!;
+            using var outerStore = new Store(engine);
+            outerStore.Fuel = ulong.MaxValue;
+            using var outerLinker = new ComponentLinker(engine);
+            using (var root = outerLinker.Root())
+            {
+                root.DefineFunction("observe", (arguments, results) =>
+                {
+                    var sentinel = new Sentinel();
+                    CheckManagedCallback();
+                    var value = asyncInner
+                        ? innerRun.CallAsync(ComponentValue.S32(3)).GetAwaiter().GetResult()
+                        : innerRun.Call(ComponentValue.S32(3));
+                    if (value!.AsS32() != 6)
+                    {
+                        throw new InvalidOperationException("Nested call result was corrupted.");
+                    }
+                    // Component traps can poison Store entry state; use a disposable trap Store.
+                    using var trapStore = new Store(engine);
+                    trapStore.Fuel = ulong.MaxValue;
+                    var trapInstance = innerLinker.Instantiate(trapStore, component);
+                    if (asyncInner)
+                    {
+                        EnableYield(trapStore);
+                    }
+                    var innerTrap = trapInstance.GetFunction("boom")!;
+                    try
+                    {
+                        if (asyncInner)
+                        {
+                            innerTrap.CallAsync().GetAwaiter().GetResult();
+                        }
+                        else
+                        {
+                            innerTrap.Call();
+                        }
+                        throw new InvalidOperationException("Nested guest trap was not surfaced.");
+                    }
+                    catch (WasmtimeException error) when (error.Message.Contains("unreachable"))
+                    {
+                        Interlocked.Increment(ref recoveredTraps);
+                    }
+                    var recovered = asyncInner
+                        ? innerSpin.CallAsync(ComponentValue.S32(100)).GetAwaiter().GetResult()
+                        : innerSpin.Call(ComponentValue.S32(100));
+                    if (recovered!.AsS32() != 42)
+                    {
+                        throw new InvalidOperationException("Nested Store failed after a trap.");
+                    }
+                    sentinel.Verify();
+                    GC.KeepAlive(sentinel);
+                    Interlocked.Increment(ref nestedCalls);
+                    results[0] = ComponentValue.S32(arguments[0].AsS32());
+                });
+            }
+            var outer = outerLinker.Instantiate(outerStore, component).GetFunction("run")!;
+            EnableYield(outerStore);
+            for (var i = 0; i < iterations; i++)
+            {
+                var call = outer.CallAsync(ComponentValue.S32(100));
+                if (call.IsCompleted)
+                {
+                    await call;
+                    throw new InvalidOperationException("Nested outer call never suspended.");
+                }
+                Interlocked.Increment(ref pendingPolls);
+                if ((await call)!.AsS32() != 5050)
+                {
+                    throw new InvalidOperationException("Nested outer result was corrupted.");
+                }
+            }
+        })));
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -352,6 +561,14 @@ internal static class Program
                     throw;
                 }
             }
+            using var freshStore = new Store(engine);
+            freshStore.Fuel = ulong.MaxValue;
+            var fresh = linker.Instantiate(freshStore, component);
+            if ((await fresh.GetFunction("spin")!.CallAsync(ComponentValue.S32(100)))!.AsS32() != 42)
+            {
+                throw new InvalidOperationException("Store failed after a host error or guest trap.");
+            }
+            Interlocked.Increment(ref recoveredTraps);
         }
     }
 
@@ -366,6 +583,15 @@ internal static class Program
 
     [DllImport("wasmtime")]
     private static extern IntPtr wasmtime_context_fuel_async_yield_interval(IntPtr context, ulong interval);
+
+    [DllImport("wasmtime")]
+    private static extern ulong wasmtime_thread_fiber_started();
+
+    [DllImport("wasmtime")]
+    private static extern ulong wasmtime_thread_fiber_live();
+
+    [DllImport("wasmtime")]
+    private static extern ulong wasmtime_thread_fiber_tls_suspensions();
 
     private sealed class Sentinel
     {
@@ -397,6 +623,10 @@ internal static class Program
                 {
                     try
                     {
+                        if (ThreadBackend)
+                        {
+                            pollingThreads.TryAdd(Environment.CurrentManagedThreadId, 0);
+                        }
                         request.Result.SetResult(ComponentFunction.Native.wasmtime_call_future_poll(request.Future));
                     }
                     catch (Exception error)
