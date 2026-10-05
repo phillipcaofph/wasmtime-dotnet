@@ -517,10 +517,10 @@ index 883f10a059..fe28d07fad 100644
  pub use limits::*;
  pub use linker::*;
 diff --git a/crates/wasmtime/src/runtime/component/concurrent.rs b/crates/wasmtime/src/runtime/component/concurrent.rs
-index 079ce49e6e..7919647a6c 100644
+index 079ce49e6e..f67a314045 100644
 --- a/crates/wasmtime/src/runtime/component/concurrent.rs
 +++ b/crates/wasmtime/src/runtime/component/concurrent.rs
-@@ -113,7 +113,23 @@ mod error_contexts;
+@@ -113,7 +113,31 @@ mod error_contexts;
  mod func;
  mod future_stream_any;
  mod futures_and_streams;
@@ -532,6 +532,14 @@ index 079ce49e6e..7919647a6c 100644
 +    feature = "gc"
 +))]
 +mod p3_thread_tests;
++#[cfg(all(
++    test,
++    wasmtime_thread_fibers,
++    feature = "cranelift",
++    feature = "wat",
++    feature = "gc"
++))]
++mod panic_thread_tests;
  pub(crate) mod table;
 +#[cfg(all(
 +    test,
@@ -1530,6 +1538,485 @@ index 0000000000..73439c2020
 +guest_cancel_test!(p3_future_guest_cancel_write_retry_rejected, false, true);
 +guest_cancel_test!(p3_future_guest_cancel_write_and_close, false, false);
 +guest_cancel_test!(p3_stream_guest_cancel_write_and_retry, true, true);
+diff --git a/crates/wasmtime/src/runtime/component/concurrent/panic_thread_tests.rs b/crates/wasmtime/src/runtime/component/concurrent/panic_thread_tests.rs
+new file mode 100644
+index 0000000000..0697781efe
+--- /dev/null
++++ b/crates/wasmtime/src/runtime/component/concurrent/panic_thread_tests.rs
+@@ -0,0 +1,473 @@
++use super::thread_tests::{assert_tls_empty, assert_workers_stopped, isolated_test};
++use crate::component::{Component, Linker, Resource, ResourceType};
++use crate::prelude::*;
++use crate::{Config, Engine, Func, Instance, Module, Store};
++use core::future::Future;
++use core::pin::Pin;
++use core::task::{Context, Poll, Waker};
++use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
++use std::sync::{
++    Arc, Mutex,
++    atomic::{AtomicUsize, Ordering},
++};
++use std::thread::{self, ThreadId};
++
++#[derive(Default)]
++struct Observations {
++    polls: Mutex<Vec<ThreadId>>,
++    dropped: AtomicUsize,
++    payload_dropped: AtomicUsize,
++    drops_on: Mutex<Vec<ThreadId>>,
++}
++
++struct Payload {
++    marker: u32,
++    origin: ThreadId,
++    observations: Arc<Observations>,
++}
++
++impl Drop for Payload {
++    fn drop(&mut self) {
++        self.observations
++            .payload_dropped
++            .fetch_add(1, Ordering::SeqCst);
++    }
++}
++
++fn raise(observations: &Arc<Observations>) -> ! {
++    panic_any(Payload {
++        marker: 5050,
++        origin: thread::current().id(),
++        observations: observations.clone(),
++    })
++}
++
++fn check_panic(action: impl FnOnce(), observations: &Observations, origin: ThreadId) {
++    let payload = catch_unwind(AssertUnwindSafe(action)).expect_err("host panic was lost");
++    assert_tls_empty();
++    let payload = payload
++        .downcast::<Payload>()
++        .expect("panic payload changed");
++    assert_eq!(payload.marker, 5050);
++    assert_eq!(payload.origin, origin);
++    assert_eq!(observations.payload_dropped.load(Ordering::SeqCst), 0);
++    drop(payload);
++    assert_eq!(observations.payload_dropped.load(Ordering::SeqCst), 1);
++}
++
++struct PendingPanic {
++    observations: Arc<Observations>,
++    polls: usize,
++    panic_poll: usize,
++    panic_drop: bool,
++}
++
++impl Future for PendingPanic {
++    type Output = Result<()>;
++
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        self.polls += 1;
++        self.observations
++            .polls
++            .lock()
++            .unwrap()
++            .push(thread::current().id());
++        if self.polls == self.panic_poll {
++            raise(&self.observations);
++        }
++        cx.waker().wake_by_ref();
++        Poll::Pending
++    }
++}
++
++impl Drop for PendingPanic {
++    fn drop(&mut self) {
++        self.observations.dropped.fetch_add(1, Ordering::SeqCst);
++        self.observations
++            .drops_on
++            .lock()
++            .unwrap()
++            .push(thread::current().id());
++        if self.panic_drop {
++            raise(&self.observations);
++        }
++    }
++}
++
++fn engine() -> Result<Engine> {
++    let mut config = Config::new();
++    config.macos_use_mach_ports(false);
++    config.wasm_component_model_async(true);
++    Engine::new(&config)
++}
++
++fn ready<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
++    let mut future = Box::pin(future);
++    match future
++        .as_mut()
++        .poll(&mut Context::from_waker(Waker::noop()))
++    {
++        Poll::Ready(r) => r,
++        Poll::Pending => panic!("fixture initialization unexpectedly suspended"),
++    }
++}
++
++fn healthy(engine: &Engine) -> Result<()> {
++    assert_tls_empty();
++    let module = Module::new(
++        engine,
++        "(module (func (export \"run\") (result i32) i32.const 42))",
++    )?;
++    let mut store = Store::new(engine, ());
++    let instance = ready(Instance::new_async(&mut store, &module, &[]))?;
++    let func = instance.get_typed_func::<(), i32>(&mut store, "run")?;
++    assert_eq!(ready(func.call_async(&mut store, ()))?, 42);
++    drop(store);
++    assert_tls_empty();
++    assert_workers_stopped();
++    Ok(())
++}
++
++fn migrate_pending<F: Future + Send>(mut future: Pin<&mut F>) -> ThreadId {
++    let suspensions = crate::fiber::wasmtime_thread_fiber_tls_suspensions();
++    assert!(
++        future
++            .as_mut()
++            .poll(&mut Context::from_waker(Waker::noop()))
++            .is_pending()
++    );
++    assert_tls_empty();
++    let migrated = thread::scope(|scope| {
++        scope
++            .spawn(|| {
++                assert_tls_empty();
++                assert!(
++                    future
++                        .as_mut()
++                        .poll(&mut Context::from_waker(Waker::noop()))
++                        .is_pending()
++                );
++                assert_tls_empty();
++                thread::current().id()
++            })
++            .join()
++            .unwrap()
++    });
++    assert!(crate::fiber::wasmtime_thread_fiber_tls_suspensions() >= suspensions + 2);
++    migrated
++}
++
++fn core_panic(panic_poll: usize, panic_drop: bool) -> Result<()> {
++    let engine = engine()?;
++    let mut store = Store::new(&engine, ());
++    let observations = Arc::new(Observations::default());
++    let observed = observations.clone();
++    let host = if panic_poll == 0 && !panic_drop {
++        Func::wrap(&mut store, move || -> () {
++            observed.polls.lock().unwrap().push(thread::current().id());
++            raise(&observed);
++        })
++    } else {
++        Func::wrap_async(&mut store, move |_, (): ()| {
++            Box::new(PendingPanic {
++                observations: observed.clone(),
++                polls: 0,
++                panic_poll,
++                panic_drop,
++            })
++        })
++    };
++    let module = Module::new(
++        &engine,
++        "(module (import \"\" \"host\" (func $host)) (func $run (export \"run\") call $host))",
++    )?;
++    let instance = ready(Instance::new_async(&mut store, &module, &[host.into()]))?;
++    let func = instance.get_typed_func::<(), ()>(&mut store, "run")?;
++    let mut future = Box::pin(func.call_async(&mut store, ()));
++    let first = thread::current().id();
++    if panic_poll > 1 || panic_drop {
++        let second = migrate_pending(future.as_mut());
++        assert_ne!(first, second);
++    }
++    // Immediate panics have not recorded their worker yet.
++    let payload = catch_unwind(AssertUnwindSafe(|| {
++        if panic_drop {
++            drop(future);
++        } else {
++            let result = future
++                .as_mut()
++                .poll(&mut Context::from_waker(Waker::noop()));
++            assert!(result.is_ready(), "panic poll unexpectedly suspended");
++            drop(future);
++        }
++    }))
++    .expect_err("worker panic was lost");
++    assert_tls_empty();
++    let origin = observations.polls.lock().unwrap()[0];
++    assert_ne!(origin, first);
++    check_panic(|| std::panic::resume_unwind(payload), &observations, origin);
++    assert_eq!(
++        observations.dropped.load(Ordering::SeqCst),
++        usize::from(panic_poll != 0 || panic_drop)
++    );
++    assert!(
++        observations
++            .drops_on
++            .lock()
++            .unwrap()
++            .iter()
++            .all(|id| *id == origin)
++    );
++    drop(store);
++    assert_workers_stopped();
++    healthy(&engine)
++}
++
++fn concurrent_panic(panic_poll: usize, panic_drop: bool) -> Result<()> {
++    let engine = engine()?;
++    let component = Component::new(
++        &engine,
++        r#"
++        (component
++            (import "host" (func $host async))
++            (core func $host (canon lower (func $host)))
++            (core module $m
++                (import "" "host" (func $host))
++                (func $run (export "run") call $host))
++            (core instance $i (instantiate $m
++                (with "" (instance (export "host" (func $host))))))
++            (func (export "run") async (canon lift (core func $i "run"))))
++    "#,
++    )?;
++    let observations = Arc::new(Observations::default());
++    let observed = observations.clone();
++    let mut linker = Linker::<u32>::new(&engine);
++    linker
++        .root()
++        .func_wrap_concurrent("host", move |accessor, (): ()| {
++            let mut pending = Box::pin(PendingPanic {
++                observations: observed.clone(),
++                polls: 0,
++                panic_poll,
++                panic_drop,
++            });
++            Box::pin(async move {
++                core::future::poll_fn(|cx| {
++                    accessor.with(|mut access| {
++                        assert_eq!(*access.data_mut(), 101);
++                        super::tls::try_get(|state| {
++                            assert!(matches!(state, super::tls::TryGet::Taken))
++                        });
++                    });
++                    pending.as_mut().poll(cx)
++                })
++                .await
++            })
++        })?;
++    let mut store = Store::new(&engine, 101u32);
++    let instance = ready(linker.instantiate_async(&mut store, &component))?;
++    let func = instance.get_typed_func::<(), ()>(&mut store, "run")?;
++    let mut future =
++        Box::pin(store.run_concurrent(async |accessor| func.call_concurrent(accessor, ()).await));
++    // Initial host polling is on the worker; later polling is on scheduler TLS.
++    let payload = if panic_poll == 1 {
++        catch_unwind(AssertUnwindSafe(|| {
++            let _ = future
++                .as_mut()
++                .poll(&mut Context::from_waker(Waker::noop()));
++        }))
++        .expect_err("initial concurrent panic was lost")
++    } else {
++        for _ in 0..100 {
++            assert!(
++                future
++                    .as_mut()
++                    .poll(&mut Context::from_waker(Waker::noop()))
++                    .is_pending()
++            );
++            assert_tls_empty();
++            if observations.polls.lock().unwrap().len() >= 2 {
++                break;
++            }
++        }
++        let (payload, catcher) = thread::scope(|scope| {
++            scope
++                .spawn(|| {
++                    assert_tls_empty();
++                    let payload = catch_unwind(AssertUnwindSafe(|| {
++                        for _ in 0..100 {
++                            let _ = future
++                                .as_mut()
++                                .poll(&mut Context::from_waker(Waker::noop()));
++                            assert_tls_empty();
++                        }
++                    }))
++                    .expect_err("migrated scheduler panic was lost");
++                    assert_tls_empty();
++                    (payload, thread::current().id())
++                })
++                .join()
++                .unwrap()
++        });
++        assert_eq!(payload.downcast_ref::<Payload>().unwrap().origin, catcher);
++        payload
++    };
++    let polls = observations.polls.lock().unwrap().clone();
++    let origin = *polls.last().unwrap();
++    if panic_poll > 1 {
++        assert_ne!(origin, polls[0]);
++    }
++    check_panic(|| std::panic::resume_unwind(payload), &observations, origin);
++    drop(future);
++    assert_tls_empty();
++    drop(store);
++    assert_eq!(observations.dropped.load(Ordering::SeqCst), 1);
++    assert_workers_stopped();
++    healthy(&engine)
++}
++
++struct HostResource;
++
++fn resource_panic(concurrent: bool, panic_drop: bool) -> Result<()> {
++    let engine = engine()?;
++    let component = Component::new(
++        &engine,
++        r#"
++        (component
++            (import "r" (type $r (sub resource)))
++            (core func $drop (canon resource.drop $r))
++            (core module $m
++                (import "" "drop" (func $drop (param i32)))
++                (func $run (export "run") (param i32) (call $drop (local.get 0))))
++            (core instance $i (instantiate $m
++                (with "" (instance (export "drop" (func $drop))))))
++            (func (export "run") (param "r" (own $r))
++                (canon lift (core func $i "run"))))
++    "#,
++    )?;
++    let observations = Arc::new(Observations::default());
++    let observed = observations.clone();
++    let mut linker = Linker::<u32>::new(&engine);
++    let panic_poll = if panic_drop { 0 } else { 3 };
++    if concurrent {
++        linker.root().resource_concurrent(
++            "r",
++            ResourceType::host::<HostResource>(),
++            move |accessor, rep| {
++                assert_eq!(rep, 77);
++                let mut pending = Box::pin(PendingPanic {
++                    observations: observed.clone(),
++                    polls: 0,
++                    panic_poll,
++                    panic_drop,
++                });
++                Box::pin(async move {
++                    core::future::poll_fn(|cx| {
++                        accessor.with(|mut access| {
++                            assert_eq!(*access.data_mut(), 101);
++                            super::tls::try_get(|state| {
++                                assert!(matches!(state, super::tls::TryGet::Taken))
++                            });
++                        });
++                        pending.as_mut().poll(cx)
++                    })
++                    .await
++                })
++            },
++        )?;
++    } else {
++        linker.root().resource_async(
++            "r",
++            ResourceType::host::<HostResource>(),
++            move |store, rep| {
++                assert_eq!(rep, 77);
++                assert_eq!(*store.data(), 101);
++                Box::new(PendingPanic {
++                    observations: observed.clone(),
++                    polls: 0,
++                    panic_poll,
++                    panic_drop,
++                })
++            },
++        )?;
++    }
++    let mut store = Store::new(&engine, 101u32);
++    let instance = ready(linker.instantiate_async(&mut store, &component))?;
++    let func = instance.get_typed_func::<(Resource<HostResource>,), ()>(&mut store, "run")?;
++    let mut future = Box::pin(func.call_async(&mut store, (Resource::new_own(77),)));
++    migrate_pending(future.as_mut());
++    let worker = observations.polls.lock().unwrap()[0];
++    let payload = thread::scope(|scope| {
++        scope
++            .spawn(|| {
++                assert_tls_empty();
++                let payload = catch_unwind(AssertUnwindSafe(|| {
++                    if panic_drop {
++                        drop(future);
++                    } else {
++                        let _ = future
++                            .as_mut()
++                            .poll(&mut Context::from_waker(Waker::noop()));
++                        drop(future);
++                    }
++                }))
++                .expect_err("resource destructor panic was lost");
++                assert_tls_empty();
++                assert_ne!(thread::current().id(), worker);
++                payload
++            })
++            .join()
++            .unwrap()
++    });
++    check_panic(|| std::panic::resume_unwind(payload), &observations, worker);
++    assert_eq!(observations.dropped.load(Ordering::SeqCst), 1);
++    assert!(
++        observations
++            .polls
++            .lock()
++            .unwrap()
++            .iter()
++            .all(|id| *id == worker)
++    );
++    assert_eq!(*observations.drops_on.lock().unwrap(), vec![worker]);
++    drop(store);
++    assert_workers_stopped();
++    healthy(&engine)
++}
++
++macro_rules! panic_test {
++    ($name:ident, $run:expr) => {
++        #[test]
++        fn $name() -> Result<()> {
++            isolated_test(
++                concat!(
++                    "runtime::component::concurrent::panic_thread_tests::",
++                    stringify!($name)
++                ),
++                $run,
++                2,
++            )
++        }
++    };
++}
++
++panic_test!(panic_sync_host_worker, || core_panic(0, false));
++panic_test!(panic_async_host_first_poll, || core_panic(1, false));
++panic_test!(panic_async_host_after_migration, || core_panic(3, false));
++panic_test!(panic_async_host_cancel_drop, || core_panic(0, true));
++panic_test!(panic_async_resource_poll, || resource_panic(false, false));
++panic_test!(panic_async_resource_cancel_drop, || resource_panic(
++    false, true
++));
++panic_test!(panic_concurrent_resource_poll, || resource_panic(
++    true, false
++));
++panic_test!(panic_concurrent_resource_cancel_drop, || resource_panic(
++    true, true
++));
++panic_test!(panic_concurrent_host_first_poll, || concurrent_panic(
++    1, false
++));
++panic_test!(panic_concurrent_host_scheduler, || concurrent_panic(
++    4, false
++));
 diff --git a/crates/wasmtime/src/runtime/component/concurrent/thread_tests.rs b/crates/wasmtime/src/runtime/component/concurrent/thread_tests.rs
 new file mode 100644
 index 0000000000..a8edbc2157
