@@ -62,7 +62,7 @@ to have fixed its TLS or Rust soundness limitations. In particular:
 
 ### P3 reads and resource-destructor lifecycle
 
-The native patch now includes eighteen isolated lifecycle regressions:
+The native patch now includes twenty isolated lifecycle regressions:
 
 - Async-lifted guest exports synchronously read host-produced futures/streams.
   Producers first poll on workers, then on both original and migrated schedulers.
@@ -71,6 +71,10 @@ The native patch now includes eighteen isolated lifecycle regressions:
 - Guest async reads return `BLOCKED`; synchronous cancel-read and retry run
   twice on the same handle, with exact `CANCELLED` results and two producer
   finish requests. Guest close promptly retires the producer.
+- Async `future.cancel-read` and `stream.cancel-read` both return `BLOCKED`
+  while producer cancellation is pending. Guest waitable-set join/wait observes
+  completion before retrying the same handle; each producer receives exactly
+  two finish requests and is destroyed once.
 - Guest resource drops use both async and concurrent host destructors through
   a sync-lifted export called asynchronously. Destructors remain on their worker
   while polling migrates; concurrent destructor accessor TLS preserves `Taken`.
@@ -87,15 +91,14 @@ empty scheduler TLS outside polls, and zero live workers after teardown. Each
 runs in a 60-second-bounded subprocess, followed by a fresh healthy Store control.
 The earlier combined native suite passed 31/31 on Linux Arm64 and macOS Arm64
 (explicit Unix signals), and the original fourteen cases passed ten repetitions
-on each platform (140/140 each). The current 30-test P3 subset passed on macOS
-Arm64; the four new parked-root cases also passed ten serial runs each
-(40/40, each followed by a healthy-Store control). Linux re-validation of these
-four cases remains outstanding. Stock controls passed 3/3 on macOS. No
-production runtime fix was needed for these measured paths, and no managed
-matrix rerun is claimed.
+on each platform (140/140 each). The current 32-test P3 subset and ten repeats
+of the two new async-cancel cases passed on macOS Arm64. Linux re-validation of
+the six newer parked-root/async-cancel cases remains outstanding. Stock controls
+passed 3/3 on macOS. No production runtime fix was needed for these measured
+paths, and no managed matrix rerun is claimed.
 
 This does not prove all P3 paths. Selected writer/consumer and multi-item
-backpressure paths are now covered below; async cancel builtins, callback-style
+backpressure paths are now covered below; async cancel-write, callback-style
 exports and concurrent combinations remain unproven. Upstream concurrent
 resource destructors currently use exclusive Store access, not genuinely
 parallel destruction. Future destruction after

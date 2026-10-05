@@ -1,9 +1,9 @@
 diff --git a/crates/fiber/README.md b/crates/fiber/README.md
 new file mode 100644
-index 0000000000..86b020b5c8
+index 0000000000..501ecf877c
 --- /dev/null
 +++ b/crates/fiber/README.md
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,447 @@
 +# Experimental OS-thread-backed execution
 +
 +This branch is based on Wasmtime **v48.0.2**. It is a feasibility experiment for
@@ -159,7 +159,7 @@ index 0000000000..86b020b5c8
 +
 +## P3 reads and resource-destructor lifecycle follow-up
 +
-+Eighteen isolated regressions in
++Twenty isolated regressions in
 +[`concurrent/p3_thread_tests.rs`](../wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs)
 +exercise:
 +
@@ -176,6 +176,10 @@ index 0000000000..86b020b5c8
 +  the same readable handle after async reads return `BLOCKED`. The guest checks
 +  exact `CANCELLED` codes; the producer sees two finish requests. Closing the
 +  readable handle retires the producer without waiting for Store drop.
++- Async `future.cancel-read` and `stream.cancel-read` both return `BLOCKED`
++  while producer cancellation is pending. Guest waitable-set join/wait observes
++  completion before retrying the same handle; each producer receives exactly
++  two finish requests and is destroyed once.
 +- Guest `resource.drop` with both `Linker::resource_async` and
 +  `Linker::resource_concurrent`, through a synchronous component export invoked
 +  with `call_async`. Each destructor suspends across polling-thread migration.
@@ -205,15 +209,14 @@ index 0000000000..86b020b5c8
 +
 +The earlier combined native suite passed 31/31 on Linux Arm64 and macOS Arm64
 +(explicit Unix signals), and the original fourteen cases passed ten repetitions
-+on each platform (140/140 each). The current 30-test P3 subset passed on macOS
-+Arm64; the four new parked-root cases also passed ten serial runs each
-+(40/40, each followed by a healthy-Store control). Linux re-validation of these
-+four cases remains outstanding. Stock-backend configuration controls still
-+passed 3/3 on macOS.
++on each platform (140/140 each). The current 32-test P3 subset and ten repeats
++of the two new async-cancel cases passed on macOS Arm64. Linux re-validation of
++the six newer parked-root/async-cancel cases remains outstanding.
++Stock-backend configuration controls still passed 3/3 on macOS.
 +
 +This is selected lifecycle coverage, not full P3 soundness. The next follow-up
 +below covers selected writers/host consumers and multi-item backpressure.
-+Async cancellation builtins, callback-style exports and concurrent multi-task
++Async cancel-write builtins, callback-style exports and concurrent multi-task
 +combinations remain unproven.
 +`resource_concurrent` currently uses an exclusive borrowed-Store path upstream;
 +these tests do not establish parallel destructor execution. Destroying a
@@ -1136,10 +1139,10 @@ index 079ce49e6e..f67a314045 100644
  /// Constant defined in the Component Model spec to indicate that the async
 diff --git a/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs
 new file mode 100644
-index 0000000000..8cef10d33f
+index 0000000000..74e5fa5808
 --- /dev/null
 +++ b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs
-@@ -0,0 +1,686 @@
+@@ -0,0 +1,808 @@
 +use super::thread_tests::{assert_tls_empty, assert_workers_stopped, isolated_test};
 +use crate::component::{
 +    Component, Destination, FutureProducer, FutureReader, Linker, Resource, ResourceType,
@@ -1341,6 +1344,70 @@ index 0000000000..8cef10d33f
 +                    (export "drop" (func $drop))))))
 +            (func (export "run") async (param "r" $t)
 +                (canon lift (core func $i "run"))))"#
++    )
++}
++
++fn reader_component_with_async_cancel(stream: bool) -> String {
++    let kind = if stream { "stream" } else { "future" };
++    let read_args = if stream { "i32 i32 i32" } else { "i32 i32" };
++    let read_count = if stream { "(i32.const 1)" } else { "" };
++    format!(
++        r#"(component
++            (core module $libc (memory (export "memory") 1))
++            (core instance $libc (instantiate $libc))
++            (type $t ({kind} u32))
++            (core module $m
++                (import "" "memory" (memory 1))
++                (import "" "read" (func $read (param {read_args}) (result i32)))
++                (import "" "cancel" (func $cancel (param i32) (result i32)))
++                (import "" "drop" (func $drop (param i32)))
++                (import "" "join" (func $join (param i32 i32)))
++                (import "" "new" (func $new (result i32)))
++                (import "" "wait" (func $wait (param i32 i32) (result i32)))
++                (import "" "set-drop" (func $set-drop (param i32)))
++                (func (export "run") (param $reader i32)
++                    (local $attempt i32)
++                    (local $result i32)
++                    (local $set i32)
++                    (loop $retry
++                        (call $read (local.get $reader) (i32.const 0) {read_count})
++                        i32.const -1
++                        i32.ne
++                        if unreachable end
++                        (local.set $result (call $cancel (local.get $reader)))
++                        (if (i32.eq (local.get $result) (i32.const -1))
++                            (then
++                                (local.set $set (call $new))
++                                (call $join (local.get $reader) (local.get $set))
++                                (drop (call $wait (local.get $set) (i32.const 16)))
++                                (call $join (local.get $reader) (i32.const 0))
++                                (call $set-drop (local.get $set))))
++                        (if (i32.ne (local.get $result) (i32.const -1))
++                            (then
++                                (if (i32.ne (local.get $result) (i32.const 2))
++                                    (then unreachable))))
++                        (local.set $attempt (i32.add (local.get $attempt) (i32.const 1)))
++                        (br_if $retry (i32.lt_u (local.get $attempt) (i32.const 2))))
++                    (call $drop (local.get $reader))))
++            (core func $read (canon {kind}.read $t async (memory (core memory $libc "memory"))))
++            (core func $cancel (canon {kind}.cancel-read $t async))
++            (core func $drop (canon {kind}.drop-readable $t))
++            (canon waitable.join (core func $join))
++            (canon waitable-set.new (core func $new))
++            (canon waitable-set.wait (memory (core memory $libc "memory")) (core func $wait))
++            (canon waitable-set.drop (core func $set-drop))
++            (core instance $i (instantiate $m
++                (with "" (instance
++                    (export "memory" (memory $libc "memory"))
++                    (export "read" (func $read))
++                    (export "cancel" (func $cancel))
++                    (export "drop" (func $drop))
++                    (export "join" (func $join))
++                    (export "new" (func $new))
++                    (export "wait" (func $wait))
++                    (export "set-drop" (func $set-drop))))))
++            (func (export "run") async (param "r" $t)
++                (canon lift (core func $i "run") (memory (core memory $libc "memory")))))"#
 +    )
 +}
 +
@@ -1669,6 +1736,41 @@ index 0000000000..8cef10d33f
 +    Ok(())
 +}
 +
++fn run_guest_async_cancellation(stream: bool) -> Result<()> {
++    assert_tls_empty();
++    let engine = engine()?;
++    let component = Component::new(&engine, reader_component_with_async_cancel(stream))?;
++    let mut store = Store::new(&engine, 101u32);
++    let linker = Linker::new(&engine);
++    let mut init = Box::pin(linker.instantiate_async(&mut store, &component));
++    let instance = match init.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
++        Poll::Ready(result) => result?,
++        Poll::Pending => panic!("unexpected instantiation suspension"),
++    };
++    drop(init);
++    let observations = Arc::new(Observations::default());
++    if stream {
++        let func = instance.get_typed_func::<(StreamReader<u32>,), ()>(&mut store, "run")?;
++        let reader = StreamReader::new(&mut store, Producer(observations.clone()))?;
++        finish_guest_cancellation(Box::pin(func.call_async(&mut store, (reader,))))?;
++    } else {
++        let func = instance.get_typed_func::<(FutureReader<u32>,), ()>(&mut store, "run")?;
++        let reader = FutureReader::new(&mut store, Producer(observations.clone()))?;
++        finish_guest_cancellation(Box::pin(func.call_async(&mut store, (reader,))))?;
++    }
++    assert_eq!(
++        observations.cancellations.load(Ordering::SeqCst),
++        2,
++        "async cancel-read did not reach producer twice"
++    );
++    assert_eq!(observations.completed.load(Ordering::SeqCst), 0);
++    assert_eq!(observations.drops.load(Ordering::SeqCst), 1);
++    drop(store);
++    assert_workers_stopped();
++    assert_tls_empty();
++    Ok(())
++}
++
 +fn finish_guest_cancellation(mut future: Pin<Box<impl Future<Output = Result<()>>>>) -> Result<()> {
 +    for _ in 0..100 {
 +        let result = future
@@ -1704,6 +1806,29 @@ index 0000000000..8cef10d33f
 +
 +guest_cancel_test!(p3_future_guest_cancel_and_retry, false);
 +guest_cancel_test!(p3_stream_guest_cancel_and_retry, true);
++
++macro_rules! guest_async_cancel_test {
++    ($name:ident, $stream:expr) => {
++        #[test]
++        fn $name() -> Result<()> {
++            isolated_test(
++                concat!(
++                    "runtime::component::concurrent::p3_thread_tests::",
++                    stringify!($name)
++                ),
++                || {
++                    run_guest_async_cancellation($stream)?;
++                    assert_workers_stopped();
++                    run_reader($stream, Finish::Complete)
++                },
++                2,
++            )
++        }
++    };
++}
++
++guest_async_cancel_test!(p3_future_guest_async_cancel_and_retry, false);
++guest_async_cancel_test!(p3_stream_guest_async_cancel_and_retry, true);
 +
 +const RESOURCE_COMPONENT: &str = r#"
 +    (component
