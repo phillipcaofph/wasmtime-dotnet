@@ -83,7 +83,7 @@ to have fixed its TLS or Rust soundness limitations. In particular:
 
 ### P3 reads and resource-destructor lifecycle
 
-The native patch now includes twenty-one isolated lifecycle regressions:
+The native patch now includes twenty-two isolated lifecycle regressions:
 
 - Async-lifted guest exports synchronously read host-produced futures/streams.
   Producers first poll on workers, then on both original and migrated schedulers.
@@ -111,6 +111,10 @@ The native patch now includes twenty-one isolated lifecycle regressions:
   scheduler poll, then passes through a guest async drop export. The test checks
   distinct guest-worker/scheduler thread IDs and exactly-once host destruction,
   including Store teardown.
+- A `StreamReader<u32>` is forwarded from one guest instance into a second
+  guest instance by a concurrent host adapter. The adapter does not consume the
+  stream; the receiving guest reads and validates the value. The test checks
+  distinct worker threads for both guest instances and migrated producer polls.
 
 Cases require started workers, saved activation evidence for parked operations,
 empty scheduler TLS outside polls, and zero live workers after teardown. Each
@@ -119,8 +123,12 @@ The earlier combined native suite passed 31/31 on Linux Arm64 and macOS Arm64
 (explicit Unix signals), and the original fourteen cases passed ten repetitions
 on each platform (140/140 each). The earlier 34-test P3 subset passed on Linux
 Arm64 and macOS Arm64. After adding the owned-resource stream case, the 35-test
-P3 subset passed 35/35 on Linux Arm64 and under Linux x64 Docker emulation; the
-new case passed ten serial repetitions on each architecture (20/20 total). The
+P3 subset passed 35/35 on Linux Arm64 and under Linux x64 Docker emulation; that
+case passed ten serial repetitions on each architecture (20/20 total). With the
+guest-instance forwarding case, the 36-test P3 subset passed 36/36 on Linux
+Arm64 and under Linux x64 Docker emulation; that case passed ten serial
+repetitions on each architecture (20/20 total). Neither new case has been run
+on macOS. The
 earlier 34-test Linux Arm64 suite passed ten serial repetitions (340/340). The
 concurrent `thread_tests` module passed 10/10 on Linux Arm64 and ten serial
 repetitions (100/100), including parked-root and parked-sibling trap cases.
@@ -130,8 +138,9 @@ emulation. Stock controls passed 3/3 on macOS. No production runtime fix was
 needed for these measured paths, and no managed matrix rerun is claimed.
 
 This does not prove all P3 paths. Selected writer/consumer and multi-item
-backpressure paths are now covered below; a host-to-guest-to-host owned-resource
-stream transfer is covered above, but guest-to-guest resource transfers,
+backpressure paths are now covered below; host-to-guest-to-host owned-resource
+transfer and guest-instance stream-reader forwarding are covered above, but
+guest-to-guest resource transfers,
 zero-length readiness, callback-style exports and
 broader concurrent combinations remain unproven. Upstream concurrent resource
 destructors currently use exclusive Store access, not genuinely parallel
@@ -169,19 +178,22 @@ treated as successful retry support or changed by the experiment.
 Linux Arm64 and macOS Arm64 (explicit Unix signals) passed the earlier **43/43**
 combined native tests and **120/120** repeated original writer cases. The
 earlier 34-test P3 suite passed on Linux Arm64 and macOS Arm64. The updated
-35-test Linux P3 suite passed 35/35 on Arm64 and under Linux x64 Docker
-emulation; the new owned-resource case passed ten serial repetitions on each
-architecture (20/20 total). Linux passed ten serial repetitions of the earlier
+36-test Linux P3 suite passed 36/36 on Arm64 and under Linux x64 Docker
+emulation; the new guest-instance forwarding case passed ten serial repetitions
+on each architecture (20/20 total). The owned-resource case also passed ten
+serial repetitions on each architecture (20/20 total). Neither new case has
+been run on macOS. Linux passed ten serial repetitions of the earlier
 34-test P3 suite (**340/340**), including the two new async cancel-write cases;
 those two cases also passed ten repetitions each on macOS Arm64. Linux x64
 emulation also passed the earlier 34-test P3 suite and ten repetitions of each
-async cancel-write case. The new owned-resource case has not been run on macOS.
+async cancel-write case.
 Each isolated case includes a fresh healthy Store control. Stock configuration
 controls passed 3/3 on macOS. No production runtime fix or managed
 stress-matrix rerun is claimed for this native-test-only follow-up.
 
-The owned-resource P3 stream transfer is covered in the section above.
-Guest-to-guest resource transfers, zero-length readiness,
+The owned-resource P3 stream transfer and guest-instance stream-reader
+forwarding are covered in the section above. Guest-to-guest resource transfers,
+zero-length readiness,
 async cancel builtins beyond the selected guest cancel-read/cancel-write paths,
 and callback exports remain unproven. Exactly-once
 consumer destruction after cancellation/error does not guarantee external
