@@ -1,9 +1,9 @@
 diff --git a/crates/fiber/README.md b/crates/fiber/README.md
 new file mode 100644
-index 0000000000..c46381dceb
+index 0000000000..39900b2ad7
 --- /dev/null
 +++ b/crates/fiber/README.md
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,459 @@
 +# Experimental OS-thread-backed execution
 +
 +This branch is based on Wasmtime **v48.0.2**. It is a feasibility experiment for
@@ -209,15 +209,18 @@ index 0000000000..c46381dceb
 +
 +The earlier combined native suite passed 31/31 on Linux Arm64 and macOS Arm64
 +(explicit Unix signals), and the original fourteen cases passed ten repetitions
-+on each platform (140/140 each). The current 32-test P3 subset and ten repeats
-+of the two new async-cancel cases passed on macOS Arm64. Linux re-validation of
-+the six newer parked-root/async-cancel cases remains outstanding.
-+Stock-backend configuration controls still passed 3/3 on macOS.
++on each platform (140/140 each). The current 34-test P3 subset passed on Linux
++Arm64 and macOS Arm64; Linux passed ten serial repetitions (340/340). The
++concurrent `thread_tests` module passed 10/10 on Linux Arm64 and ten serial
++repetitions (100/100), including parked-root and parked-sibling trap cases.
++The two new async cancel-write cases also passed ten repetitions on macOS
++Arm64. Stock-backend configuration controls still passed 3/3 on macOS.
 +
 +This is selected lifecycle coverage, not full P3 soundness. The next follow-up
 +below covers selected writers/host consumers and multi-item backpressure.
-+Async cancel-write builtins, callback-style exports and concurrent multi-task
-+combinations remain unproven.
++Resource-bearing payloads, guest-to-guest transfers, zero-length readiness,
++callback-style exports and broader concurrent multi-task combinations remain
++unproven.
 +`resource_concurrent` currently uses an exclusive borrowed-Store path upstream;
 +these tests do not establish parallel destructor execution. Destroying a
 +destructor future once is not a claim that an embedder's external resource is
@@ -272,8 +275,10 @@ index 0000000000..c46381dceb
 +43-test suite and ten serial repetitions of the original twelve writer cases
 +(120/120 per platform). The current macOS P3 suite passed 34/34, and the two
 +new async cancel-write cases passed ten repetitions each (20/20, each including
-+a healthy Store control). Linux re-validation of these cases remains
-+outstanding. Stock configuration controls passed 3/3 on macOS. Use the
++a healthy Store control). The current 34-test P3 suite passed on Linux Arm64
++and macOS Arm64; Linux passed ten serial repetitions (340/340), including both
++new async cancel-write cases. Stock configuration controls passed 3/3 on
++macOS. Use the
 +experimental flags from Reproducing:
 +
 +```sh
@@ -323,8 +328,8 @@ index 0000000000..c46381dceb
 +53-test suite, plus ten serial repetitions of the original ten panic cases
 +(100/100 per platform, each including a fresh Store control). The added
 +parked-sibling case passed in the full 11-case panic module and ten additional
-+serial repetitions on macOS Arm64 with Unix signals; it has not yet been
-+rerun on Linux. Stock configuration controls passed 3/3 on macOS. With the
++serial repetitions on both Linux Arm64 and macOS Arm64 with explicit Unix
++signals. Stock configuration controls passed 3/3 on macOS. With the
 +experimental flags:
 +
 +```sh
@@ -338,8 +343,7 @@ index 0000000000..c46381dceb
 +destructors, an unstarted worker capture destructor panicking while the caller
 +is already unwinding, broader parked-sibling scenarios, actual OS thread-resource
 +exhaustion or process OOM. A deterministic injected spawn-error test checks
-+low-level stack/capture cleanup. The single measured parked-sibling case is
-+macOS-only so far. Cancellation Drop panics here occur during ordinary
++low-level stack/capture cleanup. Cancellation Drop panics here occur during ordinary
 +cancellation, not during another panic.
 +No failed Store is reused, and no guarantee of external resource release is
 +claimed after an async destructor panics. Wider lifetime/aliasing obligations,
