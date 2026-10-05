@@ -91,17 +91,20 @@ empty scheduler TLS outside polls, and zero live workers after teardown. Each
 runs in a 60-second-bounded subprocess, followed by a fresh healthy Store control.
 The earlier combined native suite passed 31/31 on Linux Arm64 and macOS Arm64
 (explicit Unix signals), and the original fourteen cases passed ten repetitions
-on each platform (140/140 each). The current 32-test P3 subset and ten repeats
-of the two new async-cancel cases passed on macOS Arm64. Linux re-validation of
-the six newer parked-root/async-cancel cases remains outstanding. Stock controls
-passed 3/3 on macOS. No production runtime fix was needed for these measured
-paths, and no managed matrix rerun is claimed.
+on each platform (140/140 each). The current 34-test P3 subset passed on Linux
+Arm64 and macOS Arm64; Linux passed ten serial repetitions (340/340). The
+concurrent `thread_tests` module passed 10/10 on Linux Arm64 and ten serial
+repetitions (100/100), including parked-root and parked-sibling trap cases.
+The two new async cancel-write cases also passed ten repetitions on macOS
+Arm64. Stock controls passed 3/3 on macOS. No production runtime fix was needed
+for these measured paths, and no managed matrix rerun is claimed.
 
 This does not prove all P3 paths. Selected writer/consumer and multi-item
-backpressure paths are now covered below; async cancel-write, callback-style
-exports and concurrent combinations remain unproven. Upstream concurrent
-resource destructors currently use exclusive Store access, not genuinely
-parallel destruction. Future destruction after
+backpressure paths are now covered below; resource-bearing payloads,
+guest-to-guest transfers, zero-length readiness, callback-style exports and
+broader concurrent combinations remain unproven. Upstream concurrent resource
+destructors currently use exclusive Store access, not genuinely parallel
+destruction. Future destruction after
 cancellation/error does not guarantee external resource cleanup. Selected
 panic paths are now tested below; OOM and
 the previously listed platform, Mach-handling and soundness limits remain open.
@@ -134,9 +137,10 @@ treated as successful retry support or changed by the experiment.
 
 Linux Arm64 and macOS Arm64 (explicit Unix signals) passed the earlier **43/43**
 combined native tests and **120/120** repeated original writer cases. The
-current macOS P3 suite passed **34/34**, and the two new async cancel-write
-cases passed ten repetitions each (20/20, each including a fresh healthy Store
-control). Linux re-validation of these cases remains outstanding. Stock
+current 34-test P3 suite passed on Linux Arm64 and macOS Arm64. Linux passed ten
+serial repetitions of the full P3 suite (**340/340**), including the two new
+async cancel-write cases; those two cases also passed ten repetitions each on
+macOS Arm64. Each isolated case includes a fresh healthy Store control. Stock
 configuration controls passed 3/3 on macOS. No production runtime fix or
 managed stress-matrix rerun is claimed for this native-test-only follow-up.
 
@@ -170,19 +174,17 @@ Linux Arm64 and macOS Arm64 (explicit Unix signals) each passed **53/53**
 combined tests plus **100/100** repeated panic cases. Stock controls passed
 3/3 on macOS. These counts cover the original ten panic cases. The new
 parked-sibling case passed the full 11-case panic module and ten additional
-serial repetitions on macOS Arm64 with Unix signals; Linux has not been
-rerun for this additional case. No production runtime fix or managed matrix
-rerun is claimed.
+serial repetitions on both Linux Arm64 and macOS Arm64 with explicit Unix
+signals. No production runtime fix or managed matrix rerun is claimed.
 
 These are single-panic unwind tests. Double panics during active unwinding,
 `panic=abort`, panicking hooks/payload destructors, an unstarted worker capture
 destructor panicking while the caller is already unwinding, broader
 parked-sibling scenarios, actual OS thread-resource exhaustion or process OOM
 remain unvalidated. The low-level constructor's injected spawn-error cleanup
-is tested separately. The one measured parked-sibling scenario is macOS-only
-so far. Exactly-once destructor-future destruction does not prove external
-resource release after a panic. No failed Store is reused; wider soundness and
-platform limits still apply.
+is tested separately. Exactly-once destructor-future destruction does not
+prove external resource release after a panic. No failed Store is reused;
+wider soundness and platform limits still apply.
 
 ### Unsupported stack configuration boundary
 
