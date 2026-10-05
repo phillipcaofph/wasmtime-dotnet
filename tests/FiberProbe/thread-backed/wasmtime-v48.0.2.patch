@@ -1,9 +1,9 @@
 diff --git a/crates/fiber/README.md b/crates/fiber/README.md
 new file mode 100644
-index 0000000000..4aeecfb1d5
+index 0000000000..86b020b5c8
 --- /dev/null
 +++ b/crates/fiber/README.md
-@@ -0,0 +1,439 @@
+@@ -0,0 +1,444 @@
 +# Experimental OS-thread-backed execution
 +
 +This branch is based on Wasmtime **v48.0.2**. It is a feasibility experiment for
@@ -32,6 +32,10 @@ index 0000000000..4aeecfb1d5
 +- An injected worker-spawn error returns the original stack and drops closure
 +  captures without running the body. This validates constructor cleanup, not
 +  behavior under actual OS thread-resource exhaustion or process OOM.
++- If an unstarted worker's capture destructor panics during teardown, the
++  worker is joined, shared state is reclaimed, and the original panic payload
++  is resumed on the dropping thread. This is tested for ordinary destruction,
++  not when the caller is already unwinding.
 +
 +The safe low-level constructor requires Send, owned `'static` captures and
 +messages. Wasmtime's borrowed execution uses an explicitly unsafe constructor,
@@ -320,11 +324,12 @@ index 0000000000..4aeecfb1d5
 +No production runtime fix was needed for these measured unwind paths.
 +This does not validate `panic=abort`, a second destructor panic during an
 +already-active unwind (Rust normally aborts), panicking panic hooks/payload
-+destructors, unstarted worker capture-destructor panics, broader parked-sibling
-+scenarios, actual OS thread-resource exhaustion or process OOM. A deterministic
-+injected spawn-error test checks low-level stack/capture cleanup. The single
-+measured parked-sibling case is macOS-only so far. Cancellation Drop panics here
-+occur during ordinary cancellation, not during another panic.
++destructors, an unstarted worker capture destructor panicking while the caller
++is already unwinding, broader parked-sibling scenarios, actual OS thread-resource
++exhaustion or process OOM. A deterministic injected spawn-error test checks
++low-level stack/capture cleanup. The single measured parked-sibling case is
++macOS-only so far. Cancellation Drop panics here occur during ordinary
++cancellation, not during another panic.
 +No failed Store is reused, and no guarantee of external resource release is
 +claimed after an async destructor panics. Wider lifetime/aliasing obligations,
 +arbitrary host TLS and the platform/exception-handling limits remain open.
@@ -444,7 +449,7 @@ index 0000000000..4aeecfb1d5
 +cross-fiber nested call chains, panic/OOM handoffs, every P3 ABI, Windows or
 +default macOS Mach handling.
 diff --git a/crates/fiber/src/lib.rs b/crates/fiber/src/lib.rs
-index 1b7e753a99..092592f2ed 100644
+index 1b7e753a99..7367738718 100644
 --- a/crates/fiber/src/lib.rs
 +++ b/crates/fiber/src/lib.rs
 @@ -24,7 +24,7 @@ cfg_select! {
@@ -599,7 +604,7 @@ index 1b7e753a99..092592f2ed 100644
  
      fn fiber_stack(size: usize) -> FiberStack {
          FiberStack::new(size, false).unwrap()
-@@ -333,9 +429,74 @@ mod tests {
+@@ -333,9 +429,108 @@ mod tests {
              .unwrap();
      }
  
@@ -628,6 +633,40 @@ index 1b7e753a99..092592f2ed 100644
 +            .expect("dropping an unstarted worker deadlocked");
 +        parent.join().unwrap();
 +        assert!(dropped.get());
++    }
++
++    #[cfg(wasmtime_thread_fibers)]
++    #[test]
++    fn unstarted_worker_capture_drop_panic_is_propagated_after_join() {
++        use std::panic::{AssertUnwindSafe, catch_unwind};
++
++        struct PanickingCapture(Arc<Flag>);
++        impl Drop for PanickingCapture {
++            fn drop(&mut self) {
++                self.0.set(true);
++                std::panic::panic_any("unstarted worker capture drop");
++            }
++        }
++
++        let dropped = Arc::new(Flag::new(false));
++        let ran = Arc::new(Flag::new(false));
++        let capture = PanickingCapture(dropped.clone());
++        let ran_body = ran.clone();
++        let fiber = Fiber::<(), (), ()>::new(fiber_stack(1024 * 1024), move |_, _| {
++            ran_body.set(true);
++            drop(capture);
++        })
++        .unwrap();
++
++        let panic = catch_unwind(AssertUnwindSafe(|| drop(fiber)))
++            .expect_err("worker capture destructor panic was swallowed");
++        assert_eq!(
++            panic.downcast_ref::<&'static str>(),
++            Some(&"unstarted worker capture drop"),
++            "worker panic payload was not preserved across join"
++        );
++        assert!(dropped.get(), "worker capture was not destroyed");
++        assert!(!ran.get(), "unstarted worker ran its body");
 +    }
 +
 +    #[cfg(wasmtime_thread_fibers)]
@@ -675,7 +714,7 @@ index 1b7e753a99..092592f2ed 100644
          let hit2 = hit.clone();
          let fiber = Fiber::<(), (), ()>::new(fiber_stack(1024 * 1024), move |_, _| {
              hit2.set(true);
-@@ -348,7 +509,7 @@ mod tests {
+@@ -348,7 +543,7 @@ mod tests {
  
      #[test]
      fn suspend_and_resume() {
@@ -684,7 +723,7 @@ index 1b7e753a99..092592f2ed 100644
          let hit2 = hit.clone();
          let fiber = Fiber::<(), (), ()>::new(fiber_stack(1024 * 1024), move |_, s| {
              s.suspend(());
-@@ -417,7 +578,7 @@ mod tests {
+@@ -417,7 +612,7 @@ mod tests {
      fn panics_propagated() {
          use std::panic::{self, AssertUnwindSafe};
  
@@ -693,7 +732,7 @@ index 1b7e753a99..092592f2ed 100644
          let b = SetOnDrop(a.clone());
          let fiber = Fiber::<(), (), ()>::new(fiber_stack(1024 * 1024), move |(), _s| {
              let _ = &b;
-@@ -427,7 +588,7 @@ mod tests {
+@@ -427,7 +622,7 @@ mod tests {
          assert!(panic::catch_unwind(AssertUnwindSafe(|| fiber.resume(()))).is_err());
          assert!(a.get());
  
@@ -702,7 +741,7 @@ index 1b7e753a99..092592f2ed 100644
  
          impl Drop for SetOnDrop {
              fn drop(&mut self) {
-@@ -491,7 +652,7 @@ mod tests {
+@@ -491,7 +686,7 @@ mod tests {
          // A custom stack is not considered a `from_raw_parts` stack.
          assert!(!stack.is_from_raw_parts());
  
@@ -712,7 +751,7 @@ index 1b7e753a99..092592f2ed 100644
          let fiber = Fiber::<(), (), ()>::new(stack, move |_, s| {
              hit2.set(true);
 diff --git a/crates/fiber/src/miri.rs b/crates/fiber/src/miri.rs
-index fe6c2d5651..fce123c36d 100644
+index fe6c2d5651..5530350f78 100644
 --- a/crates/fiber/src/miri.rs
 +++ b/crates/fiber/src/miri.rs
 @@ -21,15 +21,53 @@ use std::cell::Cell;
@@ -867,6 +906,25 @@ index fe6c2d5651..fce123c36d 100644
          };
  
          // Cast the fiber back into a raw pointer to lose the type parameters
+@@ -201,7 +281,7 @@ impl Fiber {
+         state.cond.notify_one();
+ 
+         // Wait for the child thread to complete.
+-        self.thread.take().unwrap().join().unwrap();
++        let result = self.thread.take().unwrap().join();
+ 
+         // Clean up our state using the type parameters we know of here.
+         unsafe {
+@@ -209,6 +289,9 @@ impl Fiber {
+                 self.state.cast::<SharedFiberState<A, B, C>>(),
+             ));
+         }
++        if let Err(payload) = result {
++            std::panic::resume_unwind(payload);
++        }
+     }
+ }
+ 
 diff --git a/crates/wasmtime/src/config.rs b/crates/wasmtime/src/config.rs
 index c833bc1a8d..8d471556f9 100644
 --- a/crates/wasmtime/src/config.rs
