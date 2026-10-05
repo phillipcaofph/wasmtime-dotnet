@@ -82,7 +82,8 @@ backpressure paths are now covered below; async cancel builtins, callback-style
 exports and concurrent combinations remain unproven. Upstream concurrent
 resource destructors currently use exclusive Store access, not genuinely
 parallel destruction. Future destruction after
-cancellation/error does not guarantee external resource cleanup. Panic/OOM and
+cancellation/error does not guarantee external resource cleanup. Selected
+panic paths are now tested below; OOM and
 the previously listed platform, Mach-handling and soundness limits remain open.
 
 ### P3 writer/consumer and backpressure lifecycle
@@ -119,6 +120,34 @@ async cancellation builtins and callback exports remain unproven. Exactly-once
 consumer destruction after cancellation/error does not guarantee external
 delivery of an already-consumed item. All broader soundness/platform limits
 remain open.
+
+### Panic/unwind handoffs
+
+Ten native subprocess regressions cover synchronous core callback panics,
+async host-future poll panics before/after suspension and migration, and
+host-future cancellation Drop panics. Concurrent component callbacks panic
+both on the initial worker poll and on a migrated scheduler with accessor TLS
+active. Async/concurrent resource destructors panic on resumed worker polling
+or cancellation Drop while the poller has migrated.
+
+The original typed panic payload and origin thread must survive propagation
+to `catch_unwind`; payload and future destruction are checked exactly once.
+Tests require empty poller accessor/activation TLS, saved worker activations
+for pending paths, zero workers after failed Store teardown, and successful
+execution in a fresh healthy Store. Worker-bound destructors remain on their
+original worker. Panic-hook output is intentional; subprocesses have 60-second
+timeouts.
+
+Linux Arm64 and macOS Arm64 (explicit Unix signals) each passed **53/53**
+combined tests plus **100/100** repeated panic cases. Stock controls passed
+3/3 on macOS. No production runtime fix or managed matrix rerun is claimed.
+
+These are single-panic unwind tests. Double panics during active unwinding,
+`panic=abort`, panicking hooks/payload destructors, unstarted worker capture
+Drop panics, parked sibling guest tasks and OOM/thread-creation failure remain
+unvalidated. Exactly-once destructor-future destruction does not prove external
+resource release after a panic. No failed Store is reused; wider soundness
+and platform limits still apply.
 
 ### Unsupported stack configuration boundary
 
