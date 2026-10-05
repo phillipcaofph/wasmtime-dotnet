@@ -1,9 +1,9 @@
 diff --git a/crates/fiber/README.md b/crates/fiber/README.md
 new file mode 100644
-index 0000000000..1c5a34e310
+index 0000000000..9a7b0eb021
 --- /dev/null
 +++ b/crates/fiber/README.md
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,500 @@
 +# Experimental OS-thread-backed execution
 +
 +This branch is based on Wasmtime **v48.0.2**. It is a feasibility experiment for
@@ -240,8 +240,11 @@ index 0000000000..1c5a34e310
 +
 +The earlier combined native suite passed 31/31 on Linux Arm64 and macOS Arm64
 +(explicit Unix signals), and the original fourteen cases passed ten repetitions
-+on each platform (140/140 each). The current 34-test P3 subset passed on Linux
-+Arm64 and macOS Arm64; Linux passed ten serial repetitions (340/340). The
++on each platform (140/140 each). The earlier 34-test P3 subset passed on Linux Arm64 and macOS Arm64. After
++adding owned-resource stream coverage, the 35-test P3 subset passed 35/35 on
++Linux Arm64 and under Linux x64 Docker emulation. The new resource-transfer case
++passed ten serial repetitions on each architecture (20/20 total). The earlier
++34-test Linux Arm64 suite passed ten serial repetitions (340/340). The
 +concurrent `thread_tests` module passed 10/10 on Linux Arm64 and ten serial
 +repetitions (100/100), including parked-root and parked-sibling trap cases.
 +It also passed 10/10 once under Linux x64 Docker emulation. The two new async
@@ -250,7 +253,8 @@ index 0000000000..1c5a34e310
 +
 +This is selected lifecycle coverage, not full P3 soundness. The next follow-up
 +below covers selected writers/host consumers and multi-item backpressure.
-+Resource-bearing payloads, guest-to-guest transfers, zero-length readiness,
++Selected owned-resource transfer through a P3 stream is covered below;
++guest-to-guest resource transfers, zero-length readiness,
 +callback-style exports and broader concurrent multi-task combinations remain
 +unproven.
 +`resource_concurrent` currently uses an exclusive borrowed-Store path upstream;
@@ -305,13 +309,14 @@ index 0000000000..1c5a34e310
 +
 +Linux Arm64 and macOS Arm64 (explicit Unix signals) passed the earlier combined
 +43-test suite and ten serial repetitions of the original twelve writer cases
-+(120/120 per platform). The current macOS P3 suite passed 34/34, and the two
-+new async cancel-write cases passed ten repetitions each (20/20, each including
-+a healthy Store control). The current 34-test P3 suite passed on Linux Arm64
-+and macOS Arm64; Linux passed ten serial repetitions (340/340), including both
-+new async cancel-write cases. Linux x64 under Docker emulation passed the full
-+P3 suite 34/34 and each new async cancel-write case passed ten repetitions.
-+Stock configuration controls passed 3/3 on macOS. Use the
++(120/120 per platform). The earlier macOS P3 suite passed 34/34; the new
++owned-resource case has not been run on macOS. The updated 35-test Linux P3
++suite passed 35/35 on Arm64 and under x64 Docker emulation. The two new async
++cancel-write cases passed ten repetitions each (20/20, each including a healthy
++Store control). Linux passed ten serial repetitions of the earlier 34-test P3
++suite (340/340), including both new async cancel-write cases; Linux x64
++emulation also passed the earlier 34-test suite and ten repetitions of each
++cancel-write case. Stock configuration controls passed 3/3 on macOS. Use the
 +experimental flags from Reproducing:
 +
 +```sh
@@ -319,9 +324,10 @@ index 0000000000..1c5a34e310
 +cargo test --locked -p wasmtime --lib --features gc-copying p3_thread_tests::writers -- --test-threads=1
 +```
 +
-+No production runtime fix was needed for these measured paths. These tests use
-+scalar `u32` payloads and selected cancellation paths; resource-bearing payloads,
-+guest-to-guest transfers, zero-length readiness, async cancel builtins beyond
++No production runtime fix was needed for these measured paths. These writer/
++consumer tests use scalar `u32` payloads and selected cancellation paths;
++selected owned-resource transfer has separate coverage above. Guest-to-guest
++resource transfers, zero-length readiness, async cancel builtins beyond
 +the selected guest cancel-read/cancel-write paths, and callback exports remain
 +unproven. Cancellation/error after consumption destroys the host consumer, but
 +does not guarantee delivery to an external downstream sink. The soundness/
@@ -1186,10 +1192,10 @@ index 079ce49e6e..f67a314045 100644
  /// Constant defined in the Component Model spec to indicate that the async
 diff --git a/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs
 new file mode 100644
-index 0000000000..74e5fa5808
+index 0000000000..97e4e85856
 --- /dev/null
 +++ b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs
-@@ -0,0 +1,808 @@
+@@ -0,0 +1,809 @@
 +use super::thread_tests::{assert_tls_empty, assert_workers_stopped, isolated_test};
 +use crate::component::{
 +    Component, Destination, FutureProducer, FutureReader, Linker, Resource, ResourceType,
@@ -1206,6 +1212,7 @@ index 0000000000..74e5fa5808
 +};
 +use std::thread::{self, ThreadId};
 +
++mod resource_values;
 +mod writers;
 +
 +#[derive(Clone, Copy)]
@@ -1998,6 +2005,280 @@ index 0000000000..74e5fa5808
 +resource_test!(p3_concurrent_resource_pending_completion, true, Complete);
 +resource_test!(p3_concurrent_resource_pending_cancellation, true, Cancel);
 +resource_test!(p3_concurrent_resource_pending_error, true, Error);
+diff --git a/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests/resource_values.rs b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests/resource_values.rs
+new file mode 100644
+index 0000000000..6f1eaba931
+--- /dev/null
++++ b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests/resource_values.rs
+@@ -0,0 +1,268 @@
++use super::*;
++use crate::component::{Source, StreamConsumer};
++
++const RESOURCE_STREAM_COMPONENT: &str = r#"
++    (component
++        (import "mark" (func $mark-import))
++        (import "r" (type $r (sub resource)))
++        (core module $mem
++            (memory (export "memory") 1))
++        (core instance $mem (instantiate $mem))
++        (type $t (stream (own $r)))
++        (core func $new (canon stream.new $t))
++        (core func $write (canon stream.write $t
++            (memory (core memory $mem "memory"))))
++        (core func $drop-writable (canon stream.drop-writable $t))
++        (core func $resource-drop (canon resource.drop $r))
++        (core func $mark-core (canon lower (func $mark-import)))
++        (core module $m
++            (import "" "memory" (memory 1))
++            (import "" "mark" (func $mark))
++            (import "" "new" (func $new (result i64)))
++            (import "" "write" (func $write (param i32 i32 i32) (result i32)))
++            (import "" "drop-writable" (func $drop-writable (param i32)))
++            (import "" "resource-drop" (func $resource-drop (param i32)))
++            (global $w (mut i32) (i32.const 0))
++            (func $start (export "start") (result i32)
++                (local $pair i64)
++                (local.set $pair (call $new))
++                (global.set $w
++                    (i32.wrap_i64 (i64.shr_u (local.get $pair) (i64.const 32))))
++                (i32.wrap_i64 (local.get $pair)))
++            (func $run (export "run") (param $resource i32)
++                (call $mark)
++                (i32.store (i32.const 0) (local.get $resource))
++                (drop (call $write (global.get $w) (i32.const 0) (i32.const 1)))
++                (call $drop-writable (global.get $w)))
++            (func $drop (export "drop") (param $resource i32)
++                (call $resource-drop (local.get $resource))))
++        (core instance $i (instantiate $m
++            (with "" (instance
++                (export "memory" (memory $mem "memory"))
++                (export "mark" (func $mark-core))
++                (export "new" (func $new))
++                (export "write" (func $write))
++                (export "drop-writable" (func $drop-writable))
++                (export "resource-drop" (func $resource-drop))))))
++        (func (export "start") (result $t)
++            (canon lift (core func $i "start")))
++        (func (export "run") async
++            (param "resource" (own $r))
++            (canon lift (core func $i "run")))
++        (func (export "drop") async
++            (param "resource" (own $r))
++            (canon lift (core func $i "drop"))))
++"#;
++
++fn ready<T>(mut future: Pin<Box<impl Future<Output = Result<T>>>>) -> Result<T> {
++    match future
++        .as_mut()
++        .poll(&mut Context::from_waker(Waker::noop()))
++    {
++        Poll::Ready(result) => result,
++        Poll::Pending => panic!("resource fixture operation unexpectedly suspended"),
++    }
++}
++
++#[derive(Default)]
++struct ResourceValueObservations {
++    stream: Observations,
++    received: Mutex<Option<Resource<HostResource>>>,
++    destructor_calls: AtomicUsize,
++    worker: Mutex<Option<ThreadId>>,
++}
++
++struct ResourceConsumer(Arc<ResourceValueObservations>);
++
++impl StreamConsumer<u32> for ResourceConsumer {
++    type Item = Resource<HostResource>;
++
++    fn poll_consume(
++        self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        mut store: StoreContextMut<'_, u32>,
++        mut source: Source<'_, Self::Item>,
++        finish: bool,
++    ) -> Poll<Result<StreamResult>> {
++        let observations = &self.get_mut().0;
++        observations
++            .stream
++            .polls
++            .lock()
++            .unwrap()
++            .push(thread::current().id());
++        if finish {
++            return Poll::Ready(Ok(StreamResult::Dropped));
++        }
++        if !observations.stream.release.load(Ordering::SeqCst) {
++            cx.waker().wake_by_ref();
++            return Poll::Pending;
++        }
++
++        let mut value = None;
++        source.read(&mut store, &mut value)?;
++        let value = value.expect("guest did not write its resource to the stream");
++        assert_eq!(value.rep(), 77);
++        assert!(
++            value.owned(),
++            "guest stream transferred a borrowed resource"
++        );
++        assert!(
++            observations
++                .received
++                .lock()
++                .unwrap()
++                .replace(value)
++                .is_none(),
++            "guest stream transferred more than one resource"
++        );
++        observations.stream.completed.fetch_add(1, Ordering::SeqCst);
++        Poll::Ready(Ok(StreamResult::Dropped))
++    }
++}
++
++fn drive_resource_stream<F: Future<Output = Result<()>> + Send>(
++    mut call: Pin<&mut F>,
++    observations: &ResourceValueObservations,
++) -> Result<()> {
++    let first = thread::current().id();
++    for _ in 0..100 {
++        assert!(
++            call.as_mut()
++                .poll(&mut Context::from_waker(Waker::noop()))
++                .is_pending()
++        );
++        assert_tls_empty();
++        if !observations.stream.polls.lock().unwrap().is_empty() {
++            break;
++        }
++    }
++
++    let second = thread::scope(|scope| {
++        scope
++            .spawn(|| {
++                assert_tls_empty();
++                for _ in 0..100 {
++                    assert!(
++                        call.as_mut()
++                            .poll(&mut Context::from_waker(Waker::noop()))
++                            .is_pending()
++                    );
++                    assert_tls_empty();
++                    if observations
++                        .stream
++                        .polls
++                        .lock()
++                        .unwrap()
++                        .contains(&thread::current().id())
++                    {
++                        break;
++                    }
++                }
++                thread::current().id()
++            })
++            .join()
++            .unwrap()
++    });
++    assert_ne!(first, second);
++    {
++        let polls = observations.stream.polls.lock().unwrap();
++        assert!(polls.contains(&first));
++        assert!(polls.contains(&second));
++    }
++    let worker = observations
++        .worker
++        .lock()
++        .unwrap()
++        .expect("guest worker callback did not run");
++    assert_ne!(worker, first);
++    assert_ne!(worker, second);
++    assert_eq!(observations.destructor_calls.load(Ordering::SeqCst), 0);
++
++    observations.stream.release.store(true, Ordering::SeqCst);
++    for _ in 0..100 {
++        let result = call.as_mut().poll(&mut Context::from_waker(Waker::noop()));
++        assert_tls_empty();
++        if let Poll::Ready(result) = result {
++            return result;
++        }
++    }
++    panic!("resource-bearing stream did not complete after release");
++}
++
++fn run_resource_value_transfer() -> Result<()> {
++    assert_tls_empty();
++    let engine = engine()?;
++    let component = Component::new(&engine, RESOURCE_STREAM_COMPONENT)?;
++    let mut store = Store::new(&engine, 101u32);
++    let observations = Arc::new(ResourceValueObservations::default());
++    let observed = observations.clone();
++    let mut linker = Linker::<u32>::new(&engine);
++    linker
++        .root()
++        .resource("r", ResourceType::host::<HostResource>(), move |_, rep| {
++            assert_eq!(rep, 77);
++            observed.destructor_calls.fetch_add(1, Ordering::SeqCst);
++            Ok(())
++        })?;
++    let observed = observations.clone();
++    linker.root().func_wrap("mark", move |_, (): ()| {
++        let mut worker = observed.worker.lock().unwrap();
++        assert!(worker.replace(thread::current().id()).is_none());
++        Ok(())
++    })?;
++    let instance = ready(Box::pin(linker.instantiate_async(&mut store, &component)))?;
++    let (reader,) = instance
++        .get_typed_func::<(), (StreamReader<Resource<HostResource>>,)>(&mut store, "start")?
++        .call(&mut store, ())?;
++    reader.pipe(&mut store, ResourceConsumer(observations.clone()))?;
++
++    let run = instance.get_typed_func::<(Resource<HostResource>,), ()>(&mut store, "run")?;
++    let mut call = Box::pin(run.call_async(&mut store, (Resource::new_own(77),)));
++    drive_resource_stream(call.as_mut(), &observations)?;
++    drop(call);
++    assert_eq!(
++        observations.stream.completed.load(Ordering::SeqCst),
++        1,
++        "resource-bearing stream did not complete exactly once"
++    );
++
++    let resource = observations
++        .received
++        .lock()
++        .unwrap()
++        .take()
++        .expect("host did not receive the owned resource");
++    let drop_resource =
++        instance.get_typed_func::<(Resource<HostResource>,), ()>(&mut store, "drop")?;
++    ready(Box::pin(drop_resource.call_async(&mut store, (resource,))))?;
++    assert_eq!(
++        observations.destructor_calls.load(Ordering::SeqCst),
++        1,
++        "transferred resource was not destroyed exactly once"
++    );
++    drop(store);
++    assert_eq!(
++        observations.destructor_calls.load(Ordering::SeqCst),
++        1,
++        "resource destructor ran again during Store teardown"
++    );
++    assert_tls_empty();
++    Ok(())
++}
++
++#[test]
++fn p3_stream_transfers_owned_resource_across_worker_and_host() -> Result<()> {
++    isolated_test(
++        concat!(
++            "runtime::component::concurrent::p3_thread_tests::resource_values::",
++            "p3_stream_transfers_owned_resource_across_worker_and_host"
++        ),
++        || {
++            run_resource_value_transfer()?;
++            assert_workers_stopped();
++            run_resource_value_transfer()
++        },
++        2,
++    )
++}
 diff --git a/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests/writers.rs b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests/writers.rs
 new file mode 100644
 index 0000000000..9c070c048a
