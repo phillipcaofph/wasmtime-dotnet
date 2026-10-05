@@ -123,12 +123,14 @@ remain open.
 
 ### Panic/unwind handoffs
 
-Ten native subprocess regressions cover synchronous core callback panics,
+Eleven native subprocess regressions cover synchronous core callback panics,
 async host-future poll panics before/after suspension and migration, and
 host-future cancellation Drop panics. Concurrent component callbacks panic
 both on the initial worker poll and on a migrated scheduler with accessor TLS
 active. Async/concurrent resource destructors panic on resumed worker polling
-or cancellation Drop while the poller has migrated.
+or cancellation Drop while the poller has migrated. A concurrent component
+host future also panics after polling migrates while two same-Store sibling
+guest tasks remain pending.
 
 The original typed panic payload and origin thread must survive propagation
 to `catch_unwind`; payload and future destruction are checked exactly once.
@@ -140,12 +142,17 @@ timeouts.
 
 Linux Arm64 and macOS Arm64 (explicit Unix signals) each passed **53/53**
 combined tests plus **100/100** repeated panic cases. Stock controls passed
-3/3 on macOS. No production runtime fix or managed matrix rerun is claimed.
+3/3 on macOS. These counts cover the original ten panic cases. The new
+parked-sibling case passed the full 11-case panic module and ten additional
+serial repetitions on macOS Arm64 with Unix signals; Linux has not been
+rerun for this additional case. No production runtime fix or managed matrix
+rerun is claimed.
 
 These are single-panic unwind tests. Double panics during active unwinding,
 `panic=abort`, panicking hooks/payload destructors, unstarted worker capture
-Drop panics, parked sibling guest tasks and OOM/thread-creation failure remain
-unvalidated. Exactly-once destructor-future destruction does not prove external
+Drop panics, OOM/thread-creation failure and broader parked-sibling scenarios
+remain unvalidated. The one measured parked-sibling scenario is macOS-only so
+far. Exactly-once destructor-future destruction does not prove external
 resource release after a panic. No failed Store is reused; wider soundness
 and platform limits still apply.
 
