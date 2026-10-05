@@ -108,7 +108,7 @@ the previously listed platform, Mach-handling and soundness limits remain open.
 
 ### P3 writer/consumer and backpressure lifecycle
 
-Twelve additional native regressions test pending guest future/stream writes
+Fourteen additional native regressions test pending guest future/stream writes
 to host consumers. They require worker-to-scheduler migration, completion,
 call-future cancellation, explicit host errors and exactly-once cleanup.
 Three-item streams accept one item per operation: the guest checks exact
@@ -120,7 +120,10 @@ polling/migration. No next item can be taken and the guest cannot finish early.
 Separate cases cancel or error after taking the first item. Guest stream
 cancel-write and retry run twice on the same handle, with exact result codes,
 two finish requests and no consumed payload. Future cancel-and-close is also
-covered.
+covered. Async guest `future.cancel-write` and `stream.cancel-write` return
+`BLOCKED` while the host consumer acknowledges cancellation; waitable-set
+completion is observed before cleanup. The stream retries the same handle,
+while the future case closes after cancellation.
 
 Retrying a cancelled **future write with an installed host consumer** is
 rejected in v48.0.2 even when no payload was consumed. A standalone public-API
@@ -129,14 +132,17 @@ control reproduced the same error on the stock backend on macOS:
 This existing behavior is documented and regression-tested, not silently
 treated as successful retry support or changed by the experiment.
 
-Linux Arm64 and macOS Arm64 (explicit Unix signals) each passed **43/43**
-combined native tests and **120/120** repeated writer cases, including fresh
-healthy Store controls. Stock configuration controls passed 3/3 on macOS.
-No production runtime fix or managed stress-matrix rerun is claimed for this
-native-test-only follow-up.
+Linux Arm64 and macOS Arm64 (explicit Unix signals) passed the earlier **43/43**
+combined native tests and **120/120** repeated original writer cases. The
+current macOS P3 suite passed **34/34**, and the two new async cancel-write
+cases passed ten repetitions each (20/20, each including a fresh healthy Store
+control). Linux re-validation of these cases remains outstanding. Stock
+configuration controls passed 3/3 on macOS. No production runtime fix or
+managed stress-matrix rerun is claimed for this native-test-only follow-up.
 
 Resource-bearing payloads, guest-to-guest transfers, zero-length readiness,
-async cancellation builtins and callback exports remain unproven. Exactly-once
+async cancel builtins beyond the selected guest cancel-read/cancel-write paths,
+and callback exports remain unproven. Exactly-once
 consumer destruction after cancellation/error does not guarantee external
 delivery of an already-consumed item. All broader soundness/platform limits
 remain open.
