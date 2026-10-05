@@ -1,9 +1,9 @@
 diff --git a/crates/fiber/README.md b/crates/fiber/README.md
 new file mode 100644
-index 0000000000..39900b2ad7
+index 0000000000..d4c1a3b2b1
 --- /dev/null
 +++ b/crates/fiber/README.md
-@@ -0,0 +1,459 @@
+@@ -0,0 +1,465 @@
 +# Experimental OS-thread-backed execution
 +
 +This branch is based on Wasmtime **v48.0.2**. It is a feasibility experiment for
@@ -150,7 +150,9 @@ index 0000000000..39900b2ad7
 +  `ILLEGAL_MOVE`, involving CoreCLR exception forwarding. Explicit Unix-signal
 +  handling passed the measured managed workloads; no production default is
 +  changed.
-+- **Other platforms:** native Windows and x64 execution have not been validated.
++- **Other platforms:** Windows and native x64 hardware have not been validated.
++  Selected Linux x64 Rust suites pass under Docker emulation; see the results
++  below. Emulation does not replace native x64 validation.
 +- **Resources:** each live context retains a real thread. This is not a bounded
 +  pool; resource and performance costs under sustained concurrency remain open.
 +
@@ -213,8 +215,9 @@ index 0000000000..39900b2ad7
 +Arm64 and macOS Arm64; Linux passed ten serial repetitions (340/340). The
 +concurrent `thread_tests` module passed 10/10 on Linux Arm64 and ten serial
 +repetitions (100/100), including parked-root and parked-sibling trap cases.
-+The two new async cancel-write cases also passed ten repetitions on macOS
-+Arm64. Stock-backend configuration controls still passed 3/3 on macOS.
++It also passed 10/10 once under Linux x64 Docker emulation. The two new async
++cancel-write cases passed ten repetitions on macOS Arm64 and under Linux x64
++emulation. Stock-backend configuration controls still passed 3/3 on macOS.
 +
 +This is selected lifecycle coverage, not full P3 soundness. The next follow-up
 +below covers selected writers/host consumers and multi-item backpressure.
@@ -225,9 +228,9 @@ index 0000000000..39900b2ad7
 +these tests do not establish parallel destructor execution. Destroying a
 +destructor future once is not a claim that an embedder's external resource is
 +successfully released after its async destructor is cancelled or fails.
-+Selected panic handoffs are tested below; OOM, arbitrary host TLS, Windows/x64,
-+native host backtraces and default macOS Mach handling remain separate
-+unresolved priorities.
++Selected panic handoffs are tested below; OOM, arbitrary host TLS, Windows,
++native x64 hardware, native host backtraces and default macOS Mach handling
++remain separate unresolved priorities.
 +
 +## P3 writes, partial progress and backpressure follow-up
 +
@@ -277,8 +280,9 @@ index 0000000000..39900b2ad7
 +new async cancel-write cases passed ten repetitions each (20/20, each including
 +a healthy Store control). The current 34-test P3 suite passed on Linux Arm64
 +and macOS Arm64; Linux passed ten serial repetitions (340/340), including both
-+new async cancel-write cases. Stock configuration controls passed 3/3 on
-+macOS. Use the
++new async cancel-write cases. Linux x64 under Docker emulation passed the full
++P3 suite 34/34 and each new async cancel-write case passed ten repetitions.
++Stock configuration controls passed 3/3 on macOS. Use the
 +experimental flags from Reproducing:
 +
 +```sh
@@ -329,7 +333,9 @@ index 0000000000..39900b2ad7
 +(100/100 per platform, each including a fresh Store control). The added
 +parked-sibling case passed in the full 11-case panic module and ten additional
 +serial repetitions on both Linux Arm64 and macOS Arm64 with explicit Unix
-+signals. Stock configuration controls passed 3/3 on macOS. With the
++signals. Linux x64 under Docker emulation passed the 11-case module and ten
++additional serial repetitions of the parked-sibling case. Stock configuration
++controls passed 3/3 on macOS. With the
 +experimental flags:
 +
 +```sh
