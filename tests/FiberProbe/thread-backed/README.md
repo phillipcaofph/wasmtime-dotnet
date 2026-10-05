@@ -54,7 +54,7 @@ to have fixed its TLS or Rust soundness limitations. In particular:
 
 ### P3 reads and resource-destructor lifecycle
 
-The native patch now includes fourteen isolated lifecycle regressions:
+The native patch now includes eighteen isolated lifecycle regressions:
 
 - Async-lifted guest exports synchronously read host-produced futures/streams.
   Producers first poll on workers, then on both original and migrated schedulers.
@@ -68,14 +68,23 @@ The native patch now includes fourteen isolated lifecycle regressions:
   while polling migrates; concurrent destructor accessor TLS preserves `Taken`.
   Completion, call-future cancellation and host errors each destroy the
   destructor future once.
+- Four future/stream reader cases keep a GC object live in a guest local across
+  the synchronous P3 read. On migrated scheduler polls, the producer explicitly
+  collects while the guest stack is parked; a stack-root count must be nonzero,
+  and the guest checks the object's field after resuming. Both deferred
+  reference counting and copying GC are covered.
 
 Cases require started workers, saved activation evidence for parked operations,
 empty scheduler TLS outside polls, and zero live workers after teardown. Each
 runs in a 60-second-bounded subprocess, followed by a fresh healthy Store control.
-The combined native suite passed 31/31 on Linux Arm64 and macOS Arm64 (explicit
-Unix signals). Ten repetitions of the fourteen new cases passed on each platform
-(140/140 each); stock controls passed 3/3 on macOS. No production runtime fix
-was needed for these measured paths, and no managed matrix rerun is claimed.
+The earlier combined native suite passed 31/31 on Linux Arm64 and macOS Arm64
+(explicit Unix signals), and the original fourteen cases passed ten repetitions
+on each platform (140/140 each). The current 30-test P3 subset passed on macOS
+Arm64; the four new parked-root cases also passed ten serial runs each
+(40/40, each followed by a healthy-Store control). Linux re-validation of these
+four cases remains outstanding. Stock controls passed 3/3 on macOS. No
+production runtime fix was needed for these measured paths, and no managed
+matrix rerun is claimed.
 
 This does not prove all P3 paths. Selected writer/consumer and multi-item
 backpressure paths are now covered below; async cancel builtins, callback-style

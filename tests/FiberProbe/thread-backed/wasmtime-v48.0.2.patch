@@ -1,3 +1,444 @@
+diff --git a/crates/fiber/README.md b/crates/fiber/README.md
+new file mode 100644
+index 0000000000..70edf0180d
+--- /dev/null
++++ b/crates/fiber/README.md
+@@ -0,0 +1,435 @@
++# Experimental OS-thread-backed execution
++
++This branch is based on Wasmtime **v48.0.2**. It is a feasibility experiment for
++embedders whose managed runtimes cannot safely execute callbacks on Wasmtime's
++stack-switching fibers. It is **not a production-ready or generally sound
++replacement** for the normal backend.
++
++## Mechanism
++
++`--cfg wasmtime_thread_fibers` selects the existing Miri thread/condition-variable
++backend without enabling Miri globally. Each execution context owns a real OS
++thread; the polling thread resumes it and waits for completion or suspension.
++Managed callbacks execute directly on the worker, without a callback queue.
++Ordinary synchronous entrypoints continue to run without these workers.
++
++The runtime handshake differs from stock stack-switching:
++
++- An owned `Waker` crosses the handshake, not a pointer to the poller's
++  non-Send `Context`. Each host-future poll builds a worker-local context.
++- Wasmtime activation TLS is detached on the worker at suspension and returned
++  to `StoreFiber` so its existing GC tracing can see parked activation lists.
++- Resume and cancellation reattach activations on that same worker before
++  continuing or unwinding. The poller's activation TLS is left alone.
++- Worker teardown asserts empty activation TLS. Dropping an unstarted fiber
++  joins the worker and destroys captures without running its body.
++
++The safe low-level constructor requires Send, owned `'static` captures and
++messages. Wasmtime's borrowed execution uses an explicitly unsafe constructor,
++retaining lifetime, transfer and exclusive-access obligations.
++
++Async instantiation requires Send Store data even for locally polled futures.
++The hidden `AsyncStoreData` bound enforces this only in the experimental
++configuration. Synchronous non-Send Stores and the stock backend's locally
++polled non-Send async instantiation remain supported. Existing async function,
++resource-drop and component worker routes already require Send. Shared
++sync/async initialization documents the additional unsafe async obligation.
++
++Diagnostic exports identify the backend and support teardown/root-list probes:
++
++- `wasmtime_thread_fiber_started`: cumulative started execution threads.
++- `wasmtime_thread_fiber_live`: currently live execution threads.
++- `wasmtime_thread_fiber_tls_suspensions`: suspensions publishing nonempty
++  detached activation lists.
++
++These are experimental diagnostics, not stable public C API.
++
++## Reproducing
++
++Use Rust 1.95 and the native build prerequisites for Wasmtime. From the repository
++root, set both flags: rustdoc does not inherit `RUSTFLAGS`.
++
++```sh
++export RUSTFLAGS="--cfg wasmtime_thread_fibers --check-cfg=cfg(wasmtime_thread_fibers)"
++export RUSTDOCFLAGS="$RUSTFLAGS"
++
++cargo test --locked -p wasmtime --lib thread_tests
++cargo test --locked -p wasmtime --doc AsyncStoreData
++cargo test --locked -p wasmtime-internal-fiber --features std
++cargo build --locked --release -p wasmtime-c-api
++```
++
++For a stock-backend compatibility check, omit the experimental cfg and use a
++separate target directory:
++
++```sh
++RUSTFLAGS="--check-cfg=cfg(wasmtime_thread_fibers)" \
++RUSTDOCFLAGS="--check-cfg=cfg(wasmtime_thread_fibers)" \
++CARGO_TARGET_DIR=target-stock \
++cargo test --locked -p wasmtime --doc AsyncStoreData
++```
++
++On the tested macOS machine, Apple's linker produced a dylib rejected by dyld
++with `mis-aligned LINKEDIT string pool`. Relinking the final C API artifact with
++Homebrew LLD 21.1.8 and the macOS 26.5 SDK produced a loadable library:
++
++```sh
++SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
++MACOSX_DEPLOYMENT_TARGET=11.0 \
++cargo rustc --locked --release -p wasmtime-c-api -- \
++  -C link-arg=-fuse-ld=/opt/homebrew/opt/lld@21/bin/ld64.lld
++```
++
++Use SDK/linker paths installed on your machine. This workaround addresses
++linking, not the separate macOS exception-handling incompatibility below.
++
++The wasmtime-dotnet experiment provides isolated native-library runners and
++managed stress fixtures under `tests/FiberProbe/thread-backed`. They are not
++copied into this native repository. The runners require the diagnostic exports
++before guest execution, verify thread cleanup and saved-TLS evidence, and do
++not replace packaged runtime assets.
++
++## Validation and limits
++
++After transferring the exact tested native sources to this checkout, macOS
++Arm64 validation passed:
++
++| Check | Result |
++| --- | --- |
++| Focused runtime migration/TLS/cancellation/instantiation tests | 4/4 |
++| Non-Send async Store-data compiler rejection tests | 3/3 |
++| Low-level fiber tests | 9/9 |
++| Low-level constructor compiler rejection tests | 3/3 |
++| Stock non-Send async startup test, covering three changed APIs | 1/1 |
++
++The macOS fiber result does **not** establish caller-backtrace preservation:
++upstream already exempts macOS Arm64 from that assertion.
++
++Earlier validation of identical native sources outside this checkout includes
++Linux Arm64 focused runtime tests (4/4), Store-data compiler rejection tests
++(3/3), and a rebuilt macOS native library's .NET 10 Release matrix (56/56,
++two iterations, explicit Unix-signal exception handling).
++
++The preceding worker-TLS refinement passed 56-case Linux/macOS managed matrices
++at 20 iterations and 16 Linux CLR GCStress cases. Those longer runs predate the
++Store-data API-bound follow-up and were not repeated for this transfer.
++
++Known unresolved issues are intentionally not hidden by disabling tests:
++
++- **Rust soundness:** borrowed cross-thread execution remains unsafe internally.
++  Send Store data closes the identified non-Send API hole, but does not prove
++  all lifetime, aliasing, memory-model or host thread-local obligations.
++  No Miri or sanitizer validation is claimed.
++- **Component concurrency:** the focused accessor/same-Store tests below cover
++  sync-lowered concurrent imports and explicit guest threads. The P3 follow-up
++  covers selected future/stream reads, writes/backpressure and guest-initiated
++  resource destructors, not every ABI, callback or cross-fiber trap-chain path.
++- **Stacks and pooling:** the backend does not expose actual stack bounds or
++  guard ranges, and custom/raw stack allocation is unsupported. Engine creation
++  now rejects pooling and configured custom stack creators (see below). The earlier
++  full Linux runtime suite passed 183 tests and failed four pooled-stack tests.
++  Active protection keys are explicitly rejected.
++- **Backtraces:** a worker's native backtrace cannot naturally include the
++  poller's stack. The earlier Linux fiber suite passed eight tests and failed
++  `backtrace_traces_to_host`.
++- **macOS defaults:** nested worker execution with default Mach-port exception
++  handling reproduced exit 137 with `EXC_GUARD`, `GUARD_TYPE_MACH_PORT`,
++  `ILLEGAL_MOVE`, involving CoreCLR exception forwarding. Explicit Unix-signal
++  handling passed the measured managed workloads; no production default is
++  changed.
++- **Other platforms:** native Windows and x64 execution have not been validated.
++- **Resources:** each live context retains a real thread. This is not a bounded
++  pool; resource and performance costs under sustained concurrency remain open.
++
++Human review and resolution of these limitations are prerequisites for any
++proposal to use this as a supported backend.
++
++## P3 reads and resource-destructor lifecycle follow-up
++
++Eighteen isolated regressions in
++[`concurrent/p3_thread_tests.rs`](../wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs)
++exercise:
++
++- Host-produced `future<u32>` and `stream<u32>` read by async-lifted guest
++  exports. Synchronous read builtins park the worker until the producer is
++  released. First producer polling occurs on that worker; subsequent polling
++  is explicitly observed on both the original and migrated scheduler threads.
++  Completion checks exact ABI return codes and the payload `42` in guest memory.
++- Dropping pending call futures and then their Stores, and delivering explicit
++  producer errors. Every producer is destroyed exactly once, without completing
++  cancelled/error operations. Successful reads retire producers before Store
++  drop, not merely during teardown.
++- Guest `future.cancel-read` and `stream.cancel-read`, each repeated twice on
++  the same readable handle after async reads return `BLOCKED`. The guest checks
++  exact `CANCELLED` codes; the producer sees two finish requests. Closing the
++  readable handle retires the producer without waiting for Store drop.
++- Guest `resource.drop` with both `Linker::resource_async` and
++  `Linker::resource_concurrent`, through a synchronous component export invoked
++  with `call_async`. Each destructor suspends across polling-thread migration.
++  All destructor polls stay on the same execution worker; concurrent destructors
++  use accessor data with nested accessor TLS marked `Taken`. Completion,
++  call-future cancellation and destructor errors destroy the future exactly once.
++- Four future/stream reader cases keep a GC object live in a guest local across
++  the synchronous P3 read. On migrated scheduler polls, the producer explicitly
++  collects while the guest stack is parked; a stack-root count must be nonzero,
++  and the guest checks the object's field after resuming. Both deferred
++  reference counting and copying GC are covered.
++
++Each case runs in a subprocess with a 60-second timeout. Diagnostic counters
++prove workers were started and zero workers remain both after the tested Store
++is dropped and after a fresh healthy control on the same polling thread. Pending
++stackful cases require nonempty activation-TLS suspension evidence. Accessor
++and activation TLS must be empty on scheduler threads outside every poll.
++These tests reuse the isolated cross-fiber trap harness; no production runtime
++change was needed for these measured paths.
++
++With the experimental flags from Reproducing:
++
++```sh
++cargo test --locked -p wasmtime --lib --features gc-copying thread_tests
++cargo test --locked -p wasmtime --lib --features gc-copying p3_thread_tests -- --test-threads=1
++```
++
++The earlier combined native suite passed 31/31 on Linux Arm64 and macOS Arm64
++(explicit Unix signals), and the original fourteen cases passed ten repetitions
++on each platform (140/140 each). The current 30-test P3 subset passed on macOS
++Arm64; the four new parked-root cases also passed ten serial runs each
++(40/40, each followed by a healthy-Store control). Linux re-validation of these
++four cases remains outstanding. Stock-backend configuration controls still
++passed 3/3 on macOS.
++
++This is selected lifecycle coverage, not full P3 soundness. The next follow-up
++below covers selected writers/host consumers and multi-item backpressure.
++Async cancellation builtins, callback-style exports and concurrent multi-task
++combinations remain unproven.
++`resource_concurrent` currently uses an exclusive borrowed-Store path upstream;
++these tests do not establish parallel destructor execution. Destroying a
++destructor future once is not a claim that an embedder's external resource is
++successfully released after its async destructor is cancelled or fails.
++Selected panic handoffs are tested below; OOM, arbitrary host TLS, Windows/x64,
++native host backtraces and default macOS Mach handling remain separate
++unresolved priorities.
++
++## P3 writes, partial progress and backpressure follow-up
++
++Twelve more isolated regressions in
++[`p3_thread_tests/writers.rs`](../wasmtime/src/runtime/component/concurrent/p3_thread_tests/writers.rs)
++cover guest-created futures/streams piped to host consumers:
++
++- Pending synchronous writes in async-lifted exports, with consumers first
++  polled on the execution worker and then on two different scheduler threads.
++  Completion, call-future cancellation and explicit consumer errors check
++  exactly-once consumer destruction and worker/TLS cleanup.
++- Three-item stream writes accept only one item per call. The guest checks
++  exact partial-count codes (`16`, then `16`, then `17`), advances its memory
++  offset and retries the unwritten tail. The host checks ordered payloads
++  `[42, 43, 44]` with no duplication.
++- Backpressure after taking an item: the consumer returns `Pending` until the
++  test acknowledges that item. Repeated polls and migration must neither
++  consume another item nor complete the call early. All three acknowledgements
++  are required for successful completion. Separate cases cancel or deliver an
++  error after taking the first item but before acknowledging it; no later item
++  may be consumed.
++- Guest async stream writes followed by synchronous cancel-write and retry
++  twice on the same handle. Exact `BLOCKED`/`CANCELLED` codes and two finish
++  requests are required, with zero payload consumption and prompt retirement
++  after guest close.
++- Future cancel-write followed by close, and a separate test of retry rejection.
++
++**Observed v48.0.2 limitation:** retrying a cancelled future write with an
++installed host consumer fails with
++`cannot write to future after previous write succeeded or readable end dropped`,
++even when the consumer took no payload. The unmodified stock stack-switching
++backend reproduces the same error using a standalone public-API control on
++macOS. Existing runtime code marks the future done when the write meets the
++host consumer, before consumption completes, and cancellation does not reset
++that flag. This experiment preserves and documents that behavior, rather
++than claiming retry support or changing unrelated canonical-ABI semantics.
++The rejected retry still requires exactly-once cleanup and a healthy fresh
++Store control.
++
++Linux Arm64 and macOS Arm64 (explicit Unix signals) each passed the combined
++43-test suite and ten serial repetitions of the twelve writer cases
++(120/120 per platform, each including a healthy control). Stock configuration
++controls passed 3/3 on macOS. Use the experimental flags from Reproducing:
++
++```sh
++cargo test --locked -p wasmtime --lib --features gc-copying thread_tests
++cargo test --locked -p wasmtime --lib --features gc-copying p3_thread_tests::writers -- --test-threads=1
++```
++
++No production runtime fix was needed for these measured paths. These tests use
++scalar `u32` payloads and selected cancellation paths; resource-bearing payloads,
++guest-to-guest transfers, zero-length readiness, async cancel builtins and
++callback exports remain unproven. Cancellation/error after consumption destroys
++the host consumer, but does not guarantee delivery to an external downstream
++sink. The soundness/platform limits above still apply.
++
++## Panic/unwind handoff follow-up
++
++Eleven isolated regressions in
++[`panic_thread_tests.rs`](../wasmtime/src/runtime/component/concurrent/panic_thread_tests.rs)
++test unwinding with `panic_any` payloads rather than converting panics to
++ordinary Wasmtime errors:
++
++- A synchronous core host callback panics on an execution worker.
++- Core async host futures panic on their first poll, after two suspensions with
++  polling-thread migration, or from `Drop` during cancellation.
++- Concurrent component host futures panic during their initial worker poll or
++  on a migrated scheduler. Accessor TLS is used before the panic; the scheduler
++  case verifies the payload's origin matches the scheduler which catches it.
++- A concurrent component host future panics after polling migrates while two
++  same-Store sibling guest tasks remain pending; the test verifies the panic
++  payload and cancellation/worker cleanup.
++- Async and concurrent resource-destructor futures panic either on a resumed
++  worker poll or during cancellation `Drop`. Polling/cancellation happen on a
++  migrated polling thread, while all destructor polls and destruction remain
++  on the original execution worker.
++
++The original typed payload's marker and origin thread must reach `catch_unwind`
++unchanged and be destroyed exactly once. Host future destruction is counted,
++worker-local destruction is checked for exclusive borrowed-Store paths, and
++accessor/activation TLS must be empty outside polling and after catching the
++panic. Pending worker cases require two actual saved-activation suspensions.
++Dropping the failed Store must leave zero execution workers, and a fresh
++healthy Store on the same controlling thread must execute successfully.
++Each subprocess has a 60-second timeout. Panic-hook output is expected.
++
++Linux Arm64 and macOS Arm64 (explicit Unix signals) each passed the combined
++53-test suite, plus ten serial repetitions of the original ten panic cases
++(100/100 per platform, each including a fresh Store control). The added
++parked-sibling case passed in the full 11-case panic module and ten additional
++serial repetitions on macOS Arm64 with Unix signals; it has not yet been
++rerun on Linux. Stock configuration controls passed 3/3 on macOS. With the
++experimental flags:
++
++```sh
++cargo test --locked -p wasmtime --lib --features gc-copying thread_tests
++cargo test --locked -p wasmtime --lib --features gc-copying panic_thread_tests -- --test-threads=1
++```
++
++No production runtime fix was needed for these measured unwind paths.
++This does not validate `panic=abort`, a second destructor panic during an
++already-active unwind (Rust normally aborts), panicking panic hooks/payload
++destructors, unstarted worker capture-destructor panics, broader parked-sibling
++scenarios, or OOM/thread-creation failure. The single measured parked-sibling
++case is macOS-only so far. Cancellation Drop panics here occur during ordinary
++cancellation, not during another panic.
++No failed Store is reused, and no guarantee of external resource release is
++claimed after an async destructor panics. Wider lifetime/aliasing obligations,
++arbitrary host TLS and the platform/exception-handling limits remain open.
++
++## Stack configuration boundary follow-up
++
++With `wasmtime_thread_fibers`, `Config::validate` rejects the pooling allocator
++and `Config::with_host_stack` before an Engine or its allocator is constructed.
++Errors identify the unsupported option and recommend on-demand allocation or
++removing the custom creator. Worker stacks are OS-owned: silently ignoring an
++embedder's allocator or failing only when an async call starts is not acceptable.
++Pooling is rejected even for synchronous workloads; this conservative restriction
++avoids constructing an allocator that cannot support later async execution.
++Stock builds retain both configuration options.
++The experimental async backend requires the `std` feature for OS threads/TLS;
++no-std async builds are not supported.
++
++Tests in [`config/thread_tests.rs`](../wasmtime/src/config/thread_tests.rs)
++check exact errors for zero, one and maximum pooled-stack counts, ensure a
++sentinel custom allocator is never invoked, and execute a core export both
++synchronously and asynchronously on an on-demand Engine. The existing component
++tests exercise on-demand startup, parking, GC, migration, traps and cancellation.
++Stock controls construct Engines with pooling and a custom creator. Run:
++
++```sh
++# Experimental cfg as in Reproducing above:
++cargo test --locked -p wasmtime --lib --features gc-copying thread_tests
++# Without the experimental cfg:
++cargo test --locked -p wasmtime --lib --features gc-copying stack_config
++```
++
++Linux Arm64 and macOS Arm64 (explicit Unix signals) each passed all 17
++configuration/worker tests. The three stock-backend controls passed on macOS.
++Experimental `cargo check --no-default-features` and
++`cargo check --no-default-features --features std,async` both passed; the latter
++has async support without pooling.
++
++This is explicit configuration rejection, **not pooling implementation**.
++Direct pooled-stack unit tests still exercise unsupported raw/custom stacks;
++the earlier four failures are not disabled or claimed fixed. The runtime's
++protection-key rejection remains as a defensive guard.
++
++## Component/accessor TLS and parked-root follow-up
++
++The accessor TLS pointer is scoped by `concurrent::tls::set` around host-future
++polling. Sync-lowered concurrent imports receive their first poll on the guest
++worker; a pending future moves into the Store's scheduler and is subsequently
++polled under a fresh accessor TLS scope on the scheduler thread. The first
++scope exits before the guest worker parks. Unlike the saved Wasmtime activation
++list, this scoped accessor pointer must not be copied to the polling thread.
++No additional production TLS handoff was needed for the tested routes.
++
++Six focused regressions live in
++[`concurrent/thread_tests.rs`](../wasmtime/src/runtime/component/concurrent/thread_tests.rs):
++
++- Three guest threads in one Store retain live GC structs across sync-lowered
++  concurrent host calls. Each host future is observed first on a distinct worker
++  and subsequently on each of two different scheduler threads. Accessor data
++  stays associated with the correct Store; recursive mutable access remains
++  `Taken`, and poller accessor/activation TLS is empty outside polling.
++- While all three guests are parked, the scheduler performs at least six
++  explicit collections. A test-only stack-root counter requires at least three
++  traced guest stack roots before collection; resumed guests must validate all
++  three struct values and execute their completion callbacks.
++- The root scenario runs with deferred reference counting and the moving copying
++  collector. The null collector is a non-collecting control, not evidence of
++  reclamation or relocation.
++- Cancellation and an explicit host error after parking exercise Store teardown
++  and require all three host futures to be destroyed.
++- Nested internal accessor scopes restore the outer `Taken` state both normally
++  and after a deliberate panic. Recursive `run_concurrent` is still rejected,
++  including for another Store on the same thread; the tests do not reinterpret
++  that unsupported path as a feature.
++
++```sh
++# With the experimental RUSTFLAGS/RUSTDOCFLAGS above:
++cargo test --locked -p wasmtime --lib --features gc-copying thread_tests
++cargo test --locked -p wasmtime --lib --features gc-copying accessor_tls
++```
++
++Linux Arm64 Docker and macOS Arm64 (explicit Unix signals) each passed the
++combined ten runtime regressions. The six new cases also passed ten repeated
++serial runs on each platform (60 case executions per platform). These are native
++Rust tests, not additional CLR stress results. They do not establish full P3
++support or resolve pooling, host backtraces, default macOS Mach handling, Windows,
++arbitrary host TLS or general Rust soundness.
++
++## Cross-fiber guest traps with parked siblings
++
++Four additional native tests selectively resume either the root guest or one
++explicit child thread after all three have parked and undergone collection.
++Only that guest traps (`unreachable`); the other two host futures remain pending.
++Both deferred reference counting and copying GC are covered.
++
++The tests require the exact `UnreachableCodeReached` trap and a Wasm backtrace
++containing `$hold` and the selected `$run`/`$entry` function. This validates guest
++trap attribution, not reconstruction of the polling thread's native backtrace.
++Only one host future has completed when the error is reported, no guest has
++reported normal completion, and dropping the Store destroys all three futures.
++The failed Store is not reused: a trap can poison component entry state.
++
++Each case runs in a fresh child process with a 60-second parent timeout. Native
++diagnostics must report zero live execution workers before the test and after
++Store teardown, and at least three started workers. A fresh healthy Store then
++repeats the successful parked-root workload on the same polling thread, again
++leaving zero live workers. This avoids global-counter races between parallel
++unit tests and checks that failure did not contaminate subsequent execution.
++
++```sh
++cargo test --locked -p wasmtime --lib --features gc-copying cross_fiber
++```
++
++Linux Arm64 Docker and macOS Arm64 explicit-signal runs passed 14/14 combined
++runtime regressions and ten repeated runs of the four trap cases (40 isolated
++trap cases per platform, each followed by healthy-Store execution). No production
++trap/TLS fix was needed for these routes. This still does not prove arbitrary
++cross-fiber nested call chains, panic/OOM handoffs, every P3 ABI, Windows or
++default macOS Mach handling.
 diff --git a/crates/fiber/src/lib.rs b/crates/fiber/src/lib.rs
 index 1b7e753a99..c0d23404fd 100644
 --- a/crates/fiber/src/lib.rs
@@ -554,17 +995,17 @@ index 079ce49e6e..f67a314045 100644
  /// Constant defined in the Component Model spec to indicate that the async
 diff --git a/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs
 new file mode 100644
-index 0000000000..8912cebc50
+index 0000000000..8cef10d33f
 --- /dev/null
 +++ b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,686 @@
 +use super::thread_tests::{assert_tls_empty, assert_workers_stopped, isolated_test};
 +use crate::component::{
 +    Component, Destination, FutureProducer, FutureReader, Linker, Resource, ResourceType,
 +    StreamProducer, StreamReader, StreamResult,
 +};
 +use crate::prelude::*;
-+use crate::{AsContextMut, Config, Engine, Store, StoreContextMut};
++use crate::{AsContextMut, Collector, Config, Engine, Store, StoreContextMut};
 +use core::future::Future;
 +use core::pin::Pin;
 +use core::task::{Context, Poll, Waker};
@@ -591,6 +1032,9 @@ index 0000000000..8912cebc50
 +    completed: AtomicUsize,
 +    cancellations: AtomicUsize,
 +    polls: Mutex<Vec<ThreadId>>,
++    worker: Mutex<Option<ThreadId>>,
++    collect_parked_roots: AtomicBool,
++    parked_root_collections: AtomicUsize,
 +}
 +
 +struct Producer(Arc<Observations>);
@@ -598,7 +1042,27 @@ index 0000000000..8912cebc50
 +impl Producer {
 +    fn poll(&self, cx: &Context<'_>, store: &mut StoreContextMut<'_, u32>) -> Poll<Result<()>> {
 +        assert_eq!(*store.data(), 101);
-+        self.0.polls.lock().unwrap().push(thread::current().id());
++        let current = thread::current().id();
++        let worker = {
++            let mut worker = self.0.worker.lock().unwrap();
++            *worker.get_or_insert(current)
++        };
++        self.0.polls.lock().unwrap().push(current);
++        if self.0.collect_parked_roots.load(Ordering::SeqCst)
++            && current != worker
++            && !self.0.release.load(Ordering::SeqCst)
++        {
++            assert!(
++                store.0.parked_wasm_stack_root_count() > 0,
++                "P3 read must retain a GC root on its parked guest stack"
++            );
++            if let Err(error) = store.gc(None) {
++                return Poll::Ready(Err(error));
++            }
++            self.0
++                .parked_root_collections
++                .fetch_add(1, Ordering::SeqCst);
++        }
 +        if self.0.release.load(Ordering::SeqCst) {
 +            if self.0.fail.load(Ordering::SeqCst) {
 +                Poll::Ready(Err(crate::format_err!("intentional P3 producer error")))
@@ -661,11 +1125,18 @@ index 0000000000..8912cebc50
 +}
 +
 +fn engine() -> Result<Engine> {
++    engine_with_collector(None)
++}
++
++fn engine_with_collector(collector: Option<Collector>) -> Result<Engine> {
 +    let mut config = Config::new();
 +    config.macos_use_mach_ports(false);
 +    config.wasm_component_model_async(true);
 +    config.wasm_component_model_more_async_builtins(true);
 +    config.wasm_component_model_async_stackful(true);
++    if let Some(collector) = collector {
++        config.collector(collector);
++    }
 +    Engine::new(&config)
 +}
 +
@@ -730,6 +1201,25 @@ index 0000000000..8912cebc50
 +            (func (export "run") async (param "r" $t)
 +                (canon lift (core func $i "run"))))"#
 +    )
++}
++
++fn reader_component_with_gc_root(stream: bool) -> String {
++    let component = reader_component(stream, false)
++        .replace(
++            "(core module $m\n                (import \"\" \"memory\" (memory 1))",
++            "(core module $m\n                (type $root (struct (field i32)))\n                (import \"\" \"memory\" (memory 1))",
++        )
++        .replace(
++            "(func $run (export \"run\") (param i32)\n                    ",
++            "(func $run (export \"run\") (param i32) (local $root (ref $root))\n                    (local.set $root (struct.new $root (i32.const 4242)))\n                    ",
++        )
++        .replace(
++            "(call $drop (local.get 0)))",
++            "(call $drop (local.get 0))\n                    (struct.get $root 0 (local.get $root))\n                    i32.const 4242\n                    i32.ne\n                    if unreachable end\n                )",
++        );
++    assert!(component.contains("(type $root (struct (field i32)))"));
++    assert!(component.contains("(struct.get $root 0 (local.get $root))"));
++    component
 +}
 +
 +fn drive<F: Future<Output = Result<()>> + Send>(
@@ -882,6 +1372,99 @@ index 0000000000..8912cebc50
 +    );
 +    Ok(())
 +}
++
++fn run_parked_root_reader(stream: bool, collector: Collector) -> Result<()> {
++    assert_tls_empty();
++    let engine = engine_with_collector(Some(collector))?;
++    let component = Component::new(&engine, reader_component_with_gc_root(stream))?;
++    let mut store = Store::new(&engine, 101u32);
++    let linker = Linker::new(&engine);
++    let mut init = Box::pin(linker.instantiate_async(&mut store, &component));
++    let instance = match init.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
++        Poll::Ready(result) => result?,
++        Poll::Pending => panic!("unexpected instantiation suspension"),
++    };
++    drop(init);
++
++    let observations = Arc::new(Observations::default());
++    observations
++        .collect_parked_roots
++        .store(true, Ordering::SeqCst);
++    let suspensions = crate::fiber::wasmtime_thread_fiber_tls_suspensions();
++    if stream {
++        let func = instance.get_typed_func::<(StreamReader<u32>,), ()>(&mut store, "run")?;
++        let reader = StreamReader::new(&mut store, Producer(observations.clone()))?;
++        drive(
++            Box::pin(func.call_async(&mut store, (reader,))).as_mut(),
++            &observations,
++            Finish::Complete,
++            true,
++        )?;
++    } else {
++        let func = instance.get_typed_func::<(FutureReader<u32>,), ()>(&mut store, "run")?;
++        let reader = FutureReader::new(&mut store, Producer(observations.clone()))?;
++        drive(
++            Box::pin(func.call_async(&mut store, (reader,))).as_mut(),
++            &observations,
++            Finish::Complete,
++            true,
++        )?;
++    }
++    assert!(
++        observations.parked_root_collections.load(Ordering::SeqCst) > 0,
++        "no GC ran while a guest stack was parked"
++    );
++    assert!(crate::fiber::wasmtime_thread_fiber_tls_suspensions() > suspensions);
++    assert_eq!(observations.drops.load(Ordering::SeqCst), 1);
++    assert_eq!(observations.completed.load(Ordering::SeqCst), 1);
++    drop(store);
++    assert_workers_stopped();
++    assert_tls_empty();
++    Ok(())
++}
++
++macro_rules! parked_root_reader_test {
++    ($name:ident, $stream:expr, $collector:expr) => {
++        #[test]
++        fn $name() -> Result<()> {
++            isolated_test(
++                concat!(
++                    "runtime::component::concurrent::p3_thread_tests::",
++                    stringify!($name)
++                ),
++                || {
++                    run_parked_root_reader($stream, $collector)?;
++                    assert_workers_stopped();
++                    run_parked_root_reader($stream, $collector)
++                },
++                2,
++            )
++        }
++    };
++}
++
++parked_root_reader_test!(
++    p3_future_read_gc_while_guest_stack_parked_drc,
++    false,
++    Collector::DeferredReferenceCounting
++);
++parked_root_reader_test!(
++    p3_stream_read_gc_while_guest_stack_parked_drc,
++    true,
++    Collector::DeferredReferenceCounting
++);
++#[cfg(feature = "gc-copying")]
++parked_root_reader_test!(
++    p3_future_read_gc_while_guest_stack_parked_copying,
++    false,
++    Collector::Copying
++);
++#[cfg(feature = "gc-copying")]
++parked_root_reader_test!(
++    p3_stream_read_gc_while_guest_stack_parked_copying,
++    true,
++    Collector::Copying
++);
 +
 +macro_rules! reader_test {
 +    ($name:ident, $stream:expr, $finish:ident) => {
