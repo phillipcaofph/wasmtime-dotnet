@@ -77,12 +77,48 @@ Unix signals). Ten repetitions of the fourteen new cases passed on each platform
 (140/140 each); stock controls passed 3/3 on macOS. No production runtime fix
 was needed for these measured paths, and no managed matrix rerun is claimed.
 
-This does not prove all P3 paths. Writer/consumer sides, multi-item/backpressure
-streams, async cancel builtins, callback-style exports and concurrent combinations
-remain unproven. Upstream concurrent resource destructors currently use exclusive
-Store access, not genuinely parallel destruction. Future destruction after
+This does not prove all P3 paths. Selected writer/consumer and multi-item
+backpressure paths are now covered below; async cancel builtins, callback-style
+exports and concurrent combinations remain unproven. Upstream concurrent
+resource destructors currently use exclusive Store access, not genuinely
+parallel destruction. Future destruction after
 cancellation/error does not guarantee external resource cleanup. Panic/OOM and
 the previously listed platform, Mach-handling and soundness limits remain open.
+
+### P3 writer/consumer and backpressure lifecycle
+
+Twelve additional native regressions test pending guest future/stream writes
+to host consumers. They require worker-to-scheduler migration, completion,
+call-future cancellation, explicit host errors and exactly-once cleanup.
+Three-item streams accept one item per operation: the guest checks exact
+partial-count ABI results and retries the unwritten tail; the host verifies
+`[42, 43, 44]` without duplication.
+
+Backpressure tests take an item but hold its acknowledgement pending across
+polling/migration. No next item can be taken and the guest cannot finish early.
+Separate cases cancel or error after taking the first item. Guest stream
+cancel-write and retry run twice on the same handle, with exact result codes,
+two finish requests and no consumed payload. Future cancel-and-close is also
+covered.
+
+Retrying a cancelled **future write with an installed host consumer** is
+rejected in v48.0.2 even when no payload was consumed. A standalone public-API
+control reproduced the same error on the stock backend on macOS:
+`cannot write to future after previous write succeeded or readable end dropped`.
+This existing behavior is documented and regression-tested, not silently
+treated as successful retry support or changed by the experiment.
+
+Linux Arm64 and macOS Arm64 (explicit Unix signals) each passed **43/43**
+combined native tests and **120/120** repeated writer cases, including fresh
+healthy Store controls. Stock configuration controls passed 3/3 on macOS.
+No production runtime fix or managed stress-matrix rerun is claimed for this
+native-test-only follow-up.
+
+Resource-bearing payloads, guest-to-guest transfers, zero-length readiness,
+async cancellation builtins and callback exports remain unproven. Exactly-once
+consumer destruction after cancellation/error does not guarantee external
+delivery of an already-consumed item. All broader soundness/platform limits
+remain open.
 
 ### Unsupported stack configuration boundary
 
