@@ -15,6 +15,27 @@ The refined patch also changes Wasmtime's runtime handshake: only an owned
 `Waker` crosses from the poller, and the worker detaches/restores its Wasmtime
 activation list at suspension/resumption.
 
+### Focused worker-handoff safety review
+
+A source review traced the experimental handoff through async entrypoints,
+worker startup, resume/suspend, cancellation, panic propagation and worker
+join. Core and component async calls require `Send` Store data; the experimental
+async-instantiation bound also applies to locally polled futures. Safe fiber
+wrappers require transferable state, while unchecked borrowed startup remains
+internal and its async callers carry the additional Send obligation. The
+handshake transfers an owned `Waker` and activation state, and
+`BlockingContext` takes temporary stack/context pointers before suspending or
+releasing Store access. Cancellation resumes and joins the worker before the
+borrowed Store access can be released.
+
+The review found no additional concrete violation in these traced paths, and a
+compile-fail doctest now verifies that core `Func::call_async` rejects
+non-Send Store data. This is not a formal soundness proof: the unsafe
+`Send` implementations still rely on each suspension using the reviewed
+boundaries. Arbitrary host TLS, all nested Rust stack frames, unsafe embedder
+code, FFI callbacks, Miri, sanitizers and native x64 hardware remain outside
+this review.
+
 This is a **feasibility experiment, not a production backend**. It intentionally
 reuses the test backend's unchecked cross-thread transfers and does not claim
 to have fixed its TLS or Rust soundness limitations. In particular:
