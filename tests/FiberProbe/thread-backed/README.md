@@ -34,6 +34,10 @@ to have fixed its TLS or Rust soundness limitations. In particular:
   constructor returns its stack and drops closure captures without running the
   body. This does not simulate actual OS thread-resource exhaustion or process
   OOM.
+- If an unstarted worker's capture destructor panics during teardown, the
+  worker is joined, shared state is reclaimed, and the original panic payload
+  is resumed on the dropping thread. This is tested for ordinary destruction,
+  not when the caller is already unwinding.
 - The initial minimal build excludes Wasm GC, pooling, WASI and core stack
   switching. The later default-feature build exercises guest Wasm GC, but
   enabling other features is not evidence that their execution paths are safe.
@@ -162,13 +166,14 @@ rerun for this additional case. No production runtime fix or managed matrix
 rerun is claimed.
 
 These are single-panic unwind tests. Double panics during active unwinding,
-`panic=abort`, panicking hooks/payload destructors, unstarted worker capture
-Drop panics, actual OS thread-resource exhaustion, process OOM and broader
-parked-sibling scenarios remain unvalidated. The low-level constructor's
-injected spawn-error cleanup is tested separately. The one measured
-parked-sibling scenario is macOS-only so far. Exactly-once destructor-future
-destruction does not prove external resource release after a panic. No failed
-Store is reused; wider soundness and platform limits still apply.
+`panic=abort`, panicking hooks/payload destructors, an unstarted worker capture
+destructor panicking while the caller is already unwinding, broader
+parked-sibling scenarios, actual OS thread-resource exhaustion or process OOM
+remain unvalidated. The low-level constructor's injected spawn-error cleanup
+is tested separately. The one measured parked-sibling scenario is macOS-only
+so far. Exactly-once destructor-future destruction does not prove external
+resource release after a panic. No failed Store is reused; wider soundness and
+platform limits still apply.
 
 ### Unsupported stack configuration boundary
 
