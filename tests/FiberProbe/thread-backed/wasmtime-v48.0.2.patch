@@ -1540,11 +1540,13 @@ index 0000000000..73439c2020
 +guest_cancel_test!(p3_stream_guest_cancel_write_and_retry, true, true);
 diff --git a/crates/wasmtime/src/runtime/component/concurrent/panic_thread_tests.rs b/crates/wasmtime/src/runtime/component/concurrent/panic_thread_tests.rs
 new file mode 100644
-index 0000000000..0697781efe
+index 0000000000..00b2c298f0
 --- /dev/null
 +++ b/crates/wasmtime/src/runtime/component/concurrent/panic_thread_tests.rs
-@@ -0,0 +1,473 @@
-+use super::thread_tests::{assert_tls_empty, assert_workers_stopped, isolated_test};
+@@ -0,0 +1,736 @@
++use super::thread_tests::{
++    assert_tls_empty, assert_workers_stopped, isolated_test, workers_started,
++};
 +use crate::component::{Component, Linker, Resource, ResourceType};
 +use crate::prelude::*;
 +use crate::{Config, Engine, Func, Instance, Module, Store};
@@ -1557,6 +1559,8 @@ index 0000000000..0697781efe
 +    atomic::{AtomicUsize, Ordering},
 +};
 +use std::thread::{self, ThreadId};
++
++use super::thread_tests::COMPONENT as THREE_GUEST_COMPONENT;
 +
 +#[derive(Default)]
 +struct Observations {
@@ -1981,6 +1985,262 @@ index 0000000000..0697781efe
 +    healthy(&engine)
 +}
 +
++#[derive(Default)]
++struct SiblingObservations {
++    panic_value: AtomicUsize,
++    polls: Mutex<Vec<(usize, u32, ThreadId)>>,
++    next_wait: AtomicUsize,
++    dropped: AtomicUsize,
++    payload_dropped: AtomicUsize,
++}
++
++struct SiblingWait {
++    observations: Arc<SiblingObservations>,
++    id: usize,
++    value: u32,
++}
++
++struct SiblingPayload {
++    origin: ThreadId,
++    observations: Arc<SiblingObservations>,
++}
++
++impl Drop for SiblingPayload {
++    fn drop(&mut self) {
++        self.observations
++            .payload_dropped
++            .fetch_add(1, Ordering::SeqCst);
++    }
++}
++
++impl Future for SiblingWait {
++    type Output = Result<()>;
++
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let origin = thread::current().id();
++        self.observations
++            .polls
++            .lock()
++            .unwrap()
++            .push((self.id, self.value, origin));
++        if self.observations.panic_value.load(Ordering::SeqCst) == self.value as usize {
++            panic_any(SiblingPayload {
++                origin,
++                observations: self.observations.clone(),
++            });
++        }
++        cx.waker().wake_by_ref();
++        Poll::Pending
++    }
++}
++
++impl Drop for SiblingWait {
++    fn drop(&mut self) {
++        self.observations.dropped.fetch_add(1, Ordering::SeqCst);
++    }
++}
++
++fn panic_with_parked_siblings() -> Result<()> {
++    assert_tls_empty();
++    let mut config = Config::new();
++    config.macos_use_mach_ports(false);
++    config.wasm_component_model_async(true);
++    config.wasm_component_model_more_async_builtins(true);
++    config.wasm_component_model_async_stackful(true);
++    config.wasm_component_model_threading(true);
++    let engine = Engine::new(&config)?;
++    let component = Component::new(&engine, THREE_GUEST_COMPONENT)?;
++    let observations = Arc::new(SiblingObservations::default());
++    let observed = observations.clone();
++    let mut linker = Linker::<()>::new(&engine);
++    linker
++        .root()
++        .func_wrap_concurrent("wait", move |_, (value,): (u32,)| {
++            let id = observed.next_wait.fetch_add(1, Ordering::SeqCst);
++            Box::pin(SiblingWait {
++                observations: observed.clone(),
++                id,
++                value,
++            })
++        })?;
++    linker
++        .root()
++        .func_wrap("checked", |_, ()| -> Result<()> { Ok(()) })?;
++    let mut store = Store::new(&engine, ());
++    let instance = ready(linker.instantiate_async(&mut store, &component))?;
++    let func = instance.get_typed_func::<(), ()>(&mut store, "run")?;
++    let workers_before = workers_started();
++    let suspensions_before = crate::fiber::wasmtime_thread_fiber_tls_suspensions();
++    let mut root =
++        Box::pin(store.run_concurrent(async |accessor| func.call_concurrent(accessor, ()).await));
++    let first = thread::current().id();
++    for _ in 0..100 {
++        assert!(
++            root.as_mut()
++                .poll(&mut Context::from_waker(Waker::noop()))
++                .is_pending()
++        );
++        assert_tls_empty();
++        let polls = observations.polls.lock().unwrap();
++        let children = polls
++            .iter()
++            .filter(|(_, value, _)| *value == 6060)
++            .map(|(id, _, _)| *id)
++            .collect::<std::collections::HashSet<_>>();
++        if children.len() == 2 && polls.iter().any(|(_, value, _)| *value == 5050) {
++            break;
++        }
++    }
++    let initial = observations.polls.lock().unwrap().clone();
++    assert!(initial.iter().any(|(_, value, _)| *value == 5050));
++    assert_eq!(
++        initial
++            .iter()
++            .filter(|(_, value, _)| *value == 6060)
++            .map(|(id, _, _)| *id)
++            .collect::<std::collections::HashSet<_>>()
++            .len(),
++        2,
++        "both child guest threads must be waiting"
++    );
++    assert!(workers_started() >= workers_before + 3);
++    assert!(
++        crate::fiber::wasmtime_thread_fiber_tls_suspensions() >= suspensions_before + 3,
++        "all three guest stacks must be parked"
++    );
++
++    let scheduler = thread::scope(|scope| {
++        scope
++            .spawn(|| {
++                assert_tls_empty();
++                let second = thread::current().id();
++                for _ in 0..100 {
++                    assert!(
++                        root.as_mut()
++                            .poll(&mut Context::from_waker(Waker::noop()))
++                            .is_pending()
++                    );
++                    assert_tls_empty();
++                    let polls = observations.polls.lock().unwrap();
++                    if [5050, 6060].iter().all(|value| {
++                        polls
++                            .iter()
++                            .any(|(_, seen, poller)| seen == value && *poller == second)
++                    }) {
++                        let children = polls
++                            .iter()
++                            .filter(|(_, value, poller)| *value == 6060 && *poller == second)
++                            .map(|(id, _, _)| *id)
++                            .collect::<std::collections::HashSet<_>>()
++                            .len();
++                        if children == 2 {
++                            break;
++                        }
++                    }
++                }
++                second
++            })
++            .join()
++            .unwrap()
++    });
++    assert_ne!(first, scheduler);
++    let migrated = observations.polls.lock().unwrap().clone();
++    assert!(
++        migrated
++            .iter()
++            .any(|(_, value, poller)| *value == 5050 && *poller == scheduler)
++    );
++    assert_eq!(
++        migrated
++            .iter()
++            .filter(|(_, value, poller)| *value == 6060 && *poller == scheduler)
++            .map(|(id, _, _)| *id)
++            .collect::<std::collections::HashSet<_>>()
++            .len(),
++        2
++    );
++
++    let panic = thread::scope(|scope| {
++        scope
++            .spawn(|| {
++                assert_tls_empty();
++                let panic_scheduler = thread::current().id();
++                for _ in 0..100 {
++                    assert!(
++                        root.as_mut()
++                            .poll(&mut Context::from_waker(Waker::noop()))
++                            .is_pending()
++                    );
++                    assert_tls_empty();
++                    let polls = observations.polls.lock().unwrap();
++                    let children = polls
++                        .iter()
++                        .filter(|(_, value, poller)| {
++                            *value == 6060 && *poller == panic_scheduler
++                        })
++                        .map(|(id, _, _)| *id)
++                        .collect::<std::collections::HashSet<_>>()
++                        .len();
++                    if children == 2
++                        && polls.iter().any(|(_, value, poller)| {
++                            *value == 5050 && *poller == panic_scheduler
++                        })
++                    {
++                        break;
++                    }
++                }
++                assert_ne!(first, panic_scheduler);
++                assert!(
++                    observations.polls.lock().unwrap().iter().any(
++                        |(_, value, poller)| *value == 5050 && *poller == panic_scheduler
++                    ),
++                    "selected host future was not polled on the panic scheduler"
++                );
++                observations.panic_value.store(5050, Ordering::SeqCst);
++                let payload = catch_unwind(AssertUnwindSafe(|| {
++                    for _ in 0..100 {
++                        let _ = root.as_mut().poll(&mut Context::from_waker(Waker::noop()));
++                        assert_tls_empty();
++                    }
++                }))
++                .expect_err("panic from the selected guest worker was lost");
++                assert_tls_empty();
++                (payload, panic_scheduler)
++            })
++            .join()
++            .unwrap()
++    });
++    let (payload, catcher) = panic;
++    let payload = payload
++        .downcast::<SiblingPayload>()
++        .expect("panic payload changed");
++    let origin = payload.origin;
++    assert_eq!(origin, catcher, "panic must be caught on its originating poller");
++    assert!(
++        observations
++            .polls
++            .lock()
++            .unwrap()
++            .iter()
++            .any(|(_, value, poller)| *value == 5050 && *poller == origin),
++        "panic origin was not the thread polling the selected host future"
++    );
++    assert_eq!(observations.payload_dropped.load(Ordering::SeqCst), 0);
++    drop(payload);
++    assert_eq!(observations.payload_dropped.load(Ordering::SeqCst), 1);
++    assert_eq!(
++        observations.dropped.load(Ordering::SeqCst),
++        1,
++        "only the panicking host future should be dropped before root cancellation"
++    );
++    drop(root);
++    assert_tls_empty();
++    drop(store);
++    assert_eq!(observations.dropped.load(Ordering::SeqCst), 3);
++    assert_workers_stopped();
++    healthy(&engine)
++}
++
 +macro_rules! panic_test {
 +    ($name:ident, $run:expr) => {
 +        #[test]
@@ -2017,12 +2277,15 @@ index 0000000000..0697781efe
 +panic_test!(panic_concurrent_host_scheduler, || concurrent_panic(
 +    4, false
 +));
++panic_test!(panic_worker_with_parked_guest_siblings, || {
++    panic_with_parked_siblings()
++});
 diff --git a/crates/wasmtime/src/runtime/component/concurrent/thread_tests.rs b/crates/wasmtime/src/runtime/component/concurrent/thread_tests.rs
 new file mode 100644
-index 0000000000..a8edbc2157
+index 0000000000..7a666fa215
 --- /dev/null
 +++ b/crates/wasmtime/src/runtime/component/concurrent/thread_tests.rs
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,595 @@
 +use super::{Accessor, tls};
 +use crate::component::{Component, Linker};
 +use crate::prelude::*;
@@ -2036,7 +2299,7 @@ index 0000000000..a8edbc2157
 +};
 +use std::thread::{self, ThreadId};
 +
-+const COMPONENT: &str = r#"
++pub(super) const COMPONENT: &str = r#"
 +(component
 +    (import "wait" (func $wait async (param "value" u32)))
 +    (import "checked" (func $checked))
@@ -2508,6 +2771,14 @@ index 0000000000..a8edbc2157
 +        0,
 +        "execution worker leaked"
 +    );
++}
++
++pub(super) fn workers_started() -> u64 {
++    unsafe extern "C" {
++        fn wasmtime_thread_fiber_started() -> u64;
++    }
++    // The diagnostic has no pointer arguments and is only read in isolated tests.
++    unsafe { wasmtime_thread_fiber_started() }
 +}
 +
 +pub(super) fn isolated_test(
