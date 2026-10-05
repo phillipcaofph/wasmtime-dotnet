@@ -30,6 +30,10 @@ to have fixed its TLS or Rust soundness limitations. In particular:
 - The test backend does not report actual stack bounds/guard ranges or support
   custom stacks. A recursive Wasm stack-exhaustion probe now traps correctly,
   but stack bounds, guard faults and custom stacks still need an audit.
+- A deterministic injected worker-spawn error checks that the low-level
+  constructor returns its stack and drops closure captures without running the
+  body. This does not simulate actual OS thread-resource exhaustion or process
+  OOM.
 - The initial minimal build excludes Wasm GC, pooling, WASI and core stack
   switching. The later default-feature build exercises guest Wasm GC, but
   enabling other features is not evidence that their execution paths are safe.
@@ -159,11 +163,12 @@ rerun is claimed.
 
 These are single-panic unwind tests. Double panics during active unwinding,
 `panic=abort`, panicking hooks/payload destructors, unstarted worker capture
-Drop panics, OOM/thread-creation failure and broader parked-sibling scenarios
-remain unvalidated. The one measured parked-sibling scenario is macOS-only so
-far. Exactly-once destructor-future destruction does not prove external
-resource release after a panic. No failed Store is reused; wider soundness
-and platform limits still apply.
+Drop panics, actual OS thread-resource exhaustion, process OOM and broader
+parked-sibling scenarios remain unvalidated. The low-level constructor's
+injected spawn-error cleanup is tested separately. The one measured
+parked-sibling scenario is macOS-only so far. Exactly-once destructor-future
+destruction does not prove external resource release after a panic. No failed
+Store is reused; wider soundness and platform limits still apply.
 
 ### Unsupported stack configuration boundary
 
