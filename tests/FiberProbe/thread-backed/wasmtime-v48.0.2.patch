@@ -1,0 +1,2571 @@
+diff --git a/crates/fiber/src/lib.rs b/crates/fiber/src/lib.rs
+index 1b7e753a99..c0d23404fd 100644
+--- a/crates/fiber/src/lib.rs
++++ b/crates/fiber/src/lib.rs
+@@ -24,7 +24,7 @@ cfg_select! {
+         use nostd as imp;
+         mod stackswitch;
+     }
+-    miri => {
++    any(miri, wasmtime_thread_fibers) => {
+         mod miri;
+         use miri as imp;
+     }
+@@ -143,6 +143,8 @@ pub struct Fiber<'a, Resume, Yield, Return> {
+     stack: Option<FiberStack>,
+     inner: imp::Fiber,
+     done: Cell<bool>,
++    #[cfg(wasmtime_thread_fibers)]
++    started: Cell<bool>,
+     _phantom: PhantomData<&'a (Resume, Yield, Return)>,
+ }
+ 
+@@ -186,6 +188,7 @@ impl<'a, Resume, Yield, Return> Fiber<'a, Resume, Yield, Return> {
+     /// On error the provided `stack` is handed back to the caller (paired with
+     /// the error) so that it can be deallocated rather than leaked; the stack is
+     /// only consumed by this `Fiber` on success.
++    #[cfg(not(wasmtime_thread_fibers))]
+     pub fn new(
+         stack: FiberStack,
+         func: impl FnOnce(Resume, &mut Suspend<Resume, Yield, Return>) -> Return + 'a,
+@@ -199,6 +202,75 @@ impl<'a, Resume, Yield, Return> Fiber<'a, Resume, Yield, Return> {
+             stack: Some(stack),
+             inner,
+             done: Cell::new(false),
++            #[cfg(wasmtime_thread_fibers)]
++            started: Cell::new(false),
++            _phantom: PhantomData,
++        })
++    }
++
++    /// Creates an owned thread-backed fiber with compiler-checked transfers.
++    ///
++    /// ```compile_fail
++    /// use std::rc::Rc;
++    /// use wasmtime_internal_fiber::{Fiber, FiberStack};
++    /// let state = Rc::new(());
++    /// let _ = Fiber::<(), (), ()>::new(FiberStack::new(1024 * 1024, false).unwrap(),
++    ///     move |_, _| drop(state));
++    /// ```
++    ///
++    /// ```compile_fail
++    /// use std::rc::Rc;
++    /// use wasmtime_internal_fiber::{Fiber, FiberStack};
++    /// let _ = Fiber::<Rc<()>, (), ()>::new(
++    ///     FiberStack::new(1024 * 1024, false).unwrap(), |_, _| ());
++    /// ```
++    ///
++    /// ```compile_fail
++    /// use wasmtime_internal_fiber::{Fiber, FiberStack};
++    /// let mut value = 0;
++    /// let _ = Fiber::<(), (), ()>::new(FiberStack::new(1024 * 1024, false).unwrap(),
++    ///     |_, _| value += 1);
++    /// ```
++    #[cfg(wasmtime_thread_fibers)]
++    pub fn new(
++        stack: FiberStack,
++        func: impl FnOnce(Resume, &mut Suspend<Resume, Yield, Return>) -> Return + Send + 'static,
++    ) -> Result<Self, (Error, FiberStack)>
++    where
++        Resume: Send + 'static,
++        Yield: Send + 'static,
++        Return: Send + 'static,
++    {
++        unsafe { Self::new_unchecked(stack, func) }
++    }
++
++    /// Creates a borrowed thread-backed fiber for Wasmtime's internal scheduler.
++    ///
++    /// # Safety
++    ///
++    /// All captures and message types must be safe to transfer to the worker.
++    /// Borrowed data must remain valid until the fiber finishes and joins; it
++    /// must not be accessed by the caller while the worker has exclusive use.
++    /// A suspended stack must not retain references into caller TLS or Context.
++    #[cfg(wasmtime_thread_fibers)]
++    pub unsafe fn new_unchecked(
++        stack: FiberStack,
++        func: impl FnOnce(Resume, &mut Suspend<Resume, Yield, Return>) -> Return + 'a,
++    ) -> Result<Self, (Error, FiberStack)>
++    where
++        Resume: Send,
++        Yield: Send,
++        Return: Send,
++    {
++        let inner = match imp::Fiber::new(&stack.0, func) {
++            Ok(inner) => inner,
++            Err(e) => return Err((e, stack)),
++        };
++        Ok(Self {
++            stack: Some(stack),
++            inner,
++            done: Cell::new(false),
++            started: Cell::new(false),
+             _phantom: PhantomData,
+         })
+     }
+@@ -219,6 +291,8 @@ impl<'a, Resume, Yield, Return> Fiber<'a, Resume, Yield, Return> {
+     /// Note that if the fiber itself panics during execution then the panic
+     /// will be propagated to this caller.
+     pub fn resume(&self, val: Resume) -> Result<Return, Yield> {
++        #[cfg(wasmtime_thread_fibers)]
++        self.started.set(true);
+         assert!(!self.done.replace(true), "cannot resume a finished fiber");
+         let result = Cell::new(RunResult::Resuming(val));
+         self.inner.resume(&self.stack().0, &result);
+@@ -303,7 +377,13 @@ impl<Resume, Yield, Return> Suspend<Resume, Yield, Return> {
+ 
+ impl<A, B, C> Drop for Fiber<'_, A, B, C> {
+     fn drop(&mut self) {
++        #[cfg(not(wasmtime_thread_fibers))]
+         debug_assert!(self.done.get(), "fiber dropped without finishing");
++        #[cfg(wasmtime_thread_fibers)]
++        debug_assert!(
++            self.done.get() || !self.started.get(),
++            "fiber dropped while suspended"
++        );
+         unsafe {
+             self.inner.drop::<A, B, C>();
+         }
+@@ -314,8 +394,24 @@ impl<A, B, C> Drop for Fiber<'_, A, B, C> {
+ mod tests {
+     use super::{Fiber, FiberStack};
+     use alloc::string::ToString;
+-    use std::cell::Cell;
+-    use std::rc::Rc;
++    use std::sync::{
++        Arc,
++        atomic::{AtomicBool, Ordering},
++    };
++
++    struct Flag(AtomicBool);
++
++    impl Flag {
++        fn new(value: bool) -> Self {
++            Self(AtomicBool::new(value))
++        }
++        fn get(&self) -> bool {
++            self.0.load(Ordering::SeqCst)
++        }
++        fn set(&self, value: bool) {
++            self.0.store(value, Ordering::SeqCst);
++        }
++    }
+ 
+     fn fiber_stack(size: usize) -> FiberStack {
+         FiberStack::new(size, false).unwrap()
+@@ -333,9 +429,36 @@ mod tests {
+             .unwrap();
+     }
+ 
++    #[cfg(wasmtime_thread_fibers)]
++    #[test]
++    fn unstarted_worker_is_joined_and_capture_dropped() {
++        struct Capture(Arc<Flag>);
++        impl Drop for Capture {
++            fn drop(&mut self) {
++                self.0.set(true);
++            }
++        }
++        let dropped = Arc::new(Flag::new(false));
++        let capture = Capture(dropped.clone());
++        let (tx, rx) = std::sync::mpsc::channel();
++        let parent = std::thread::spawn(move || {
++            let fiber = Fiber::<(), (), ()>::new(fiber_stack(1024 * 1024), move |_, _| {
++                let _ = &capture;
++                panic!("unstarted fiber ran its body");
++            })
++            .unwrap();
++            drop(fiber);
++            tx.send(()).unwrap();
++        });
++        rx.recv_timeout(std::time::Duration::from_secs(5))
++            .expect("dropping an unstarted worker deadlocked");
++        parent.join().unwrap();
++        assert!(dropped.get());
++    }
++
+     #[test]
+     fn smoke() {
+-        let hit = Rc::new(Cell::new(false));
++        let hit = Arc::new(Flag::new(false));
+         let hit2 = hit.clone();
+         let fiber = Fiber::<(), (), ()>::new(fiber_stack(1024 * 1024), move |_, _| {
+             hit2.set(true);
+@@ -348,7 +471,7 @@ mod tests {
+ 
+     #[test]
+     fn suspend_and_resume() {
+-        let hit = Rc::new(Cell::new(false));
++        let hit = Arc::new(Flag::new(false));
+         let hit2 = hit.clone();
+         let fiber = Fiber::<(), (), ()>::new(fiber_stack(1024 * 1024), move |_, s| {
+             s.suspend(());
+@@ -417,7 +540,7 @@ mod tests {
+     fn panics_propagated() {
+         use std::panic::{self, AssertUnwindSafe};
+ 
+-        let a = Rc::new(Cell::new(false));
++        let a = Arc::new(Flag::new(false));
+         let b = SetOnDrop(a.clone());
+         let fiber = Fiber::<(), (), ()>::new(fiber_stack(1024 * 1024), move |(), _s| {
+             let _ = &b;
+@@ -427,7 +550,7 @@ mod tests {
+         assert!(panic::catch_unwind(AssertUnwindSafe(|| fiber.resume(()))).is_err());
+         assert!(a.get());
+ 
+-        struct SetOnDrop(Rc<Cell<bool>>);
++        struct SetOnDrop(Arc<Flag>);
+ 
+         impl Drop for SetOnDrop {
+             fn drop(&mut self) {
+@@ -491,7 +614,7 @@ mod tests {
+         // A custom stack is not considered a `from_raw_parts` stack.
+         assert!(!stack.is_from_raw_parts());
+ 
+-        let hit = Rc::new(Cell::new(false));
++        let hit = Arc::new(Flag::new(false));
+         let hit2 = hit.clone();
+         let fiber = Fiber::<(), (), ()>::new(stack, move |_, s| {
+             hit2.set(true);
+diff --git a/crates/fiber/src/miri.rs b/crates/fiber/src/miri.rs
+index fe6c2d5651..f1b2ccd483 100644
+--- a/crates/fiber/src/miri.rs
++++ b/crates/fiber/src/miri.rs
+@@ -21,15 +21,38 @@ use std::cell::Cell;
+ use std::io;
+ use std::mem;
+ use std::ops::Range;
++#[cfg(wasmtime_thread_fibers)]
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Arc, Condvar, Mutex};
+ use std::thread::{self, JoinHandle};
+ 
++#[cfg(wasmtime_thread_fibers)]
++static STARTED: AtomicU64 = AtomicU64::new(0);
++#[cfg(wasmtime_thread_fibers)]
++static LIVE: AtomicU64 = AtomicU64::new(0);
++
++#[cfg(wasmtime_thread_fibers)]
++#[unsafe(no_mangle)]
++pub extern "C" fn wasmtime_thread_fiber_started() -> u64 {
++    STARTED.load(Ordering::SeqCst)
++}
++
++#[cfg(wasmtime_thread_fibers)]
++#[unsafe(no_mangle)]
++pub extern "C" fn wasmtime_thread_fiber_live() -> u64 {
++    LIVE.load(Ordering::SeqCst)
++}
++
+ pub use wasmtime_environ::error::Error;
+ 
+ pub struct FiberStack(usize);
+ 
+ impl FiberStack {
+     pub fn new(size: usize, _zeroed: bool) -> Result<Self> {
++        #[cfg(wasmtime_thread_fibers)]
++        if size > isize::MAX as usize {
++            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
++        }
+         Ok(FiberStack(size))
+     }
+ 
+@@ -88,27 +111,60 @@ enum State<A, B, C> {
+     Exiting,
+ }
+ 
++#[cfg(not(wasmtime_thread_fibers))]
+ unsafe impl<A, B, C> Send for State<A, B, C> {}
++#[cfg(not(wasmtime_thread_fibers))]
+ unsafe impl<A, B, C> Sync for State<A, B, C> {}
+ 
+ struct IgnoreSendSync<T>(T);
+ 
+ unsafe impl<T> Send for IgnoreSendSync<T> {}
++#[cfg(not(wasmtime_thread_fibers))]
+ unsafe impl<T> Sync for IgnoreSendSync<T> {}
+ 
++#[cfg(wasmtime_thread_fibers)]
++pub trait ThreadMessage: Send {}
++#[cfg(wasmtime_thread_fibers)]
++impl<T: Send> ThreadMessage for T {}
++#[cfg(not(wasmtime_thread_fibers))]
++pub trait ThreadMessage {}
++#[cfg(not(wasmtime_thread_fibers))]
++impl<T> ThreadMessage for T {}
++
+ fn run<F, A, B, C>(state: Arc<SharedFiberState<A, B, C>>, func: IgnoreSendSync<F>)
+ where
+     F: FnOnce(A, &mut super::Suspend<A, B, C>) -> C,
++    A: ThreadMessage,
++    B: ThreadMessage,
++    C: ThreadMessage,
+ {
++    #[cfg(wasmtime_thread_fibers)]
++    {
++        STARTED.fetch_add(1, Ordering::SeqCst);
++        LIVE.fetch_add(1, Ordering::SeqCst);
++    }
++    #[cfg(wasmtime_thread_fibers)]
++    struct LiveThread;
++    #[cfg(wasmtime_thread_fibers)]
++    impl Drop for LiveThread {
++        fn drop(&mut self) {
++            LIVE.fetch_sub(1, Ordering::SeqCst);
++        }
++    }
++    #[cfg(wasmtime_thread_fibers)]
++    let _live = LiveThread;
+     // Wait for the initial message of what to initially invoke `func` with.
+     let init = {
+         let mut lock = state.state.lock().unwrap();
+         lock = state
+             .cond
+-            .wait_while(lock, |msg| !matches!(msg, State::ResumeWith(_)))
++            .wait_while(lock, |msg| {
++                !matches!(msg, State::ResumeWith(_) | State::Exiting)
++            })
+             .unwrap();
+         match mem::replace(&mut *lock, State::None) {
+             State::ResumeWith(RunResult::Resuming(init)) => init,
++            State::Exiting => return,
+             _ => unreachable!(),
+         }
+     };
+@@ -136,6 +192,9 @@ impl Fiber {
+     pub fn new<F, A, B, C>(stack: &FiberStack, func: F) -> Result<Self>
+     where
+         F: FnOnce(A, &mut super::Suspend<A, B, C>) -> C,
++        A: ThreadMessage,
++        B: ThreadMessage,
++        C: ThreadMessage,
+     {
+         // Allocate shared state between the fiber and the suspension argument.
+         let state = Arc::new(SharedFiberState::<A, B, C> {
+diff --git a/crates/wasmtime/src/config.rs b/crates/wasmtime/src/config.rs
+index c833bc1a8d..8d471556f9 100644
+--- a/crates/wasmtime/src/config.rs
++++ b/crates/wasmtime/src/config.rs
+@@ -38,6 +38,9 @@ pub use wasmtime_environ::Inlining;
+ 
+ pub(crate) const DEFAULT_WASM_BACKTRACE_MAX_FRAMES: NonZeroUsize = NonZeroUsize::new(20).unwrap();
+ 
++#[cfg(all(test, feature = "async", feature = "cranelift", feature = "wat"))]
++mod thread_tests;
++
+ /// Represents the module instance allocation strategy to use.
+ #[derive(Clone)]
+ #[non_exhaustive]
+@@ -1703,6 +1706,9 @@ impl Config {
+     ///
+     /// Custom memory creators are used when creating creating async instance stacks for
+     /// the on-demand instance allocation strategy.
++    ///
++    /// The experimental OS-thread fiber backend rejects custom stack creators
++    /// when constructing an [`Engine`]; worker stacks are allocated by the OS.
+     #[cfg(feature = "async")]
+     pub fn with_host_stack(&mut self, stack_creator: Arc<dyn StackCreator>) -> &mut Self {
+         self.stack_creator = Some(Arc::new(StackCreatorProxy(stack_creator)));
+@@ -1740,6 +1746,10 @@ impl Config {
+     ///
+     /// This is notably used in conjunction with
+     /// [`InstanceAllocationStrategy::Pooling`] and [`PoolingAllocationConfig`].
++    ///
++    /// The experimental OS-thread fiber backend only supports `OnDemand`.
++    /// Selecting `Pooling` is rejected when constructing an [`Engine`], even
++    /// for synchronous workloads, rather than failing later on stack allocation.
+     pub fn allocation_strategy(
+         &mut self,
+         strategy: impl Into<InstanceAllocationStrategy>,
+@@ -2604,6 +2614,23 @@ impl Config {
+     }
+ 
+     pub(crate) fn validate(&self) -> Result<(Tunables, WasmFeatures)> {
++        #[cfg(all(wasmtime_thread_fibers, feature = "pooling-allocator"))]
++        if matches!(
++            self.allocation_strategy,
++            InstanceAllocationStrategy::Pooling(_)
++        ) {
++            bail!(
++                "thread-backed execution does not support the pooling allocator; \
++                 use InstanceAllocationStrategy::OnDemand"
++            );
++        }
++        #[cfg(all(wasmtime_thread_fibers, feature = "async"))]
++        if self.stack_creator.is_some() {
++            bail!(
++                "thread-backed execution does not support custom stack creators; \
++                 remove Config::with_host_stack"
++            );
++        }
+         let features = self.features();
+ 
+         // First validate that the selected compiler backend and configuration
+diff --git a/crates/wasmtime/src/config/thread_tests.rs b/crates/wasmtime/src/config/thread_tests.rs
+new file mode 100644
+index 0000000000..d07b98ab4d
+--- /dev/null
++++ b/crates/wasmtime/src/config/thread_tests.rs
+@@ -0,0 +1,95 @@
++use super::*;
++use crate::{Engine, Instance, Module, Store};
++use core::task::{Context, Poll, Waker};
++
++#[cfg(all(wasmtime_thread_fibers, feature = "pooling-allocator"))]
++#[test]
++fn thread_stack_config_rejects_pooling_before_allocator_creation() {
++    for total_stacks in [0, 1, u32::MAX] {
++        let mut pool = PoolingAllocationConfig::default();
++        pool.total_stacks(total_stacks);
++        let mut config = Config::new();
++        config.allocation_strategy(pool);
++        let error = Engine::new(&config)
++            .err()
++            .expect("pooling must be rejected");
++        assert_eq!(
++            error.to_string(),
++            "thread-backed execution does not support the pooling allocator; use InstanceAllocationStrategy::OnDemand"
++        );
++    }
++}
++
++struct UnexpectedStackCreator;
++
++// This creator never hands out memory. Engine validation must reject it
++// without invoking allocation.
++unsafe impl crate::StackCreator for UnexpectedStackCreator {
++    fn new_stack(&self, _: usize, _: bool) -> Result<Box<dyn crate::StackMemory>, Error> {
++        panic!("unsupported custom stack creator was invoked");
++    }
++}
++
++#[test]
++#[cfg(wasmtime_thread_fibers)]
++fn thread_stack_config_rejects_custom_creator_before_execution() {
++    let mut config = Config::new();
++    config.with_host_stack(Arc::new(UnexpectedStackCreator));
++    let error = Engine::new(&config)
++        .err()
++        .expect("custom stacks must be rejected");
++    assert_eq!(
++        error.to_string(),
++        "thread-backed execution does not support custom stack creators; remove Config::with_host_stack"
++    );
++}
++
++#[cfg(all(not(wasmtime_thread_fibers), feature = "pooling-allocator"))]
++#[test]
++fn stock_stack_config_still_accepts_pooling() -> Result<()> {
++    let mut pool = PoolingAllocationConfig::default();
++    pool.total_stacks(1)
++        .total_memories(1)
++        .total_tables(1)
++        .total_core_instances(1)
++        .total_component_instances(1);
++    let mut config = Config::new();
++    config.allocation_strategy(pool);
++    Engine::new(&config)?;
++    Ok(())
++}
++
++#[cfg(not(wasmtime_thread_fibers))]
++#[test]
++fn stock_stack_config_still_accepts_custom_creator() -> Result<()> {
++    let mut config = Config::new();
++    config.with_host_stack(Arc::new(UnexpectedStackCreator));
++    Engine::new(&config)?;
++    Ok(())
++}
++
++#[test]
++fn thread_stack_config_on_demand_preserves_sync_and_async_execution() -> Result<()> {
++    use core::future::Future;
++    let mut config = Config::new();
++    #[cfg(wasmtime_thread_fibers)]
++    config.macos_use_mach_ports(false);
++    config.allocation_strategy(InstanceAllocationStrategy::OnDemand);
++    let engine = Engine::new(&config)?;
++    let module = Module::new(
++        &engine,
++        "(module (func (export \"answer\") (result i32) i32.const 42))",
++    )?;
++    let mut store = Store::new(&engine, ());
++    let instance = Instance::new(&mut store, &module, &[])?;
++    let function = instance.get_typed_func::<(), i32>(&mut store, "answer")?;
++    assert_eq!(function.call(&mut store, ())?, 42);
++    let mut future = Box::pin(function.call_async(&mut store, ()));
++    assert!(matches!(
++        future
++            .as_mut()
++            .poll(&mut Context::from_waker(Waker::noop())),
++        Poll::Ready(Ok(42))
++    ));
++    Ok(())
++}
+diff --git a/crates/wasmtime/src/runtime.rs b/crates/wasmtime/src/runtime.rs
+index 883f10a059..fe28d07fad 100644
+--- a/crates/wasmtime/src/runtime.rs
++++ b/crates/wasmtime/src/runtime.rs
+@@ -95,7 +95,7 @@ pub use exception::*;
+ pub use externals::*;
+ pub use func::*;
+ pub use gc::*;
+-pub use instance::{Instance, InstancePre};
++pub use instance::{AsyncStoreData, Instance, InstancePre};
+ pub use instantiate::CompiledModule;
+ pub use limits::*;
+ pub use linker::*;
+diff --git a/crates/wasmtime/src/runtime/component/concurrent.rs b/crates/wasmtime/src/runtime/component/concurrent.rs
+index 079ce49e6e..7919647a6c 100644
+--- a/crates/wasmtime/src/runtime/component/concurrent.rs
++++ b/crates/wasmtime/src/runtime/component/concurrent.rs
+@@ -113,7 +113,23 @@ mod error_contexts;
+ mod func;
+ mod future_stream_any;
+ mod futures_and_streams;
++#[cfg(all(
++    test,
++    wasmtime_thread_fibers,
++    feature = "cranelift",
++    feature = "wat",
++    feature = "gc"
++))]
++mod p3_thread_tests;
+ pub(crate) mod table;
++#[cfg(all(
++    test,
++    wasmtime_thread_fibers,
++    feature = "cranelift",
++    feature = "wat",
++    feature = "gc"
++))]
++mod thread_tests;
+ pub(crate) mod tls;
+ 
+ /// Constant defined in the Component Model spec to indicate that the async
+diff --git a/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs
+new file mode 100644
+index 0000000000..c047ee8d51
+--- /dev/null
++++ b/crates/wasmtime/src/runtime/component/concurrent/p3_thread_tests.rs
+@@ -0,0 +1,542 @@
++use super::thread_tests::{assert_tls_empty, assert_workers_stopped, isolated_test};
++use crate::component::{
++    Component, Destination, FutureProducer, FutureReader, Linker, Resource, ResourceType,
++    StreamProducer, StreamReader, StreamResult,
++};
++use crate::prelude::*;
++use crate::{AsContextMut, Config, Engine, Store, StoreContextMut};
++use core::future::Future;
++use core::pin::Pin;
++use core::task::{Context, Poll, Waker};
++use std::sync::{
++    Arc, Mutex,
++    atomic::{AtomicBool, AtomicUsize, Ordering},
++};
++use std::thread::{self, ThreadId};
++
++#[derive(Clone, Copy)]
++enum Finish {
++    Complete,
++    Cancel,
++    Error,
++}
++
++#[derive(Default)]
++struct Observations {
++    release: AtomicBool,
++    fail: AtomicBool,
++    drops: AtomicUsize,
++    completed: AtomicUsize,
++    cancellations: AtomicUsize,
++    polls: Mutex<Vec<ThreadId>>,
++}
++
++struct Producer(Arc<Observations>);
++
++impl Producer {
++    fn poll(&self, cx: &Context<'_>, store: &mut StoreContextMut<'_, u32>) -> Poll<Result<()>> {
++        assert_eq!(*store.data(), 101);
++        self.0.polls.lock().unwrap().push(thread::current().id());
++        if self.0.release.load(Ordering::SeqCst) {
++            if self.0.fail.load(Ordering::SeqCst) {
++                Poll::Ready(Err(crate::format_err!("intentional P3 producer error")))
++            } else {
++                self.0.completed.fetch_add(1, Ordering::SeqCst);
++                Poll::Ready(Ok(()))
++            }
++        } else {
++            cx.waker().wake_by_ref();
++            Poll::Pending
++        }
++    }
++}
++
++impl Drop for Producer {
++    fn drop(&mut self) {
++        self.0.drops.fetch_add(1, Ordering::SeqCst);
++    }
++}
++
++impl FutureProducer<u32> for Producer {
++    type Item = u32;
++
++    fn poll_produce(
++        self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        mut store: StoreContextMut<'_, u32>,
++        finish: bool,
++    ) -> Poll<Result<Option<u32>>> {
++        if finish && !self.0.release.load(Ordering::SeqCst) {
++            self.0.cancellations.fetch_add(1, Ordering::SeqCst);
++            return Poll::Ready(Ok(None));
++        }
++        self.poll(cx, &mut store).map(|r| r.map(|()| Some(42)))
++    }
++}
++
++impl StreamProducer<u32> for Producer {
++    type Item = u32;
++    type Buffer = Option<u32>;
++
++    fn poll_produce<'a>(
++        self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        mut store: StoreContextMut<'a, u32>,
++        mut destination: Destination<'a, u32, Option<u32>>,
++        finish: bool,
++    ) -> Poll<Result<StreamResult>> {
++        if finish && !self.0.release.load(Ordering::SeqCst) {
++            self.0.cancellations.fetch_add(1, Ordering::SeqCst);
++            return Poll::Ready(Ok(StreamResult::Cancelled));
++        }
++        self.poll(cx, &mut store).map(|r| {
++            r.map(|()| {
++                destination.set_buffer(Some(42));
++                StreamResult::Dropped
++            })
++        })
++    }
++}
++
++fn engine() -> Result<Engine> {
++    let mut config = Config::new();
++    config.macos_use_mach_ports(false);
++    config.wasm_component_model_async(true);
++    config.wasm_component_model_more_async_builtins(true);
++    config.wasm_component_model_async_stackful(true);
++    Engine::new(&config)
++}
++
++// Sync reads must park the execution worker, rather than merely returning
++// the async ABI's BLOCKED code to a guest that never actually suspends.
++fn reader_component(stream: bool, cancel: bool) -> String {
++    let kind = if stream { "stream" } else { "future" };
++    let count = if stream { "(i32.const 1)" } else { "" };
++    let args = if stream { "i32 i32 i32" } else { "i32 i32" };
++    let code = if stream { 17 } else { 0 };
++    let options = if cancel { "async" } else { "" };
++    let read = format!("(call $read (local.get 0) (i32.const 0) {count})");
++    let body = if cancel {
++        format!(
++            r#"(local $attempt i32)
++               (loop $retry
++                   {read}
++                   i32.const -1
++                   i32.ne
++                   if unreachable end
++                   (call $cancel (local.get 0))
++                   i32.const 2
++                   i32.ne
++                   if unreachable end
++                   (local.set $attempt (i32.add (local.get $attempt) (i32.const 1)))
++                   (br_if $retry (i32.lt_u (local.get $attempt) (i32.const 2))))"#
++        )
++    } else {
++        format!(
++            r#"{read}
++               i32.const {code}
++               i32.ne
++               if unreachable end
++               (i32.load (i32.const 0))
++               i32.const 42
++               i32.ne
++               if unreachable end"#
++        )
++    };
++    format!(
++        r#"(component
++            (core module $mem (memory (export "memory") 1))
++            (core instance $mem (instantiate $mem))
++            (type $t ({kind} u32))
++            (core func $read (canon {kind}.read $t {options} (memory (core memory $mem "memory"))))
++            (core func $cancel (canon {kind}.cancel-read $t))
++            (core func $drop (canon {kind}.drop-readable $t))
++            (core module $m
++                (import "" "memory" (memory 1))
++                (import "" "read" (func $read (param {args}) (result i32)))
++                (import "" "drop" (func $drop (param i32)))
++                (import "" "cancel" (func $cancel (param i32) (result i32)))
++                (func $run (export "run") (param i32)
++                    {body}
++                    (call $drop (local.get 0))))
++            (core instance $i (instantiate $m
++                (with "" (instance
++                    (export "memory" (memory $mem "memory"))
++                    (export "read" (func $read))
++                    (export "cancel" (func $cancel))
++                    (export "drop" (func $drop))))))
++            (func (export "run") async (param "r" $t)
++                (canon lift (core func $i "run"))))"#
++    )
++}
++
++fn drive<F: Future<Output = Result<()>> + Send>(
++    mut future: Pin<&mut F>,
++    observations: &Observations,
++    finish: Finish,
++    migrate_producer: bool,
++) -> Result<()> {
++    let first = thread::current().id();
++    for _ in 0..100 {
++        assert!(
++            future
++                .as_mut()
++                .poll(&mut Context::from_waker(Waker::noop()))
++                .is_pending()
++        );
++        assert_tls_empty();
++        let polls = observations.polls.lock().unwrap();
++        if if migrate_producer {
++            polls.contains(&first)
++        } else {
++            !polls.is_empty()
++        } {
++            break;
++        }
++    }
++    assert!(
++        !observations.polls.lock().unwrap().is_empty(),
++        "producer never polled"
++    );
++    let second = thread::scope(|scope| {
++        scope
++            .spawn(|| {
++                assert_tls_empty();
++                for _ in 0..100 {
++                    assert!(
++                        future
++                            .as_mut()
++                            .poll(&mut Context::from_waker(Waker::noop()))
++                            .is_pending()
++                    );
++                    assert_tls_empty();
++                    if !migrate_producer
++                        || observations
++                            .polls
++                            .lock()
++                            .unwrap()
++                            .contains(&thread::current().id())
++                    {
++                        break;
++                    }
++                }
++                thread::current().id()
++            })
++            .join()
++            .unwrap()
++    });
++    assert_ne!(first, second);
++    assert_eq!(
++        observations.drops.load(Ordering::SeqCst),
++        0,
++        "pending producer destroyed early"
++    );
++    assert_eq!(observations.completed.load(Ordering::SeqCst), 0);
++    {
++        let polls = observations.polls.lock().unwrap();
++        let worker = polls[0];
++        assert_ne!(worker, first);
++        assert_ne!(worker, second);
++        if migrate_producer {
++            assert!(
++                polls.contains(&first),
++                "producer did not reach first scheduler"
++            );
++            assert!(
++                polls.contains(&second),
++                "producer did not migrate to second scheduler"
++            );
++        } else {
++            assert!(polls.iter().all(|id| *id == worker));
++        }
++    }
++    if matches!(finish, Finish::Cancel) {
++        return Ok(());
++    }
++    observations
++        .fail
++        .store(matches!(finish, Finish::Error), Ordering::SeqCst);
++    observations.release.store(true, Ordering::SeqCst);
++    for _ in 0..100 {
++        let result = future
++            .as_mut()
++            .poll(&mut Context::from_waker(Waker::noop()));
++        assert_tls_empty();
++        if let Poll::Ready(result) = result {
++            match finish {
++                Finish::Complete => result?,
++                Finish::Error => {
++                    let error = result.expect_err("P3 host error was lost");
++                    assert!(format!("{error:#}").contains("intentional P3 producer error"));
++                }
++                Finish::Cancel => unreachable!(),
++            }
++            return Ok(());
++        }
++    }
++    panic!("released P3 operation never completed");
++}
++
++fn run_reader(stream: bool, finish: Finish) -> Result<()> {
++    assert_tls_empty();
++    let engine = engine()?;
++    let component = Component::new(&engine, reader_component(stream, false))?;
++    let mut store = Store::new(&engine, 101u32);
++    let linker = Linker::new(&engine);
++    let mut init = Box::pin(linker.instantiate_async(&mut store, &component));
++    let instance = match init.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
++        Poll::Ready(r) => r?,
++        Poll::Pending => panic!("unexpected instantiation suspension"),
++    };
++    drop(init);
++    let observations = Arc::new(Observations::default());
++    let suspensions = crate::fiber::wasmtime_thread_fiber_tls_suspensions();
++    if stream {
++        let func = instance.get_typed_func::<(StreamReader<u32>,), ()>(&mut store, "run")?;
++        let reader = StreamReader::new(&mut store, Producer(observations.clone()))?;
++        let mut call = Box::pin(func.call_async(&mut store, (reader,)));
++        drive(call.as_mut(), &observations, finish, true)?;
++    } else {
++        let func = instance.get_typed_func::<(FutureReader<u32>,), ()>(&mut store, "run")?;
++        let reader = FutureReader::new(&mut store, Producer(observations.clone()))?;
++        let mut call = Box::pin(func.call_async(&mut store, (reader,)));
++        drive(call.as_mut(), &observations, finish, true)?;
++    }
++    assert!(crate::fiber::wasmtime_thread_fiber_tls_suspensions() > suspensions);
++    assert_tls_empty();
++    if matches!(finish, Finish::Complete) {
++        assert_eq!(
++            observations.drops.load(Ordering::SeqCst),
++            1,
++            "completed producer was not retired promptly"
++        );
++    }
++    drop(store);
++    assert_tls_empty();
++    assert_eq!(observations.drops.load(Ordering::SeqCst), 1);
++    assert_eq!(
++        observations.completed.load(Ordering::SeqCst),
++        usize::from(matches!(finish, Finish::Complete))
++    );
++    Ok(())
++}
++
++macro_rules! reader_test {
++    ($name:ident, $stream:expr, $finish:ident) => {
++        #[test]
++        fn $name() -> Result<()> {
++            isolated_test(
++                concat!(
++                    "runtime::component::concurrent::p3_thread_tests::",
++                    stringify!($name)
++                ),
++                || {
++                    run_reader($stream, Finish::$finish)?;
++                    assert_workers_stopped();
++                    run_reader($stream, Finish::Complete)
++                },
++                2,
++            )
++        }
++    };
++}
++
++reader_test!(p3_future_pending_completion, false, Complete);
++reader_test!(p3_future_pending_cancellation, false, Cancel);
++reader_test!(p3_future_pending_error, false, Error);
++reader_test!(p3_stream_pending_completion, true, Complete);
++reader_test!(p3_stream_pending_cancellation, true, Cancel);
++reader_test!(p3_stream_pending_error, true, Error);
++
++fn run_guest_cancellation(stream: bool) -> Result<()> {
++    assert_tls_empty();
++    let engine = engine()?;
++    let component = Component::new(&engine, reader_component(stream, true))?;
++    let mut store = Store::new(&engine, 101u32);
++    let linker = Linker::new(&engine);
++    let mut init = Box::pin(linker.instantiate_async(&mut store, &component));
++    let instance = match init.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
++        Poll::Ready(r) => r?,
++        Poll::Pending => panic!("unexpected instantiation suspension"),
++    };
++    drop(init);
++    let observations = Arc::new(Observations::default());
++    if stream {
++        let func = instance.get_typed_func::<(StreamReader<u32>,), ()>(&mut store, "run")?;
++        let reader = StreamReader::new(&mut store, Producer(observations.clone()))?;
++        finish_guest_cancellation(Box::pin(func.call_async(&mut store, (reader,))))?;
++    } else {
++        let func = instance.get_typed_func::<(FutureReader<u32>,), ()>(&mut store, "run")?;
++        let reader = FutureReader::new(&mut store, Producer(observations.clone()))?;
++        finish_guest_cancellation(Box::pin(func.call_async(&mut store, (reader,))))?;
++    }
++    assert_eq!(observations.cancellations.load(Ordering::SeqCst), 2);
++    assert_eq!(observations.completed.load(Ordering::SeqCst), 0);
++    assert_eq!(
++        observations.drops.load(Ordering::SeqCst),
++        1,
++        "guest close did not retire producer"
++    );
++    drop(store);
++    assert_eq!(observations.drops.load(Ordering::SeqCst), 1);
++    assert_tls_empty();
++    Ok(())
++}
++
++fn finish_guest_cancellation(mut future: Pin<Box<impl Future<Output = Result<()>>>>) -> Result<()> {
++    for _ in 0..100 {
++        let result = future
++            .as_mut()
++            .poll(&mut Context::from_waker(Waker::noop()));
++        assert_tls_empty();
++        if let Poll::Ready(result) = result {
++            return result;
++        }
++    }
++    panic!("guest cancel-and-retry never completed");
++}
++
++macro_rules! guest_cancel_test {
++    ($name:ident, $stream:expr) => {
++        #[test]
++        fn $name() -> Result<()> {
++            isolated_test(
++                concat!(
++                    "runtime::component::concurrent::p3_thread_tests::",
++                    stringify!($name)
++                ),
++                || {
++                    run_guest_cancellation($stream)?;
++                    assert_workers_stopped();
++                    run_reader($stream, Finish::Complete)
++                },
++                2,
++            )
++        }
++    };
++}
++
++guest_cancel_test!(p3_future_guest_cancel_and_retry, false);
++guest_cancel_test!(p3_stream_guest_cancel_and_retry, true);
++
++const RESOURCE_COMPONENT: &str = r#"
++    (component
++        (import "r" (type $r (sub resource)))
++        (core func $drop (canon resource.drop $r))
++        (core module $m
++            (import "" "drop" (func $drop (param i32)))
++            (func $run (export "run") (param i32)
++                (call $drop (local.get 0))))
++        (core instance $i (instantiate $m
++            (with "" (instance (export "drop" (func $drop))))))
++        (func (export "run") (param "r" (own $r))
++            (canon lift (core func $i "run"))))
++"#;
++
++struct HostResource;
++
++fn run_resource(concurrent: bool, finish: Finish) -> Result<()> {
++    assert_tls_empty();
++    let engine = engine()?;
++    let component = Component::new(&engine, RESOURCE_COMPONENT)?;
++    let mut store = Store::new(&engine, 101u32);
++    let observations = Arc::new(Observations::default());
++    let observed = observations.clone();
++    let mut linker = Linker::<u32>::new(&engine);
++    if concurrent {
++        linker.root().resource_concurrent(
++            "r",
++            ResourceType::host::<HostResource>(),
++            move |accessor, rep| {
++                assert_eq!(rep, 77);
++                let producer = Producer(observed.clone());
++                Box::pin(async move {
++                    core::future::poll_fn(|cx| {
++                        accessor.with(|mut access| {
++                            super::tls::try_get(|state| {
++                                assert!(matches!(state, super::tls::TryGet::Taken));
++                            });
++                            producer.poll(cx, &mut access.as_context_mut())
++                        })
++                    })
++                    .await
++                })
++            },
++        )?;
++    } else {
++        linker.root().resource_async(
++            "r",
++            ResourceType::host::<HostResource>(),
++            move |mut store, rep| {
++                assert_eq!(rep, 77);
++                let producer = Producer(observed.clone());
++                Box::new(
++                    async move { core::future::poll_fn(|cx| producer.poll(cx, &mut store)).await },
++                )
++            },
++        )?;
++    }
++    let mut init = Box::pin(linker.instantiate_async(&mut store, &component));
++    let instance = match init.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
++        Poll::Ready(r) => r?,
++        Poll::Pending => panic!("unexpected instantiation suspension"),
++    };
++    drop(init);
++    let func = instance.get_typed_func::<(Resource<HostResource>,), ()>(&mut store, "run")?;
++    let suspensions = crate::fiber::wasmtime_thread_fiber_tls_suspensions();
++    let mut call = Box::pin(func.call_async(&mut store, (Resource::new_own(77),)));
++    drive(call.as_mut(), &observations, finish, false)?;
++    drop(call);
++    assert!(crate::fiber::wasmtime_thread_fiber_tls_suspensions() > suspensions);
++    assert_eq!(
++        observations.drops.load(Ordering::SeqCst),
++        1,
++        "destructor future leaked"
++    );
++    let polls = observations.polls.lock().unwrap();
++    let worker = polls[0];
++    assert_ne!(worker, thread::current().id());
++    assert!(
++        polls.iter().all(|id| *id == worker),
++        "destructor moved off its execution worker"
++    );
++    assert_eq!(
++        observations.completed.load(Ordering::SeqCst),
++        usize::from(matches!(finish, Finish::Complete))
++    );
++    drop(store);
++    assert_eq!(
++        observations.drops.load(Ordering::SeqCst),
++        1,
++        "destructor ran twice"
++    );
++    assert_tls_empty();
++    Ok(())
++}
++
++macro_rules! resource_test {
++    ($name:ident, $concurrent:expr, $finish:ident) => {
++        #[test]
++        fn $name() -> Result<()> {
++            isolated_test(
++                concat!(
++                    "runtime::component::concurrent::p3_thread_tests::",
++                    stringify!($name)
++                ),
++                || {
++                    run_resource($concurrent, Finish::$finish)?;
++                    assert_workers_stopped();
++                    run_resource($concurrent, Finish::Complete)
++                },
++                2,
++            )
++        }
++    };
++}
++
++resource_test!(p3_async_resource_pending_completion, false, Complete);
++resource_test!(p3_async_resource_pending_cancellation, false, Cancel);
++resource_test!(p3_async_resource_pending_error, false, Error);
++resource_test!(p3_concurrent_resource_pending_completion, true, Complete);
++resource_test!(p3_concurrent_resource_pending_cancellation, true, Cancel);
++resource_test!(p3_concurrent_resource_pending_error, true, Error);
+diff --git a/crates/wasmtime/src/runtime/component/concurrent/thread_tests.rs b/crates/wasmtime/src/runtime/component/concurrent/thread_tests.rs
+new file mode 100644
+index 0000000000..a8edbc2157
+--- /dev/null
++++ b/crates/wasmtime/src/runtime/component/concurrent/thread_tests.rs
+@@ -0,0 +1,587 @@
++use super::{Accessor, tls};
++use crate::component::{Component, Linker};
++use crate::prelude::*;
++use crate::{AsContextMut, Collector, Config, Engine, Result, Store, Trap, WasmBacktrace};
++use core::future::Future;
++use core::pin::Pin;
++use core::task::{Context, Poll, Waker};
++use std::sync::{
++    Arc, Mutex,
++    atomic::{AtomicBool, AtomicUsize, Ordering},
++};
++use std::thread::{self, ThreadId};
++
++const COMPONENT: &str = r#"
++(component
++    (import "wait" (func $wait async (param "value" u32)))
++    (import "checked" (func $checked))
++    (core module $libc (table (export "table") 1 funcref))
++    (core instance $libc (instantiate $libc))
++    (core module $m
++        (type $root (struct (field i32)))
++        (type $garbage (array (mut i8)))
++        (import "" "wait" (func $wait (param i32)))
++        (import "" "checked" (func $checked))
++        (import "" "new" (func $new (param i32 i32) (result i32)))
++        (import "" "resume" (func $resume (param i32)))
++        (import "" "table" (table $table 1 funcref))
++        (func $hold (param $value i32)
++            (local $root (ref $root))
++            (local.set $root (struct.new $root (local.get $value)))
++            (array.new_default $garbage (i32.const 65536))
++            drop
++            local.get $value
++            call $wait
++            (struct.get $root 0 (local.get $root))
++            local.get $value
++            i32.ne
++            if unreachable end
++            call $checked)
++        (func $entry (param i32)
++            i32.const 6060
++            call $hold)
++        (elem (table $table) (i32.const 0) func $entry)
++        (func $run (export "run")
++            (call $resume (call $new (i32.const 0) (i32.const 0)))
++            (call $resume (call $new (i32.const 0) (i32.const 0)))
++            i32.const 5050
++            call $hold))
++    (core type $entry (func (param i32)))
++    (core func $new (canon thread.new-indirect $entry (core table $libc "table")))
++    (core func $resume (canon thread.resume-later))
++    (core func $wait (canon lower (func $wait)))
++    (core func $checked (canon lower (func $checked)))
++    (core instance $i (instantiate $m
++        (with "" (instance
++            (export "new" (func $new))
++            (export "resume" (func $resume))
++            (export "wait" (func $wait))
++            (export "checked" (func $checked))
++            (export "table" (table $libc "table"))))))
++    (func (export "run") async (canon lift (core func $i "run"))))
++"#;
++
++#[derive(Default)]
++struct State {
++    entered: usize,
++    checked: usize,
++}
++
++#[derive(Default)]
++struct Observations {
++    release: AtomicBool,
++    fail: AtomicBool,
++    release_id: AtomicUsize,
++    dropped: AtomicUsize,
++    polls: Mutex<Vec<(usize, ThreadId)>>,
++    values: Mutex<Vec<(usize, u32)>>,
++}
++
++struct Waiting<'a> {
++    accessor: &'a Accessor<State>,
++    observations: Arc<Observations>,
++    id: Option<usize>,
++    value: u32,
++}
++
++impl Future for Waiting<'_> {
++    type Output = Result<()>;
++
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let id = match self.id {
++            Some(id) => id,
++            None => {
++                let id = self.accessor.with(|mut access| {
++                    let state = access.data_mut();
++                    state.entered += 1;
++                    state.entered
++                });
++                self.id = Some(id);
++                self.observations
++                    .values
++                    .lock()
++                    .unwrap()
++                    .push((id, self.value));
++                id
++            }
++        };
++        self.accessor.with(|mut access| {
++            assert!(access.data_mut().entered >= id);
++            tls::try_get(|state| assert!(matches!(state, tls::TryGet::Taken)));
++        });
++        self.observations
++            .polls
++            .lock()
++            .unwrap()
++            .push((id, thread::current().id()));
++        let release_id = self.observations.release_id.load(Ordering::SeqCst);
++        if self.observations.release.load(Ordering::SeqCst) && (release_id == 0 || release_id == id)
++        {
++            Poll::Ready(if self.observations.fail.load(Ordering::SeqCst) {
++                Err(crate::format_err!("parked host task failed"))
++            } else {
++                Ok(())
++            })
++        } else {
++            cx.waker().wake_by_ref();
++            Poll::Pending
++        }
++    }
++}
++
++impl Drop for Waiting<'_> {
++    fn drop(&mut self) {
++        // Accessor use in arbitrary Drop is not a public guarantee. Only check
++        // destruction, leaving the TLS checks in the supported poll scope.
++        self.observations.dropped.fetch_add(1, Ordering::SeqCst);
++    }
++}
++
++pub(super) fn assert_tls_empty() {
++    tls::try_get(|state| assert!(matches!(state, tls::TryGet::None)));
++    crate::vm::tls::with(|state| assert!(state.is_none()));
++}
++
++fn engine(collector: Collector) -> Result<Engine> {
++    let mut config = Config::new();
++    config.macos_use_mach_ports(false);
++    config.wasm_component_model_async(true);
++    config.wasm_component_model_more_async_builtins(true);
++    config.wasm_component_model_async_stackful(true);
++    config.wasm_component_model_threading(true);
++    config.collector(collector);
++    Engine::new(&config)
++}
++
++#[derive(Clone, Copy)]
++enum Finish {
++    Complete,
++    Cancel,
++    HostError,
++    RootTrap,
++    ChildTrap,
++}
++
++fn run(collector: Collector, finish: Finish) -> Result<()> {
++    assert_tls_empty();
++    let engine = engine(collector)?;
++    let source = match finish {
++        Finish::RootTrap => COMPONENT.replace(
++            "call $checked)",
++            "local.get $value i32.const 5050 i32.eq if unreachable end call $checked)",
++        ),
++        Finish::ChildTrap => COMPONENT.replace(
++            "call $checked)",
++            "local.get $value i32.const 6060 i32.eq if unreachable end call $checked)",
++        ),
++        _ => COMPONENT.to_string(),
++    };
++    let component = Component::new(&engine, source)?;
++    let mut store = Store::new(&engine, State::default());
++    let observations = Arc::new(Observations::default());
++    let observed = observations.clone();
++    let mut linker = Linker::<State>::new(&engine);
++    linker
++        .root()
++        .func_wrap_concurrent("wait", move |accessor, (value,): (u32,)| {
++            Box::pin(Waiting {
++                accessor,
++                observations: observed.clone(),
++                id: None,
++                value,
++            })
++        })?;
++    linker.root().func_wrap("checked", |mut store, ()| {
++        store.data_mut().checked += 1;
++        Ok(())
++    })?;
++    let instance = {
++        let mut init = Box::pin(linker.instantiate_async(&mut store, &component));
++        match init.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
++            Poll::Ready(result) => result?,
++            Poll::Pending => panic!("fixture instantiation unexpectedly suspended"),
++        }
++    };
++    let func = instance.get_typed_func::<(), ()>(&mut store, "run")?;
++    let before = crate::fiber::wasmtime_thread_fiber_tls_suspensions();
++    let collections = Arc::new(AtomicUsize::new(0));
++    let collected = collections.clone();
++    let mut future = Box::pin(store.run_concurrent(async |accessor| -> Result<()> {
++        let mut call = core::pin::pin!(func.call_concurrent(accessor, ()));
++        core::future::poll_fn(|cx| {
++            if let Poll::Ready(result) = call.as_mut().poll(cx) {
++                return Poll::Ready(result);
++            }
++            if !observations.release.load(Ordering::SeqCst)
++                && accessor.with(|mut access| access.data_mut().entered) == 3
++            {
++                for _ in 0..3 {
++                    accessor.with(|mut access| {
++                        assert!(
++                            access.as_context_mut().0.parked_wasm_stack_root_count() >= 3,
++                            "GC tracing must find roots on all three parked guest stacks"
++                        );
++                    });
++                    accessor.with(|mut access| access.as_context_mut().gc(None))?;
++                    collected.fetch_add(1, Ordering::SeqCst);
++                }
++            }
++            Poll::Pending
++        })
++        .await?;
++        core::future::poll_fn(|cx| {
++            if accessor.with(|mut access| access.data_mut().checked) == 3 {
++                Poll::Ready(())
++            } else {
++                cx.waker().wake_by_ref();
++                Poll::Pending
++            }
++        })
++        .await;
++        Ok(())
++    }));
++    let first = thread::current().id();
++    let mut cx = Context::from_waker(Waker::noop());
++    for _ in 0..100 {
++        assert!(future.as_mut().poll(&mut cx).is_pending());
++        assert_tls_empty();
++        let polls = observations.polls.lock().unwrap();
++        if (1..=3).all(|id| polls.contains(&(id, first))) && collections.load(Ordering::SeqCst) >= 3
++        {
++            break;
++        }
++    }
++    assert_eq!(
++        observations
++            .polls
++            .lock()
++            .unwrap()
++            .iter()
++            .map(|(id, _)| *id)
++            .max(),
++        Some(3),
++        "all three same-Store guest threads must park"
++    );
++    assert!(crate::fiber::wasmtime_thread_fiber_tls_suspensions() >= before + 3);
++
++    // Polling a concurrent root future lets us collect while all guest stacks
++    // remain suspended, without retaining a Store borrow across the handoff.
++    let second = thread::scope(|scope| {
++        scope
++            .spawn(|| {
++                assert_tls_empty();
++                for _ in 0..100 {
++                    assert!(
++                        future
++                            .as_mut()
++                            .poll(&mut Context::from_waker(Waker::noop()))
++                            .is_pending()
++                    );
++                    assert_tls_empty();
++                    let polls = observations.polls.lock().unwrap();
++                    if (1..=3).all(|id| polls.contains(&(id, thread::current().id()))) {
++                        break;
++                    }
++                }
++                thread::current().id()
++            })
++            .join()
++            .unwrap()
++    });
++    assert_ne!(first, second);
++    assert!(collections.load(Ordering::SeqCst) >= 6);
++    {
++        let polls = observations.polls.lock().unwrap();
++        let workers: Vec<_> = (1..=3)
++            .map(|id| {
++                let worker = polls.iter().find(|(task, _)| *task == id).unwrap().1;
++                assert_ne!(worker, first);
++                assert_ne!(worker, second);
++                assert!(
++                    polls.contains(&(id, first)),
++                    "host task did not reach first scheduler"
++                );
++                assert!(polls.contains(&(id, second)), "host task did not migrate");
++                worker
++            })
++            .collect();
++        assert_ne!(workers[0], workers[1]);
++        assert_ne!(workers[0], workers[2]);
++        assert_ne!(workers[1], workers[2]);
++    }
++    if !matches!(finish, Finish::Cancel) {
++        if matches!(finish, Finish::RootTrap | Finish::ChildTrap) {
++            let value = if matches!(finish, Finish::RootTrap) {
++                5050
++            } else {
++                6060
++            };
++            let id = observations
++                .values
++                .lock()
++                .unwrap()
++                .iter()
++                .find(|(_, v)| *v == value)
++                .unwrap()
++                .0;
++            observations.release_id.store(id, Ordering::SeqCst);
++        }
++        observations
++            .fail
++            .store(matches!(finish, Finish::HostError), Ordering::SeqCst);
++        observations.release.store(true, Ordering::SeqCst);
++        let mut complete = false;
++        for _ in 0..100 {
++            match future.as_mut().poll(&mut cx) {
++                Poll::Ready(result) => {
++                    match finish {
++                        Finish::Complete => result??,
++                        Finish::HostError => {
++                            let error = match result {
++                                Err(error) | Ok(Err(error)) => error,
++                                Ok(Ok(())) => panic!("host error was lost"),
++                            };
++                            assert!(format!("{error:#}").contains("parked host task failed"));
++                        }
++                        Finish::RootTrap | Finish::ChildTrap => {
++                            let error = match result {
++                                Err(error) | Ok(Err(error)) => error,
++                                Ok(Ok(())) => panic!("guest trap was lost"),
++                            };
++                            assert_eq!(
++                                error.downcast_ref::<Trap>(),
++                                Some(&Trap::UnreachableCodeReached)
++                            );
++                            let trace = error
++                                .downcast_ref::<WasmBacktrace>()
++                                .expect("guest trap must include a Wasm backtrace");
++                            assert!(
++                                trace
++                                    .frames()
++                                    .iter()
++                                    .any(|frame| frame.func_name() == Some("hold"))
++                            );
++                            let entry = if matches!(finish, Finish::RootTrap) {
++                                "run"
++                            } else {
++                                "entry"
++                            };
++                            assert!(
++                                trace
++                                    .frames()
++                                    .iter()
++                                    .any(|frame| frame.func_name() == Some(entry)),
++                                "trap backtrace did not identify the selected guest thread"
++                            );
++                            assert_eq!(
++                                observations.dropped.load(Ordering::SeqCst),
++                                1,
++                                "only the trapping worker's host future should have completed"
++                            );
++                        }
++                        Finish::Cancel => unreachable!(),
++                    }
++                    complete = true;
++                    break;
++                }
++                Poll::Pending => assert_tls_empty(),
++            }
++        }
++        assert!(complete);
++    }
++    drop(future);
++    if matches!(finish, Finish::RootTrap | Finish::ChildTrap) {
++        assert_eq!(store.data().checked, 0);
++    }
++    if matches!(finish, Finish::Complete) {
++        assert_eq!(store.data().checked, 3);
++    }
++    drop(store);
++    assert_eq!(observations.dropped.load(Ordering::SeqCst), 3);
++    assert_tls_empty();
++    Ok(())
++}
++
++#[test]
++fn accessor_tls_same_store_parked_roots_drc() -> Result<()> {
++    run(Collector::DeferredReferenceCounting, Finish::Complete)
++}
++
++#[test]
++fn accessor_tls_same_store_parked_roots_null() -> Result<()> {
++    run(Collector::Null, Finish::Complete)
++}
++
++#[test]
++fn accessor_tls_same_store_cancellation() -> Result<()> {
++    run(Collector::DeferredReferenceCounting, Finish::Cancel)
++}
++
++#[test]
++fn accessor_tls_same_store_host_error() -> Result<()> {
++    run(Collector::DeferredReferenceCounting, Finish::HostError)
++}
++
++#[test]
++fn cross_fiber_root_trap_with_parked_siblings_drc() -> Result<()> {
++    isolated_trap(
++        "cross_fiber_root_trap_with_parked_siblings_drc",
++        Collector::DeferredReferenceCounting,
++        Finish::RootTrap,
++    )
++}
++
++#[test]
++fn cross_fiber_child_trap_with_parked_siblings_drc() -> Result<()> {
++    isolated_trap(
++        "cross_fiber_child_trap_with_parked_siblings_drc",
++        Collector::DeferredReferenceCounting,
++        Finish::ChildTrap,
++    )
++}
++
++#[cfg(feature = "gc-copying")]
++#[test]
++fn cross_fiber_root_trap_with_parked_siblings_copying() -> Result<()> {
++    isolated_trap(
++        "cross_fiber_root_trap_with_parked_siblings_copying",
++        Collector::Copying,
++        Finish::RootTrap,
++    )
++}
++
++#[cfg(feature = "gc-copying")]
++#[test]
++fn cross_fiber_child_trap_with_parked_siblings_copying() -> Result<()> {
++    isolated_trap(
++        "cross_fiber_child_trap_with_parked_siblings_copying",
++        Collector::Copying,
++        Finish::ChildTrap,
++    )
++}
++
++fn isolated_trap(name: &str, collector: Collector, finish: Finish) -> Result<()> {
++    isolated_test(
++        &format!("runtime::component::concurrent::thread_tests::{name}"),
++        || {
++            run(collector, finish)?;
++            assert_workers_stopped();
++            // A new healthy Store on the same polling thread must still work.
++            run(collector, Finish::Complete)
++        },
++        6,
++    )
++}
++
++pub(super) fn assert_workers_stopped() {
++    unsafe extern "C" {
++        fn wasmtime_thread_fiber_live() -> u64;
++    }
++    // The diagnostic has no pointer arguments and is only read in isolated tests.
++    assert_eq!(
++        unsafe { wasmtime_thread_fiber_live() },
++        0,
++        "execution worker leaked"
++    );
++}
++
++pub(super) fn isolated_test(
++    test: &str,
++    run: impl FnOnce() -> Result<()>,
++    workers: u64,
++) -> Result<()> {
++    const CHILD: &str = "WASMTIME_THREAD_TRAP_TEST_CHILD";
++    if std::env::var(CHILD).as_deref() == Ok(test) {
++        unsafe extern "C" {
++            fn wasmtime_thread_fiber_started() -> u64;
++        }
++        // These experiment-only diagnostics have no pointer arguments.
++        assert_workers_stopped();
++        let before = unsafe { wasmtime_thread_fiber_started() };
++        run()?;
++        assert!(unsafe { wasmtime_thread_fiber_started() } >= before + workers);
++        assert_workers_stopped();
++        return Ok(());
++    }
++    let mut child = std::process::Command::new(std::env::current_exe()?)
++        .args(["--exact", test, "--nocapture", "--test-threads=1"])
++        .env(CHILD, test)
++        .spawn()?;
++    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
++    loop {
++        if let Some(status) = child.try_wait()? {
++            ensure!(
++                status.success(),
++                "isolated thread test {test} failed: {status}"
++            );
++            return Ok(());
++        }
++        if std::time::Instant::now() >= deadline {
++            child.kill()?;
++            child.wait()?;
++            bail!("isolated thread test {test} timed out");
++        }
++        thread::sleep(std::time::Duration::from_millis(10));
++    }
++}
++
++#[cfg(feature = "gc-copying")]
++#[test]
++fn accessor_tls_same_store_parked_roots_copying() -> Result<()> {
++    run(Collector::Copying, Finish::Complete)
++}
++
++#[test]
++fn accessor_tls_nested_scopes_restore_taken_context_after_unwind() -> Result<()> {
++    use std::panic::{AssertUnwindSafe, catch_unwind};
++    assert_tls_empty();
++    let engine = engine(Collector::DeferredReferenceCounting)?;
++    let mut outer = Store::new(&engine, 101usize);
++    let mut inner = Store::new(&engine, 202usize);
++    let inner_accessor = Accessor::new(crate::store::StoreToken::new(inner.as_context_mut()));
++    let mut future = Box::pin(outer.run_concurrent(async |accessor| {
++        accessor.with(|mut access| {
++            assert_eq!(*access.data_mut(), 101);
++            {
++                tls::set(inner.as_context_mut().0, || {
++                    inner_accessor.with(|mut access| assert_eq!(*access.data_mut(), 202));
++                });
++            }
++            tls::try_get(|state| assert!(matches!(state, tls::TryGet::Taken)));
++            let caught = catch_unwind(AssertUnwindSafe(|| {
++                tls::set(inner.as_context_mut().0, || {
++                    inner_accessor.with(|mut access| assert_eq!(*access.data_mut(), 202));
++                    panic!("intentional nested poll panic");
++                });
++            }));
++            let panic = caught.expect_err("nested scope did not panic");
++            assert_eq!(
++                panic.downcast_ref::<&str>(),
++                Some(&"intentional nested poll panic")
++            );
++            tls::try_get(|state| assert!(matches!(state, tls::TryGet::Taken)));
++            let caught = catch_unwind(AssertUnwindSafe(|| {
++                let mut nested = Box::pin(inner.run_concurrent(async |_| ()));
++                let _ = nested
++                    .as_mut()
++                    .poll(&mut Context::from_waker(Waker::noop()));
++            }));
++            let panic = caught.expect_err("recursive event loop must remain unsupported");
++            assert_eq!(
++                panic.downcast_ref::<&str>(),
++                Some(&"Recursive `StoreContextMut::run_concurrent` calls not supported")
++            );
++            tls::try_get(|state| assert!(matches!(state, tls::TryGet::Taken)));
++        });
++        accessor.with(|mut access| assert_eq!(*access.data_mut(), 101));
++    }));
++    assert!(matches!(
++        future
++            .as_mut()
++            .poll(&mut Context::from_waker(Waker::noop())),
++        Poll::Ready(Ok(()))
++    ));
++    drop(future);
++    assert_tls_empty();
++    Ok(())
++}
+diff --git a/crates/wasmtime/src/runtime/component/instance.rs b/crates/wasmtime/src/runtime/component/instance.rs
+index 453b6dcf57..bcd3635858 100644
+--- a/crates/wasmtime/src/runtime/component/instance.rs
++++ b/crates/wasmtime/src/runtime/component/instance.rs
+@@ -840,6 +840,8 @@ impl<'a> Instantiator<'a> {
+                     // Also note we are calling new_started_impl because we have
+                     // already checked for asyncness and are running on a fiber
+                     // if required.
++                    // In thread-backed mode the public async instantiation
++                    // entrypoints also require Send Store data.
+ 
+                     let i = unsafe {
+                         crate::Instance::new_started(store, module, imports.as_ref(), asyncness)
+@@ -1162,7 +1164,14 @@ impl<T: 'static> InstancePre<T> {
+     //
+     // TODO: needs more docs
+     #[cfg(feature = "async")]
+-    pub async fn instantiate_async(&self, store: impl AsContextMut<Data = T>) -> Result<Instance> {
++    #[cfg_attr(
++        wasmtime_thread_fibers,
++        doc = "The experimental OS-thread backend requires `Send` Store data, even for locally polled futures."
++    )]
++    pub async fn instantiate_async(&self, store: impl AsContextMut<Data = T>) -> Result<Instance>
++    where
++        T: crate::AsyncStoreData,
++    {
+         self._instantiate(store, Asyncness::Yes).await
+     }
+ 
+diff --git a/crates/wasmtime/src/runtime/fiber.rs b/crates/wasmtime/src/runtime/fiber.rs
+index 50f086f7d4..1ca5c010e4 100644
+--- a/crates/wasmtime/src/runtime/fiber.rs
++++ b/crates/wasmtime/src/runtime/fiber.rs
+@@ -17,8 +17,21 @@ use super::module::ModuleRegistry;
+ #[cfg(all(feature = "component-model-async", feature = "gc"))]
+ use super::vm::GcRootsList;
+ 
+-type WasmtimeResume = Result<NonNull<Context<'static>>>;
++#[cfg(not(wasmtime_thread_fibers))]
++type PollContext = NonNull<Context<'static>>;
++#[cfg(wasmtime_thread_fibers)]
++type PollContext = core::task::Waker;
++#[cfg(not(wasmtime_thread_fibers))]
++type WasmtimeResume = Result<PollContext>;
++#[cfg(wasmtime_thread_fibers)]
++type WasmtimeResume = (Result<PollContext>, AsyncWasmCallState);
++#[cfg(not(wasmtime_thread_fibers))]
+ type WasmtimeYield = StoreFiberYield;
++#[cfg(wasmtime_thread_fibers)]
++struct WasmtimeYield {
++    reason: StoreFiberYield,
++    tls: AsyncWasmCallState,
++}
+ type WasmtimeComplete = Result<()>;
+ type WasmtimeSuspend = Suspend<WasmtimeResume, WasmtimeYield, WasmtimeComplete>;
+ type WasmtimeFiber<'a> = Fiber<'a, WasmtimeResume, WasmtimeYield, WasmtimeComplete>;
+@@ -82,7 +95,11 @@ pub(crate) struct AsyncState {
+     /// handled by ensuring the signatures that work with `BlockingContext` all
+     /// use constrained anonymous lifetimes that are guaranteed to be shorter
+     /// than the original `Context` lifetime.
+-    current_future_cx: Option<NonNull<Context<'static>>>,
++    ///
++    /// The experimental thread backend stores an owned `Waker` instead. Each
++    /// host-future poll constructs a worker-local `Context` from that waker;
++    /// no pointer into the polling thread's Context crosses the handshake.
++    current_future_cx: Option<PollContext>,
+ 
+     /// The last fiber stack that was in use by the store.
+     ///
+@@ -106,6 +123,8 @@ pub(crate) struct AsyncState {
+ // `None`. Thus if a store is being sent across threads that's done because no
+ // fibers are active, and once fibers are active everything will stick within
+ // the same thread.
++// For the thread backend the context is an owned Send Waker. The suspend pointer
++// is used only by the worker and cleared before yielding Store access.
+ unsafe impl Send for AsyncState {}
+ unsafe impl Sync for AsyncState {}
+ 
+@@ -163,7 +182,52 @@ pub(crate) struct BlockingContext<'a, 'b> {
+     /// available. Upon resumption the context here is *optionally* provided.
+     /// Cancellation is a case where it isn't passed back and a re-poll is a
+     /// case where it's passed back.
++    #[cfg(not(wasmtime_thread_fibers))]
+     future_cx: Option<&'a mut Context<'b>>,
++    #[cfg(wasmtime_thread_fibers)]
++    future_cx: Option<PollContext>,
++    #[cfg(wasmtime_thread_fibers)]
++    _context_lifetime: core::marker::PhantomData<&'b ()>,
++}
++
++#[cfg(wasmtime_thread_fibers)]
++std::thread_local! {
++    // Each worker owns exactly one execution stack. Never attach its activations
++    // to the polling thread, even when that thread is itself executing Wasm.
++    static WORKER_TLS: core::cell::Cell<Option<crate::vm::PreviousAsyncWasmCallState>> =
++        const { core::cell::Cell::new(None) };
++}
++
++#[cfg(wasmtime_thread_fibers)]
++fn enter_worker_tls(tls: AsyncWasmCallState) {
++    AsyncWasmCallState::assert_worker_tls_empty();
++    WORKER_TLS.with(|slot| {
++        assert!(
++            slot.take().is_none(),
++            "worker already has an activation owner"
++        );
++        slot.set(Some(unsafe { tls.push() }));
++    });
++}
++
++#[cfg(wasmtime_thread_fibers)]
++fn leave_worker_tls() -> AsyncWasmCallState {
++    let tls = WORKER_TLS.with(|slot| unsafe {
++        slot.take()
++            .expect("worker activation owner missing")
++            .restore()
++    });
++    AsyncWasmCallState::assert_worker_tls_empty();
++    tls
++}
++
++#[cfg(wasmtime_thread_fibers)]
++static TLS_SUSPENSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++
++#[cfg(wasmtime_thread_fibers)]
++#[unsafe(no_mangle)]
++pub extern "C" fn wasmtime_thread_fiber_tls_suspensions() -> u64 {
++    TLS_SUSPENSIONS.load(core::sync::atomic::Ordering::SeqCst)
+ }
+ 
+ impl<'a, 'b> BlockingContext<'a, 'b> {
+@@ -215,12 +279,20 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
+         // fiber and for this fiber. The "take" pattern here ensures that if
+         // this `BlockingContext` context acquires the pointers then there are
+         // no other instances of these pointers in use anywhere else.
++        #[cfg(not(wasmtime_thread_fibers))]
+         let future_cx = unsafe { Some(state.current_future_cx.take().unwrap().as_mut()) };
++        #[cfg(wasmtime_thread_fibers)]
++        let future_cx = Some(state.current_future_cx.take().unwrap());
+         let suspend = unsafe { state.current_suspend.take().unwrap().as_mut() };
+ 
+         let mut reset = ResetBlockingContext {
+             store,
+-            cx: BlockingContext { future_cx, suspend },
++            cx: BlockingContext {
++                future_cx,
++                suspend,
++                #[cfg(wasmtime_thread_fibers)]
++                _context_lifetime: core::marker::PhantomData,
++            },
+         };
+         return f(&mut reset.store, &mut reset.cx);
+ 
+@@ -238,6 +310,7 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
+                 debug_assert!(state.current_suspend.is_none());
+                 state.current_suspend = Some(NonNull::from(&mut *self.cx.suspend));
+ 
++                #[cfg(not(wasmtime_thread_fibers))]
+                 if let Some(cx) = &mut self.cx.future_cx {
+                     // SAFETY: while this is changing the lifetime to `'static`
+                     // it should never be used while it's `'static` given this
+@@ -245,6 +318,10 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
+                     state.current_future_cx =
+                         Some(NonNull::from(unsafe { change_context_lifetime(cx) }));
+                 }
++                #[cfg(wasmtime_thread_fibers)]
++                {
++                    state.current_future_cx = self.cx.future_cx.take();
++                }
+             }
+         }
+     }
+@@ -301,7 +378,13 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
+     {
+         let mut future = core::pin::pin!(future);
+         loop {
+-            match future.as_mut().poll(self.future_cx.as_mut().unwrap()) {
++            #[cfg(not(wasmtime_thread_fibers))]
++            let poll = future.as_mut().poll(self.future_cx.as_mut().unwrap());
++            #[cfg(wasmtime_thread_fibers)]
++            let poll = future
++                .as_mut()
++                .poll(&mut Context::from_waker(self.future_cx.as_ref().unwrap()));
++            match poll {
+                 Poll::Ready(v) => break Ok(v),
+                 Poll::Pending => self.suspend(StoreFiberYield::KeepStore)?,
+             }
+@@ -321,15 +404,294 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
+         // value given back.
+         self.future_cx.take();
+ 
+-        let mut new_future_cx: NonNull<Context<'static>> = self.suspend.suspend(yield_)?;
++        #[cfg(wasmtime_thread_fibers)]
++        {
++            let tls = leave_worker_tls();
++            if !tls.is_empty() {
++                TLS_SUSPENSIONS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
++            }
++            let (cx, tls) = self.suspend.suspend(WasmtimeYield {
++                reason: yield_,
++                tls,
++            });
++            // Cancellation must reattach the saved activations before unwinding.
++            enter_worker_tls(tls);
++            self.future_cx = Some(cx?);
++        }
+ 
+-        // SAFETY: this function is unsafe as we're doing "funky" things to the
+-        // `new_future_cx` we have been given. The safety here relies on the
+-        // fact that the lifetimes of `BlockingContext` are all "smaller" than
+-        // the original `Context` itself, and that should be guaranteed through
+-        // the exclusive constructor of this type `BlockingContext::with`.
+-        unsafe {
+-            self.future_cx = Some(change_context_lifetime(new_future_cx.as_mut()));
++        #[cfg(not(wasmtime_thread_fibers))]
++        {
++            let mut new_future_cx: NonNull<Context<'static>> = self.suspend.suspend(yield_)?;
++            unsafe {
++                self.future_cx = Some(change_context_lifetime(new_future_cx.as_mut()));
++            }
++        }
++        Ok(())
++    }
++}
++
++#[cfg(all(test, wasmtime_thread_fibers, feature = "cranelift", feature = "wat"))]
++mod thread_tests {
++    use super::*;
++    use crate::{Caller, Config, Func, Instance, Module, Store};
++    use std::sync::{Arc, Mutex};
++    use std::task::{Wake, Waker};
++    use std::thread::{self, ThreadId};
++
++    struct RecordWake {
++        tag: u32,
++        events: Arc<Mutex<Vec<u32>>>,
++    }
++
++    impl Wake for RecordWake {
++        fn wake(self: Arc<Self>) {
++            self.events.lock().unwrap().push(self.tag);
++        }
++    }
++
++    struct HostFuture {
++        polls: u32,
++        threads: Arc<Mutex<Vec<ThreadId>>>,
++    }
++
++    impl Future for HostFuture {
++        type Output = ();
++        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
++            crate::vm::tls::with(|state| assert!(state.is_some()));
++            self.threads.lock().unwrap().push(thread::current().id());
++            cx.waker().wake_by_ref();
++            self.polls += 1;
++            if self.polls < 3 {
++                Poll::Pending
++            } else {
++                Poll::Ready(())
++            }
++        }
++    }
++
++    fn instantiate(store: &mut Store<()>, module: &Module, host: Func) -> Result<Instance> {
++        let imports = [host.into()];
++        let mut init = Box::pin(Instance::new_async(store, module, &imports));
++        match init.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
++            Poll::Ready(result) => result,
++            Poll::Pending => panic!("fixture without startup unexpectedly suspended"),
++        }
++    }
++
++    #[test]
++    fn worker_context_uses_each_poll_waker_and_restores_activations() -> Result<()> {
++        let mut config = Config::new();
++        config.macos_use_mach_ports(false);
++        let engine = Engine::new(&config)?;
++        let mut store = Store::new(&engine, ());
++        let threads = Arc::new(Mutex::new(Vec::new()));
++        let host_threads = threads.clone();
++        let host = Func::wrap_async(&mut store, move |_: Caller<'_, ()>, (): ()| {
++            Box::new(HostFuture {
++                polls: 0,
++                threads: host_threads.clone(),
++            })
++        });
++        let module = Module::new(
++            &engine,
++            "(module (import \"\" \"host\" (func $host)) (func (export \"run\") call $host))",
++        )?;
++        let instance = instantiate(&mut store, &module, host)?;
++        let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
++        let mut future = Box::pin(run.call_async(&mut store, ()));
++        let events = Arc::new(Mutex::new(Vec::new()));
++        let waker = |tag| {
++            Waker::from(Arc::new(RecordWake {
++                tag,
++                events: events.clone(),
++            }))
++        };
++        let first = waker(1);
++        let before = wasmtime_thread_fiber_tls_suspensions();
++        assert!(
++            future
++                .as_mut()
++                .poll(&mut Context::from_waker(&first))
++                .is_pending()
++        );
++        assert!(
++            wasmtime_thread_fiber_tls_suspensions() > before,
++            "parked worker did not publish its activation list"
++        );
++        crate::vm::tls::with(|state| assert!(state.is_none()));
++        let second = waker(2);
++        let poller = thread::scope(|scope| {
++            scope
++                .spawn(|| {
++                    crate::vm::tls::with(|state| assert!(state.is_none()));
++                    assert!(
++                        future
++                            .as_mut()
++                            .poll(&mut Context::from_waker(&second))
++                            .is_pending()
++                    );
++                    crate::vm::tls::with(|state| assert!(state.is_none()));
++                    thread::current().id()
++                })
++                .join()
++                .unwrap()
++        });
++        let third = waker(3);
++        assert!(matches!(
++            future.as_mut().poll(&mut Context::from_waker(&third)),
++            Poll::Ready(Ok(()))
++        ));
++        drop(future);
++        crate::vm::tls::with(|state| assert!(state.is_none()));
++        assert_eq!(*events.lock().unwrap(), [1, 2, 3]);
++        let threads = threads.lock().unwrap();
++        assert_eq!(threads.len(), 3);
++        assert!(threads.iter().all(|t| *t == threads[0]));
++        assert_ne!(threads[0], thread::current().id());
++        assert_ne!(threads[0], poller);
++        Ok(())
++    }
++
++    #[test]
++    fn cancellation_reattaches_worker_tls_before_unwinding() -> Result<()> {
++        struct PendingDrop(Arc<core::sync::atomic::AtomicBool>);
++        impl Future for PendingDrop {
++            type Output = ();
++            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
++                Poll::Pending
++            }
++        }
++        impl Drop for PendingDrop {
++            fn drop(&mut self) {
++                crate::vm::tls::with(|state| assert!(state.is_some()));
++                self.0.store(true, core::sync::atomic::Ordering::SeqCst);
++            }
++        }
++        let mut config = Config::new();
++        config.macos_use_mach_ports(false);
++        let engine = Engine::new(&config)?;
++        let mut store = Store::new(&engine, ());
++        let dropped = Arc::new(core::sync::atomic::AtomicBool::new(false));
++        let host_dropped = dropped.clone();
++        let host = Func::wrap_async(&mut store, move |_: Caller<'_, ()>, (): ()| {
++            Box::new(PendingDrop(host_dropped.clone()))
++        });
++        let module = Module::new(
++            &engine,
++            "(module (import \"\" \"host\" (func $host)) (func (export \"run\") call $host))",
++        )?;
++        let instance = instantiate(&mut store, &module, host)?;
++        let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
++        let events = Arc::new(Mutex::new(Vec::new()));
++        let waker = Waker::from(Arc::new(RecordWake { tag: 0, events }));
++        let mut future = Box::pin(run.call_async(&mut store, ()));
++        assert!(
++            future
++                .as_mut()
++                .poll(&mut Context::from_waker(&waker))
++                .is_pending()
++        );
++        drop(future);
++        crate::vm::tls::with(|state| assert!(state.is_none()));
++        assert!(dropped.load(core::sync::atomic::Ordering::SeqCst));
++        Ok(())
++    }
++
++    #[test]
++    fn non_send_store_still_supports_synchronous_instantiation() -> Result<()> {
++        struct ThreadBound {
++            creator: ThreadId,
++            _not_send: core::marker::PhantomData<std::rc::Rc<()>>,
++        }
++        let mut config = Config::new();
++        config.macos_use_mach_ports(false);
++        let engine = Engine::new(&config)?;
++        let mut store = Store::new(
++            &engine,
++            ThreadBound {
++                creator: thread::current().id(),
++                _not_send: core::marker::PhantomData,
++            },
++        );
++        let host = Func::wrap(
++            &mut store,
++            |caller: Caller<'_, ThreadBound>| -> Result<()> {
++                ensure!(
++                    caller.data().creator == thread::current().id(),
++                    "synchronous Store data moved to worker"
++                );
++                Ok(())
++            },
++        );
++        let module = Module::new(
++            &engine,
++            "(module (import \"\" \"host\" (func $host)) (func $start call $host) (start $start))",
++        )?;
++        let imports = [host.into()];
++        Instance::new(&mut store, &module, &imports)?;
++        let mut linker = crate::Linker::new(&engine);
++        linker.define(&store, "", "host", host)?;
++        linker.instantiate_pre(&module)?.instantiate(&mut store)?;
++        #[cfg(feature = "component-model")]
++        {
++            let component = crate::component::Component::new(
++                &engine,
++                "(component (core module $m (func $start) (start $start)) (core instance (instantiate $m)))",
++            )?;
++            crate::component::Linker::new(&engine)
++                .instantiate_pre(&component)?
++                .instantiate(&mut store)?;
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn send_store_supports_async_instantiation_entrypoints() -> Result<()> {
++        let mut config = Config::new();
++        config.macos_use_mach_ports(false);
++        let engine = Engine::new(&config)?;
++        let creator = thread::current().id();
++        let mut store = Store::new(&engine, 0usize);
++        let host = Func::wrap(&mut store, move |mut caller: Caller<'_, usize>| {
++            assert_ne!(creator, thread::current().id());
++            *caller.data_mut() += 1;
++        });
++        let module = Module::new(
++            &engine,
++            "(module (import \"\" \"host\" (func $host)) (func $start call $host) (start $start))",
++        )?;
++        let mut cx = Context::from_waker(Waker::noop());
++        let imports = [host.into()];
++        {
++            let mut init = Box::pin(Instance::new_async(&mut store, &module, &imports));
++            assert!(matches!(init.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
++        }
++        let mut linker = crate::Linker::new(&engine);
++        linker.define(&store, "", "host", host)?;
++        {
++            let mut init = Box::pin(linker.instantiate_async(&mut store, &module));
++            assert!(matches!(init.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
++        }
++        let pre = linker.instantiate_pre(&module)?;
++        {
++            let mut init = Box::pin(pre.instantiate_async(&mut store));
++            assert!(matches!(init.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
++        }
++        assert_eq!(*store.data(), 3);
++        #[cfg(feature = "component-model")]
++        {
++            let component = crate::component::Component::new(
++                &engine,
++                "(component (core module $m (func $start) (start $start)) (core instance (instantiate $m)))",
++            )?;
++            let linker = crate::component::Linker::<usize>::new(&engine);
++            {
++                let mut init = Box::pin(linker.instantiate_async(&mut store, &component));
++                assert!(matches!(init.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
++            }
++            let pre = linker.instantiate_pre(&component)?;
++            let mut init = Box::pin(pre.instantiate_async(&mut store));
++            assert!(matches!(init.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+         }
+         Ok(())
+     }
+@@ -608,7 +970,10 @@ impl FiberResumeState {
+         store: &mut StoreOpaque,
+         fiber: &mut StoreFiber<'_>,
+     ) -> PriorFiberResumeState {
++        #[cfg(not(wasmtime_thread_fibers))]
+         let tls = unsafe { self.tls.push() };
++        #[cfg(wasmtime_thread_fibers)]
++        let tls = self.tls;
+         let mpk = swap_mpk_states(self.mpk);
+         let async_guard_range = fiber
+             .fiber()
+@@ -661,27 +1026,30 @@ impl StoreOpaque {
+         mem::replace(&mut self.fiber_async_state_mut().current_suspend, ptr)
+     }
+ 
+-    fn replace_current_future_cx(
+-        &mut self,
+-        ptr: Option<NonNull<Context<'static>>>,
+-    ) -> Option<NonNull<Context<'static>>> {
++    fn replace_current_future_cx(&mut self, ptr: Option<PollContext>) -> Option<PollContext> {
+         mem::replace(&mut self.fiber_async_state_mut().current_future_cx, ptr)
+     }
+ }
+ 
+ struct PriorFiberResumeState {
++    #[cfg(not(wasmtime_thread_fibers))]
+     tls: crate::runtime::vm::PreviousAsyncWasmCallState,
++    #[cfg(wasmtime_thread_fibers)]
++    tls: AsyncWasmCallState,
+     mpk: Option<ProtectionMask>,
+     stack_limit: usize,
+     async_guard_range: Range<*mut u8>,
+     current_suspend: Option<NonNull<WasmtimeSuspend>>,
+-    current_future_cx: Option<NonNull<Context<'static>>>,
++    current_future_cx: Option<PollContext>,
+     executor: Executor,
+ }
+ 
+ impl PriorFiberResumeState {
+     unsafe fn replace(self, store: &mut StoreOpaque) -> FiberResumeState {
++        #[cfg(not(wasmtime_thread_fibers))]
+         let tls = unsafe { self.tls.restore() };
++        #[cfg(wasmtime_thread_fibers)]
++        let tls = self.tls;
+         let mpk = swap_mpk_states(self.mpk);
+         // No need to save `_my_guard` since we can re-infer it from the fiber
+         // that this state is attached to.
+@@ -725,9 +1093,17 @@ fn swap_mpk_states(mask: Option<ProtectionMask>) -> Option<ProtectionMask> {
+ fn resume_fiber<'a>(
+     store: &mut StoreOpaque,
+     fiber: &mut StoreFiber<'a>,
+-    result: WasmtimeResume,
++    result: Result<PollContext>,
+ ) -> Result<WasmtimeComplete, StoreFiberYield> {
+     assert_eq!(store.id(), fiber.id);
++    #[cfg(wasmtime_thread_fibers)]
++    let result = (
++        result,
++        mem::replace(
++            &mut fiber.state.as_mut().unwrap().get_mut().tls,
++            AsyncWasmCallState::new(),
++        ),
++    );
+ 
+     struct Restore<'a, 'b> {
+         store: &'b mut StoreOpaque,
+@@ -756,6 +1132,11 @@ fn resume_fiber<'a>(
+         restore.fiber.fiber().unwrap().resume(result)
+     };
+ 
++    #[cfg(wasmtime_thread_fibers)]
++    let result = result.map_err(|yield_| {
++        fiber.state.as_mut().unwrap().get_mut().tls = yield_.tls;
++        yield_.reason
++    });
+     match &result {
+         // The fiber has finished, so recycle its stack by disposing of the
+         // underlying fiber itself.
+@@ -796,6 +1177,8 @@ fn resume_fiber<'a>(
+ /// The returned `StoreFiber<'a>` structure is unconditionally `Send` but the
+ /// send-ness is actually a function of `S`. When `S` is statically known to be
+ /// `Send` then use the safe [`make_fiber`] function.
++/// With thread-backed fibers, the caller must guarantee that all reachable
++/// Store state can transfer to the worker, even if the future is polled locally.
+ pub(crate) unsafe fn make_fiber_unchecked<'a, S>(
+     store: &mut S,
+     fun: impl FnOnce(&mut S) -> Result<()> + Send + Sync + 'a,
+@@ -807,10 +1190,30 @@ where
+     let engine = opaque.engine().clone();
+     let executor = Executor::new(&engine)?;
+     let id = opaque.id();
+-    let stack = opaque.allocate_fiber_stack()?;
+     let track_pkey_context_switch = opaque.has_pkey();
++    #[cfg(wasmtime_thread_fibers)]
++    ensure!(
++        !track_pkey_context_switch,
++        "thread-backed execution does not support protection keys"
++    );
++    let stack = opaque.allocate_fiber_stack()?;
+     let store = &raw mut *store;
+-    let fiber = Fiber::new(stack, move |result: WasmtimeResume, suspend| {
++    let run = move |result: WasmtimeResume, suspend: &mut WasmtimeSuspend| {
++        #[cfg(wasmtime_thread_fibers)]
++        let result = {
++            enter_worker_tls(result.1);
++            result.0
++        };
++        #[cfg(wasmtime_thread_fibers)]
++        struct ResetWorkerTls;
++        #[cfg(wasmtime_thread_fibers)]
++        impl Drop for ResetWorkerTls {
++            fn drop(&mut self) {
++                leave_worker_tls().assert_null();
++            }
++        }
++        #[cfg(wasmtime_thread_fibers)]
++        let _worker_tls = ResetWorkerTls;
+         let future_cx = match result {
+             Ok(cx) => cx,
+             // Cancelled before we started? Just return.
+@@ -858,7 +1261,13 @@ where
+         let reset = ResetCurrentPointersToNull(store_ref);
+ 
+         fun(reset.0)
+-    });
++    };
++    #[cfg(not(wasmtime_thread_fibers))]
++    let fiber = Fiber::new(stack, run);
++    // SAFETY: the caller guarantees exclusive access and transferable borrowed
++    // state for the lifetime of this fiber, including its cancellation/join.
++    #[cfg(wasmtime_thread_fibers)]
++    let fiber = unsafe { Fiber::new_unchecked(stack, run) };
+     let fiber = match fiber {
+         Ok(fiber) => fiber,
+         Err((e, stack)) => {
+@@ -907,6 +1316,26 @@ pub(crate) async fn on_fiber<S, R>(
+     store: &mut S,
+     func: impl FnOnce(&mut S) -> R + Send + Sync,
+ ) -> Result<R>
++where
++    S: AsStoreOpaque + Send + ?Sized,
++    R: Send + Sync,
++{
++    // SAFETY: S is Send and the fiber cannot outlive this exclusive borrow.
++    unsafe { on_fiber_unchecked(store, func).await }
++}
++
++/// Run borrowed state on a fiber without a static Send bound.
++///
++/// # Safety
++///
++/// With thread-backed fibers, all state reachable through `store` must be safe
++/// to transfer to the worker. The future retains exclusive access until the
++/// worker is joined, including when dropped. Stock fibers only require that
++/// the future is Send exactly when S is Send.
++pub(crate) async unsafe fn on_fiber_unchecked<S, R>(
++    store: &mut S,
++    func: impl FnOnce(&mut S) -> R + Send + Sync,
++) -> Result<R>
+ where
+     S: AsStoreOpaque + ?Sized,
+     R: Send + Sync,
+@@ -917,11 +1346,8 @@ where
+ 
+     let mut result = None;
+ 
+-    // SAFETY: the `StoreFiber` returned by `make_fiber_unchecked` is `Send`
+-    // despite we not actually knowing here whether `S` is `Send` or not. That
+-    // is safe here, however, because this function is already conditionally
+-    // `Send` based on `S`. Additionally `fiber` doesn't escape this function,
+-    // so the future-of-this-function is still correctly `Send`-vs-not.
++    // SAFETY: the caller upholds the transfer contract, and the fiber does not
++    // escape this future or its exclusive Store borrow.
+     let fiber = unsafe {
+         make_fiber_unchecked(store, |store| {
+             result = Some(func(store));
+@@ -1001,8 +1427,10 @@ impl<'b> Future for FiberFuture<'_, 'b> {
+         // satisfied by the users of this in the `BlockingContext` structure
+         // where the lifetime parameters there are always more constrained than
+         // they are here.
+-        let cx: &mut Context<'static> = unsafe { change_context_lifetime(cx) };
+-        let cx = NonNull::from(cx);
++        #[cfg(not(wasmtime_thread_fibers))]
++        let cx = NonNull::from(unsafe { change_context_lifetime(cx) });
++        #[cfg(wasmtime_thread_fibers)]
++        let cx = cx.waker().clone();
+ 
+         match resume_fiber(me.store, me.fiber.as_mut().unwrap(), Ok(cx)) {
+             Ok(Ok(())) => Poll::Ready(Ok(None)),
+@@ -1033,6 +1461,7 @@ impl Drop for FiberFuture<'_, '_> {
+ /// being used to determine whether it's actually safe or not. See docs on
+ /// callers of this function. The purpose of this is to scope the `transmute` to
+ /// as small an operation as possible.
++#[cfg(not(wasmtime_thread_fibers))]
+ unsafe fn change_context_lifetime<'a, 'b>(cx: &'a mut Context<'_>) -> &'a mut Context<'b> {
+     // SAFETY: See the function documentation, this is not safe in general.
+     unsafe { mem::transmute::<&mut Context<'_>, &mut Context<'b>>(cx) }
+diff --git a/crates/wasmtime/src/runtime/instance.rs b/crates/wasmtime/src/runtime/instance.rs
+index 53fd54faed..cfa223b095 100644
+--- a/crates/wasmtime/src/runtime/instance.rs
++++ b/crates/wasmtime/src/runtime/instance.rs
+@@ -197,8 +197,12 @@ impl Instance {
+     /// memory allocation fails. See the `OutOfMemory` type's documentation for
+     /// details on Wasmtime's out-of-memory handling.
+     #[cfg(feature = "async")]
+-    pub async fn new_async(
+-        mut store: impl AsContextMut,
++    #[cfg_attr(
++        wasmtime_thread_fibers,
++        doc = "The experimental OS-thread backend requires `Send` Store data, even for locally polled futures."
++    )]
++    pub async fn new_async<T: crate::AsyncStoreData + 'static>(
++        mut store: impl AsContextMut<Data = T>,
+         module: &Module,
+         imports: &[Extern],
+     ) -> Result<Instance> {
+@@ -248,6 +252,8 @@ impl Instance {
+     /// Internal function to create an instance and run the start function.
+     ///
+     /// This function's unsafety is the same as `Instance::new_raw`.
++    /// With thread-backed fibers, `T` must additionally be `Send` when
++    /// `asyncness` is `Yes`. Synchronous callers need no such bound.
+     pub(crate) async unsafe fn new_started<T>(
+         store: &mut StoreContextMut<'_, T>,
+         module: &Module,
+@@ -273,7 +279,13 @@ impl Instance {
+             } else {
+                 #[cfg(feature = "async")]
+                 {
+-                    store.on_fiber(|store| instance.start_raw(store)).await??;
++                    // SAFETY: async callers uphold the Send contract above.
++                    unsafe {
++                        crate::fiber::on_fiber_unchecked(store.0, |store| {
++                            instance.start_raw(&mut StoreContextMut(store))
++                        })
++                        .await??
++                    };
+                 }
+                 #[cfg(not(feature = "async"))]
+                 unreachable!();
+@@ -935,10 +947,17 @@ impl<T: 'static> InstancePre<T> {
+     /// memory allocation fails. See the `OutOfMemory` type's documentation for
+     /// details on Wasmtime's out-of-memory handling.
+     #[cfg(feature = "async")]
++    #[cfg_attr(
++        wasmtime_thread_fibers,
++        doc = "The experimental OS-thread backend requires `Send` Store data, even for locally polled futures."
++    )]
+     pub async fn instantiate_async(
+         &self,
+         mut store: impl AsContextMut<Data = T>,
+-    ) -> Result<Instance> {
++    ) -> Result<Instance>
++    where
++        T: crate::AsyncStoreData,
++    {
+         let mut store = store.as_context_mut();
+         let imports = pre_instantiate_raw(
+             &mut store.0,
+@@ -958,6 +977,75 @@ impl<T: 'static> InstancePre<T> {
+     }
+ }
+ 
++/// Store data accepted by asynchronous instantiation.
++///
++/// The experimental OS-thread backend requires `Send` even when the returned
++/// future is polled locally. Stock stack-switching retains its existing contract.
++#[doc(hidden)]
++#[cfg(wasmtime_thread_fibers)]
++/// A local, never-polled future must still reject non-Send Store data:
++///
++/// ```compile_fail,E0277
++/// use std::rc::Rc;
++/// use wasmtime::{Engine, Instance, Module, Store};
++/// let engine = Engine::default();
++/// let module = Module::new(&engine, "(module)").unwrap();
++/// let mut store = Store::new(&engine, Rc::new(()));
++/// let _future = Instance::new_async(&mut store, &module, &[]);
++/// ```
++///
++/// ```compile_fail,E0277
++/// use std::rc::Rc;
++/// use wasmtime::{Engine, Linker, Module, Store};
++/// let engine = Engine::default();
++/// let module = Module::new(&engine, "(module)").unwrap();
++/// let pre = Linker::<Rc<()>>::new(&engine).instantiate_pre(&module).unwrap();
++/// let mut store = Store::new(&engine, Rc::new(()));
++/// let _future = pre.instantiate_async(&mut store);
++/// ```
++///
++/// ```compile_fail,E0277
++/// use std::rc::Rc;
++/// use wasmtime::{Engine, Store};
++/// use wasmtime::component::{Component, Linker};
++/// let engine = Engine::default();
++/// let component = Component::new(&engine, "(component)").unwrap();
++/// let pre = Linker::<Rc<()>>::new(&engine).instantiate_pre(&component).unwrap();
++/// let mut store = Store::new(&engine, Rc::new(()));
++/// let _future = pre.instantiate_async(&mut store);
++/// ```
++pub trait AsyncStoreData: Send {}
++#[cfg(wasmtime_thread_fibers)]
++impl<T: Send + ?Sized> AsyncStoreData for T {}
++#[doc(hidden)]
++#[cfg(not(wasmtime_thread_fibers))]
++/// Stock fibers continue accepting non-Send Store data:
++///
++/// ```
++/// use std::rc::Rc;
++/// use std::future::Future;
++/// use std::task::{Context, Poll, Waker};
++/// use wasmtime::{Engine, Instance, Linker, Module, Store};
++/// let engine = Engine::default();
++/// let module = Module::new(&engine, "(module (func $start) (start $start))").unwrap();
++/// let mut store = Store::new(&engine, Rc::new(()));
++/// let mut cx = Context::from_waker(Waker::noop());
++/// assert!(matches!(Box::pin(Instance::new_async(&mut store, &module, &[]))
++///     .as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
++/// let pre = Linker::<Rc<()>>::new(&engine).instantiate_pre(&module).unwrap();
++/// assert!(matches!(Box::pin(pre.instantiate_async(&mut store))
++///     .as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
++/// let component = wasmtime::component::Component::new(&engine,
++///     "(component (core module $m (func $start) (start $start)) (core instance (instantiate $m)))").unwrap();
++/// let pre = wasmtime::component::Linker::<Rc<()>>::new(&engine)
++///     .instantiate_pre(&component).unwrap();
++/// assert!(matches!(Box::pin(pre.instantiate_async(&mut store))
++///     .as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
++/// ```
++pub trait AsyncStoreData {}
++#[cfg(not(wasmtime_thread_fibers))]
++impl<T: ?Sized> AsyncStoreData for T {}
++
+ /// Helper function shared between
+ /// `InstancePre::{instantiate,instantiate_async}`
+ ///
+diff --git a/crates/wasmtime/src/runtime/store/async_.rs b/crates/wasmtime/src/runtime/store/async_.rs
+index 09a98b24c5..6496e2b1e8 100644
+--- a/crates/wasmtime/src/runtime/store/async_.rs
++++ b/crates/wasmtime/src/runtime/store/async_.rs
+@@ -204,7 +204,7 @@ impl StoreOpaque {
+     }
+ }
+ 
+-impl<T> StoreContextMut<'_, T> {
++impl<T: Send> StoreContextMut<'_, T> {
+     /// Executes a synchronous computation `func` asynchronously on a new fiber.
+     pub(crate) async fn on_fiber<R: Send + Sync>(
+         &mut self,
+diff --git a/crates/wasmtime/src/runtime/store/gc.rs b/crates/wasmtime/src/runtime/store/gc.rs
+index 364249346c..4ef950301f 100644
+--- a/crates/wasmtime/src/runtime/store/gc.rs
++++ b/crates/wasmtime/src/runtime/store/gc.rs
+@@ -767,6 +767,17 @@ impl StoreOpaque {
+         }
+     }
+ 
++    #[cfg(all(test, wasmtime_thread_fibers, feature = "component-model-async"))]
++    pub(crate) fn parked_wasm_stack_root_count(&mut self) -> usize {
++        let mut roots = GcRootsList::default();
++        self.trace_wasm_stack_roots(&mut roots);
++        // SAFETY: exclusive Store access keeps the parked stacks and their
++        // slots alive and unchanged throughout this iteration.
++        unsafe { roots.iter() }
++            .filter(|root| root.is_on_wasm_stack())
++            .count()
++    }
++
+     fn trace_wasm_stack_roots(&mut self, gc_roots_list: &mut GcRootsList) {
+         log::trace!("Begin trace GC roots :: Wasm stack");
+ 
+diff --git a/crates/wasmtime/src/runtime/vm/traphandlers.rs b/crates/wasmtime/src/runtime/vm/traphandlers.rs
+index 7ea34b1473..ea0eda0a4e 100644
+--- a/crates/wasmtime/src/runtime/vm/traphandlers.rs
++++ b/crates/wasmtime/src/runtime/vm/traphandlers.rs
+@@ -1297,6 +1297,19 @@ pub(crate) mod tls {
+             assert!(self.state.is_null());
+         }
+ 
++        #[cfg(wasmtime_thread_fibers)]
++        pub(crate) fn is_empty(&self) -> bool {
++            self.state.is_null()
++        }
++
++        #[cfg(wasmtime_thread_fibers)]
++        pub(crate) fn assert_worker_tls_empty() {
++            assert!(
++                raw::get().is_null(),
++                "worker retained a live activation chain"
++            );
++        }
++
+         /// Asserts that the current CallThreadState pointer, if present, is not
+         /// in the `range` specified.
+         ///

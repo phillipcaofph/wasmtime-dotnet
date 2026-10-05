@@ -9,5 +9,6 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Wasmtime.csproj" />
     <None Include="../Components/fiber-probe.wat" Link="fiber-probe.wat" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../Components/fiber-gc-probe.wat" Link="fiber-gc-probe.wat" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

@@ -30,6 +30,24 @@ namespace Wasmtime.Tests
             }
         }
 
+        public static IEnumerable<object[]> ConfidenceScenarios()
+        {
+            foreach (var scenario in new[] { "nested-sync", "nested-async", "lifecycle", "guest-gc", "stack-overflow" })
+            foreach (var serverGc in new[] { false, true })
+            foreach (var backgroundGc in new[] { false, true })
+            {
+                yield return new object[] { scenario, serverGc, backgroundGc };
+            }
+        }
+
+        [ThreadBackendTheory]
+        [MemberData(nameof(ConfidenceScenarios))]
+        public async Task ThreadBackendSurvivesNestedCallsAndTeardown(
+            string scenario, bool serverGc, bool backgroundGc)
+        {
+            await NativeFibersPreserveManagedState(scenario, serverGc, backgroundGc);
+        }
+
         [UnixFiberTheory]
         [MemberData(nameof(Scenarios))]
         public async Task NativeFibersPreserveManagedState(string scenario, bool serverGc, bool backgroundGc)
@@ -88,19 +106,43 @@ namespace Wasmtime.Tests
             Assert.Equal(scenario, root.GetProperty("scenario").GetString());
             Assert.True(root.GetProperty("forcedGc").GetBoolean());
             Assert.False(root.GetProperty("threadAffine").GetBoolean());
+            var threadBackend = Environment.GetEnvironmentVariable("WASMTIME_THREAD_FIBER_EXPERIMENT") == "1";
+            Assert.Equal(threadBackend, root.GetProperty("threadBackend").GetBoolean());
+            if (threadBackend)
+            {
+                if (scenario == "sync-control")
+                {
+                    Assert.Equal(0UL, root.GetProperty("nativeThreadsStarted").GetUInt64());
+                }
+                else
+                {
+                    Assert.True(root.GetProperty("nativeThreadsStarted").GetUInt64() > 0);
+                }
+                Assert.Equal(0UL, root.GetProperty("nativeThreadsLive").GetUInt64());
+                if (scenario is not ("errors" or "sync-control" or "stack-overflow"))
+                {
+                    Assert.True(root.GetProperty("nativeTlsSuspensions").GetUInt64() > 0,
+                        "No worker activation list was saved across suspension.");
+                }
+                if (scenario is "callbacks" or "concurrent")
+                {
+                    Assert.True(root.GetProperty("callbackThreadCount").GetInt32() > 0);
+                    Assert.True(root.GetProperty("pollingThreadCount").GetInt32() >= 2);
+                }
+            }
             var iterations = int.Parse(start.ArgumentList[2]);
             Assert.Equal(iterations, root.GetProperty("iterations").GetInt32());
             if (root.GetProperty("processorCount").GetInt32() > 1)
             {
                 Assert.Equal(serverGc, root.GetProperty("serverGc").GetBoolean());
             }
-            if (scenario is not ("errors" or "sync-control"))
+            if (scenario is not ("errors" or "sync-control" or "stack-overflow"))
             {
                 Assert.True(root.GetProperty("pendingPolls").GetInt32() > 0, "No actual yielding was observed.");
             }
-            if (scenario is "callbacks" or "concurrent")
+            if (scenario is "callbacks" or "concurrent" or "guest-gc")
             {
-                var calls = checked(iterations * (scenario == "concurrent" ? 4 : 1));
+                var calls = checked(iterations * (scenario is "concurrent" or "guest-gc" ? 4 : 1));
                 Assert.Equal(checked(calls * 100), root.GetProperty("callbacks").GetInt32());
                 Assert.Equal(checked(calls * 100), root.GetProperty("collections").GetInt32());
                 Assert.Equal(calls, root.GetProperty("migrations").GetInt32());
@@ -121,10 +163,42 @@ namespace Wasmtime.Tests
                 Assert.Equal(checked(iterations * 400), root.GetProperty("collections").GetInt32());
                 Assert.Equal(0, root.GetProperty("pendingPolls").GetInt32());
             }
+            if (scenario is "nested-sync" or "nested-async")
+            {
+                Assert.Equal(checked(iterations * 1600), root.GetProperty("callbacks").GetInt32());
+                Assert.Equal(checked(iterations * 1600), root.GetProperty("collections").GetInt32());
+                Assert.Equal(checked(iterations * 400), root.GetProperty("nestedCalls").GetInt32());
+                Assert.Equal(checked(iterations * 400), root.GetProperty("recoveredTraps").GetInt32());
+                Assert.Equal(checked(iterations * 4), root.GetProperty("pendingPolls").GetInt32());
+            }
+            if (scenario == "lifecycle")
+            {
+                Assert.Equal(iterations, root.GetProperty("lifecycleCycles").GetInt32());
+                Assert.Equal(checked(iterations * 2), root.GetProperty("recoveredTraps").GetInt32());
+            }
+            if (scenario == "guest-gc")
+            {
+                Assert.Equal(checked(iterations * 400), root.GetProperty("guestCollections").GetInt32());
+            }
+            if (scenario == "stack-overflow")
+            {
+                Assert.Equal(iterations, root.GetProperty("stackOverflows").GetInt32());
+            }
+        }
+
+        public sealed class ThreadBackendTheoryAttribute : UnixFiberTheoryAttribute
+        {
+            public ThreadBackendTheoryAttribute()
+            {
+                if (Skip is null && Environment.GetEnvironmentVariable("WASMTIME_THREAD_FIBER_EXPERIMENT") != "1")
+                {
+                    Skip = "Opt-in thread-backed native runtime confidence probes.";
+                }
+            }
         }
     }
 
-    public sealed class UnixFiberTheoryAttribute : TheoryAttribute
+    public class UnixFiberTheoryAttribute : TheoryAttribute
     {
         public UnixFiberTheoryAttribute()
         {
