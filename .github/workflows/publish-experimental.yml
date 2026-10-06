@@ -1,0 +1,57 @@
+name: Publish experimental NuGet package
+
+on:
+  push:
+    tags:
+      - "nuget-experiment-*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.repository == 'phillipcaofph/wasmtime-dotnet'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: "10.0.x"
+      - name: Validate package version
+        id: version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#nuget-experiment-}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-experiment\.[0-9]+$ ]]; then
+            echo "Tag must be nuget-experiment-<major>.<minor>.<patch>-experiment.<number>." >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - name: Pack
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.value }}
+          NATIVE_RELEASE_REPOSITORY: ${{ github.repository_owner }}/wasmtime
+        run: |
+          dotnet pack src/Wasmtime.csproj \
+            --configuration Release \
+            /p:Packing=true \
+            /p:PackageId=Wasmtime.Experimental \
+            "/p:WasmtimePackageVersion=$PACKAGE_VERSION" \
+            /p:WasmtimeVersion=51.0.0 \
+            "/p:BaseURL=https://github.com/$NATIVE_RELEASE_REPOSITORY/releases/download" \
+            "/p:ReleaseURLBase=https://github.com/$NATIVE_RELEASE_REPOSITORY/releases/download/thread-backed-fibers" \
+            /p:ReleaseFileNameBase=wasmtime-dev
+      - name: Publish to NuGet
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          if [[ -z "$NUGET_API_KEY" ]]; then
+            echo "Configure the NUGET_API_KEY repository secret before publishing." >&2
+            exit 1
+          fi
+          dotnet nuget push \
+            "src/bin/Release/Wasmtime.Experimental.$PACKAGE_VERSION.nupkg" \
+            --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
