@@ -157,3 +157,15 @@ commit to make for the release.
 
 When the release is published on GitHub, an action should automatically start
 to build and publish the package to NuGet.
+
+### Publishing the experimental thread-backed fibers package
+
+The `phillipcaofph/wasmtime` fork publishes public native C API assets whenever
+`experiment/thread-backed-fibers` is updated. After that workflow succeeds, push a unique tag
+such as `nuget-experiment-51.0.0-experiment.1` to this repository. The experimental workflow
+packs the matching native assets into `Wasmtime.Experimental` and publishes it to NuGet.
+
+Configure the `NUGET_API_KEY` repository secret with a NuGet API key that can publish
+`Wasmtime.Experimental` before pushing the tag. Use a new `.experiment.N` suffix for each package
+version because NuGet package versions cannot be overwritten. This package is separate from the
+official `Wasmtime` package.
