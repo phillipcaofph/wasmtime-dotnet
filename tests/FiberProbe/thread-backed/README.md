@@ -83,7 +83,7 @@ to have fixed its TLS or Rust soundness limitations. In particular:
 
 ### P3 reads and resource-destructor lifecycle
 
-The native patch now includes twenty-three isolated lifecycle regressions:
+The native patch now includes twenty-four isolated lifecycle regressions:
 
 - Async-lifted guest exports synchronously read host-produced futures/streams.
   Producers first poll on workers, then on both original and migrated schedulers.
@@ -115,6 +115,11 @@ The native patch now includes twenty-three isolated lifecycle regressions:
   guest instance by a concurrent host adapter. The adapter does not consume the
   stream; the receiving guest reads and validates the value. The test checks
   distinct worker threads for both guest instances and migrated producer polls.
+- A writer guest sends an owned host resource through a P3
+  `stream<own<resource>>` to a distinct reader guest instance. The reader guest
+  consumes and drops it; the registered host destructor runs exactly once,
+  including across Store teardown. Both guest worker threads are distinct from
+  each other and from the controller thread.
 - A zero-capacity guest stream read waits while the producer is pending. The
   producer reports readiness without buffering or consuming an item, and the
   next one-item read receives the expected value. Readiness callbacks are
@@ -131,12 +136,12 @@ P3 subset passed 35/35 on Linux Arm64 and under Linux x64 Docker emulation; that
 case passed ten serial repetitions on each architecture (20/20 total). With the
 guest-instance forwarding case, the 36-test P3 subset passed 36/36 on Linux
 Arm64 and under Linux x64 Docker emulation; that case passed ten serial
-repetitions on each architecture (20/20 total). The updated 37-test P3 subset
-passed 37/37 on Linux Arm64 and under Linux x64 Docker emulation; the new
-zero-length readiness case passed ten serial repetitions on each architecture
-(20/20 total). None of these three new cases has been run on macOS. The earlier
-34-test Linux Arm64 suite passed ten serial repetitions (340/340). The
-concurrent `thread_tests` module passed 10/10 on Linux Arm64 and ten serial
+repetitions on each architecture (20/20 total). The updated 38-test P3 subset
+passed 38/38 on Linux Arm64 and under Linux x64 Docker emulation; the new
+guest-to-guest resource-transfer case passed ten serial repetitions on each
+architecture (20/20 total). None of these four new cases has been run on macOS.
+The earlier 34-test Linux Arm64 suite passed ten serial repetitions (340/340).
+The concurrent `thread_tests` module passed 10/10 on Linux Arm64 and ten serial
 repetitions (100/100), including parked-root and parked-sibling trap cases.
 It also passed 10/10 once under Linux x64 Docker emulation. The two new async
 cancel-write cases passed ten repetitions on macOS Arm64 and under Linux x64
@@ -144,9 +149,9 @@ emulation. Stock controls passed 3/3 on macOS. No production runtime fix was
 needed for these measured paths, and no managed matrix rerun is claimed.
 
 This does not prove all P3 paths. Selected writer/consumer and multi-item
-backpressure paths are now covered below; host-to-guest-to-host owned-resource
-transfer, guest-instance stream-reader forwarding and zero-length readiness are
-covered above, but guest-to-guest resource transfers, callback-style exports and
+backpressure paths are now covered below; host-to-guest-to-host and
+guest-to-guest owned-resource transfer, guest-instance stream-reader forwarding
+and zero-length readiness are covered above, but callback-style exports and
 broader concurrent combinations remain unproven. Upstream concurrent resource
 destructors currently use exclusive Store access, not genuinely parallel
 destruction. Future destruction after
@@ -183,13 +188,14 @@ treated as successful retry support or changed by the experiment.
 Linux Arm64 and macOS Arm64 (explicit Unix signals) passed the earlier **43/43**
 combined native tests and **120/120** repeated original writer cases. The
 earlier 34-test P3 suite passed on Linux Arm64 and macOS Arm64. The updated
-37-test Linux P3 suite passed 37/37 on Arm64 and under Linux x64 Docker
+38-test Linux P3 suite passed 38/38 on Arm64 and under Linux x64 Docker
 emulation; the zero-length readiness case passed ten serial repetitions on each
 architecture (20/20 total). The guest-instance forwarding and owned-resource
 cases also each passed ten serial repetitions on both architectures (20/20
-each). None of these three new cases has been run on macOS. Linux passed ten
-serial repetitions of the earlier
-34-test P3 suite (**340/340**), including the two new async cancel-write cases;
+each). The guest-to-guest resource-transfer case passed ten repetitions on each
+architecture (20/20 total). None of these four new cases has been run on macOS.
+Linux passed ten serial repetitions of the earlier 34-test P3 suite (**340/340**),
+including the two new async cancel-write cases;
 those two cases also passed ten repetitions each on macOS Arm64. Linux x64
 emulation also passed the earlier 34-test P3 suite and ten repetitions of each
 async cancel-write case.
@@ -197,11 +203,10 @@ Each isolated case includes a fresh healthy Store control. Stock configuration
 controls passed 3/3 on macOS. No production runtime fix or managed
 stress-matrix rerun is claimed for this native-test-only follow-up.
 
-The owned-resource P3 stream transfer, guest-instance stream-reader forwarding
-and zero-length readiness are covered in the section above. Guest-to-guest
-resource transfers,
-async cancel builtins beyond the selected guest cancel-read/cancel-write paths,
-and callback exports remain unproven. Exactly-once
+The owned-resource P3 stream transfer, guest-instance stream-reader forwarding,
+guest-to-guest resource transfer and zero-length readiness are covered in the
+section above. Async cancel builtins beyond the selected guest
+cancel-read/cancel-write paths and callback exports remain unproven. Exactly-once
 consumer destruction after cancellation/error does not guarantee external
 delivery of an already-consumed item. All broader soundness/platform limits
 remain open.
