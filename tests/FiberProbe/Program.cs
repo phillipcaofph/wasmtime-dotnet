@@ -26,6 +26,7 @@ internal static class Program
     private static int lifecycleCycles;
     private static int guestCollections;
     private static int stackOverflows;
+    private static int causesTransferred;
     private static readonly ConcurrentDictionary<int, byte> callbackThreads = new();
     private static readonly ConcurrentDictionary<int, byte> pollingThreads = new();
     private static bool ThreadBackend =>
@@ -41,11 +42,13 @@ internal static class Program
         {
             var scenario = args[0];
             var iterations = int.Parse(args[1]);
-            if (NativeCallbackBridge.Enabled &&
-                (ThreadBackend || scenario is "nested-sync" or "nested-async" or "guest-gc"))
+            if (NativeCallbackBridge.Enabled && ThreadBackend)
             {
-                throw new InvalidOperationException(
-                    "The callback bridge is a separate experiment and does not support Store access or nested calls.");
+                throw new InvalidOperationException("The callback bridge and thread backend are separate experiments.");
+            }
+            if (!NativeCallbackBridge.Enabled && scenario.StartsWith("bridge-") && scenario != "bridge-values")
+            {
+                throw new InvalidOperationException($"{scenario} requires WASMTIME_CALLBACK_BRIDGE_EXPERIMENT=1.");
             }
             if (iterations < 1)
             {
@@ -84,6 +87,26 @@ internal static class Program
             if (scenario == "bridge-values")
             {
                 await CheckBridgeValues(engine, iterations);
+            }
+            else if (scenario == "bridge-reentrant")
+            {
+                await CheckReentrant(engine, component, iterations);
+            }
+            else if (scenario == "bridge-exhaustion")
+            {
+                await CheckExhaustion(engine, component, iterations);
+            }
+            else if (scenario == "bridge-async")
+            {
+                await CheckAsyncImports(engine, component, iterations);
+            }
+            else if (scenario == "bridge-async-cancel")
+            {
+                await CheckAsyncCancellation(engine, iterations);
+            }
+            else if (scenario == "bridge-async-errors")
+            {
+                await CheckAsyncErrors(engine, component, iterations);
             }
             else if (scenario == "bridge-registration")
             {
@@ -177,7 +200,8 @@ internal static class Program
                 })));
             }
 
-            if (scenario is not ("errors" or "sync-control" or "stack-overflow" or "bridge-values") && pendingPolls == 0)
+            if (scenario is not ("errors" or "sync-control" or "stack-overflow" or "bridge-values" or
+                "bridge-async-errors") && pendingPolls == 0)
             {
                 throw new InvalidOperationException("The probe never observed a pending native future.");
             }
@@ -190,7 +214,9 @@ internal static class Program
             var nativeThreadsLive = ThreadBackend ? wasmtime_thread_fiber_live() : 0;
             var nativeTlsSuspensions = ThreadBackend ? wasmtime_thread_fiber_tls_suspensions() : 0;
             NativeCallbackBridge.Finish();
-            var bridgeRequests = NativeCallbackBridge.Enabled ? NativeCallbackBridge.bridge_completed() : 0;
+            ulong Bridge(NativeCallbackBridge.BridgeCounter counter) =>
+                NativeCallbackBridge.Enabled ? NativeCallbackBridge.Counter(counter) : 0;
+            var bridgeRequests = Bridge(NativeCallbackBridge.BridgeCounter.CompletedRequests);
             if (NativeCallbackBridge.Enabled &&
                 (bridgeRequests < (ulong)callbacks || callbackThreads.Keys.Any(pollingThreads.ContainsKey)))
             {
@@ -226,7 +252,17 @@ internal static class Program
                 threadBackend = ThreadBackend,
                 callbackBridge = NativeCallbackBridge.Enabled,
                 bridgeRequests,
-                bridgesLive = NativeCallbackBridge.Enabled ? NativeCallbackBridge.bridge_live() : 0,
+                bridgesLive = Bridge(NativeCallbackBridge.BridgeCounter.LiveRegistrations),
+                bridgeLiveAsync = Bridge(NativeCallbackBridge.BridgeCounter.LiveAsync),
+                bridgeThreadsStarted = Bridge(NativeCallbackBridge.BridgeCounter.ThreadsStarted),
+                bridgePeakWorkers = Bridge(NativeCallbackBridge.BridgeCounter.PeakBusyWorkers),
+                bridgeExhaustions = Bridge(NativeCallbackBridge.BridgeCounter.Exhaustions),
+                bridgeOwnerOperations = Bridge(NativeCallbackBridge.BridgeCounter.OwnerOperations),
+                bridgePeakAsync = Bridge(NativeCallbackBridge.BridgeCounter.PeakLiveAsync),
+                bridgeAsyncCancelled = Bridge(NativeCallbackBridge.BridgeCounter.AsyncCancelled),
+                bridgeStagedDeleted = Bridge(NativeCallbackBridge.BridgeCounter.StagedDeleted),
+                bridgeUnreportableFailures = Bridge(NativeCallbackBridge.BridgeCounter.UnreportableFailures),
+                causesTransferred,
                 macosMachPorts,
                 nativeThreadsStarted,
                 nativeThreadsLive,
@@ -267,7 +303,7 @@ internal static class Program
             CheckManagedCallback();
             if (collectGuest is not null)
             {
-                collectGuest.GC();
+                NativeCallbackBridge.CollectGuest(collectGuest);
                 Interlocked.Increment(ref guestCollections);
             }
             results[0] = ComponentValue.S32(arguments[0].AsS32());
@@ -324,17 +360,19 @@ internal static class Program
         }
     }
 
+    private const string RecursiveComponent = """
+        (component
+          (core module $m
+            (func $recurse (export "recurse")
+              call $recurse
+              nop))
+          (core instance $i (instantiate $m))
+          (func (export "recurse") (canon lift (core func $i "recurse"))))
+        """;
+
     private static async Task CheckStackOverflow(Engine engine, int iterations)
     {
-        using var recursive = Component.FromText(engine, """
-            (component
-              (core module $m
-                (func $recurse (export "recurse")
-                  call $recurse
-                  nop))
-              (core instance $i (instantiate $m))
-              (func (export "recurse") (canon lift (core func $i "recurse"))))
-            """);
+        using var recursive = Component.FromText(engine, RecursiveComponent);
         using var linker = new ComponentLinker(engine);
         for (var i = 0; i < iterations; i++)
         {
@@ -372,7 +410,7 @@ internal static class Program
             using var outerLinker = new ComponentLinker(engine);
             using (var root = outerLinker.Root())
             {
-                root.DefineFunction("observe", (arguments, results) =>
+                NativeCallbackBridge.DefineFunction(root, "observe", (arguments, results) =>
                 {
                     var sentinel = new Sentinel();
                     CheckManagedCallback();
@@ -438,6 +476,346 @@ internal static class Program
                 }
             }
         })));
+    }
+
+    private static void ExpectCause<T>(Store store, WasmtimeException error, string message)
+        where T : Exception
+    {
+        if (!NativeCallbackBridge.Enabled)
+        {
+            return;
+        }
+        // The prototype hands the original exception to the caller by Store context.
+        var cause = NativeCallbackBridge.TakeCause(store);
+        if (cause is not T || !cause.Message.Contains(message))
+        {
+            throw new InvalidOperationException($"Callback exception was not transferred: {cause}", error);
+        }
+        Interlocked.Increment(ref causesTransferred);
+    }
+
+    private static async Task CheckReentrant(Engine engine, Component component, int iterations)
+    {
+        using var recursive = Component.FromText(engine, RecursiveComponent);
+        using var linker = new ComponentLinker(engine);
+        ComponentFunction? outerRun = null;
+        var depth = 0;
+        using (var root = linker.Root())
+        {
+            // A single registration re-entered through other Stores needs more than one worker.
+            NativeCallbackBridge.DefineFunction(root, "observe", (arguments, results) =>
+            {
+                CheckManagedCallback();
+                if (arguments[0].AsS32() == 3)
+                {
+                    var level = Interlocked.Increment(ref depth);
+                    try
+                    {
+                        if (level == 1)
+                        {
+                            try
+                            {
+                                outerRun!.Call(ComponentValue.S32(1));
+                                throw new InvalidOperationException("Same-Store re-entry was permitted.");
+                            }
+                            catch (InvalidOperationException error) when (error.Message.Contains("already in progress"))
+                            {
+                                Interlocked.Increment(ref recoveredTraps);
+                            }
+                            using var deep = new Store(engine);
+                            deep.Fuel = ulong.MaxValue;
+                            try
+                            {
+                                linker.Instantiate(deep, recursive).GetFunction("recurse")!.Call();
+                                throw new InvalidOperationException("Worker-thread recursion did not trap.");
+                            }
+                            catch (WasmtimeException error) when (error.Message.Contains("call stack exhausted"))
+                            {
+                                Interlocked.Increment(ref stackOverflows);
+                            }
+                        }
+                        if (level < 4)
+                        {
+                            using var nestedStore = new Store(engine);
+                            nestedStore.Fuel = ulong.MaxValue;
+                            var nested = linker.Instantiate(nestedStore, component).GetFunction("run")!;
+                            if (nested.Call(ComponentValue.S32(3))!.AsS32() != 6)
+                            {
+                                throw new InvalidOperationException("Re-entrant result was corrupted.");
+                            }
+                            Interlocked.Increment(ref nestedCalls);
+                        }
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref depth);
+                    }
+                }
+                results[0] = arguments[0];
+            });
+        }
+        for (var i = 0; i < iterations; i++)
+        {
+            using var store = new Store(engine);
+            store.Fuel = ulong.MaxValue;
+            outerRun = linker.Instantiate(store, component).GetFunction("run")!;
+            EnableYield(store);
+            var call = outerRun.CallAsync(ComponentValue.S32(10));
+            if (!call.IsCompleted)
+            {
+                Interlocked.Increment(ref pendingPolls);
+            }
+            if ((await call)!.AsS32() != 55)
+            {
+                throw new InvalidOperationException("Re-entrant outer result was corrupted.");
+            }
+        }
+    }
+
+    private static async Task CheckExhaustion(Engine engine, Component component, int iterations)
+    {
+        if (NativeCallbackBridge.MaxWorkers != 1)
+        {
+            throw new InvalidOperationException("bridge-exhaustion requires WASMTIME_BRIDGE_MAX_WORKERS=1.");
+        }
+        using var linker = new ComponentLinker(engine);
+        using (var root = linker.Root())
+        {
+            NativeCallbackBridge.DefineFunction(root, "observe", (arguments, results) =>
+            {
+                CheckManagedCallback();
+                if (arguments[0].AsS32() == 3)
+                {
+                    using var nestedStore = new Store(engine);
+                    nestedStore.Fuel = ulong.MaxValue;
+                    var nested = linker.Instantiate(nestedStore, component).GetFunction("run")!;
+                    try
+                    {
+                        nested.Call(ComponentValue.S32(3));
+                        throw new InvalidOperationException("A nested callback ran without a worker.");
+                    }
+                    catch (WasmtimeException error) when (error.Message.Contains("worker pool exhausted"))
+                    {
+                        // The only worker is busy here; waiting would deadlock, so the stub fails fast.
+                        Interlocked.Increment(ref recoveredTraps);
+                    }
+                }
+                results[0] = arguments[0];
+            });
+        }
+        for (var i = 0; i < iterations; i++)
+        {
+            using var store = new Store(engine);
+            store.Fuel = ulong.MaxValue;
+            var run = linker.Instantiate(store, component).GetFunction("run")!;
+            EnableYield(store);
+            var call = run.CallAsync(ComponentValue.S32(10));
+            if (!call.IsCompleted)
+            {
+                Interlocked.Increment(ref pendingPolls);
+            }
+            if ((await call)!.AsS32() != 55)
+            {
+                throw new InvalidOperationException("Outer call failed after pool exhaustion.");
+            }
+        }
+    }
+
+    private static void CountAsyncCallback()
+    {
+        if (Interlocked.Increment(ref callbacks) % 16 == 0 && ForceGc)
+        {
+            CheckRoots();
+        }
+        callbackThreads.TryAdd(Environment.CurrentManagedThreadId, 0);
+    }
+
+    private static async Task CheckAsyncImports(Engine engine, Component component, int iterations)
+    {
+        using var values = Component.FromTextFile(
+            engine, Path.Combine(AppContext.BaseDirectory, "bridge-values.wat"));
+        using var linker = new ComponentLinker(engine);
+        using (var root = linker.Root())
+        {
+            NativeCallbackBridge.DefineAsyncFunction(root, "observe", async (arguments, cancellation) =>
+            {
+                CountAsyncCallback();
+                var value = arguments[0].AsS32();
+                await Task.Delay(1 + value % 3, cancellation);
+                return new[] { ComponentValue.S32(value) };
+            });
+            foreach (var name in new[] { "text", "bytes" })
+            {
+                NativeCallbackBridge.DefineAsyncFunction(root, name, async (arguments, cancellation) =>
+                {
+                    CountAsyncCallback();
+                    await Task.Yield();
+                    return new[] { arguments[0] };
+                });
+            }
+        }
+        const int stores = 32;
+        for (var i = 0; i < iterations; i++)
+        {
+            await Task.WhenAll(Enumerable.Range(0, stores).Select(index => Task.Run(async () =>
+            {
+                using var store = new Store(engine);
+                store.Fuel = ulong.MaxValue;
+                if (index % 2 == 0)
+                {
+                    var call = (await linker.InstantiateAsync(store, component)).GetFunction("run")!
+                        .CallAsync(ComponentValue.S32(20));
+                    if (!call.IsCompleted)
+                    {
+                        Interlocked.Increment(ref pendingPolls);
+                    }
+                    if ((await call)!.AsS32() != 210)
+                    {
+                        throw new InvalidOperationException("Async import result was corrupted.");
+                    }
+                    return;
+                }
+                var instance = (await linker.InstantiateAsync(store, values));
+                var expected = "async \u03bb \ud83d\ude80\0" + new string((char)('a' + index % 26), 1024 + index);
+                if ((await instance.GetFunction("text")!.CallAsync(ComponentValue.String(expected)))!
+                    .AsString() != expected)
+                {
+                    throw new InvalidOperationException("Async staged string was corrupted.");
+                }
+                var bytes = Enumerable.Range(0, 300).Select(value => ComponentValue.U8((byte)(value + index))).ToArray();
+                var echoed = (await instance.GetFunction("bytes")!.CallAsync(ComponentValue.List(bytes)))!.AsList();
+                if (echoed.Count != bytes.Length || echoed.Where((value, at) => value.AsU8() != bytes[at].AsU8()).Any())
+                {
+                    throw new InvalidOperationException("Async staged list was corrupted.");
+                }
+            })));
+        }
+    }
+
+    private static async Task CheckAsyncCancellation(Engine engine, int iterations)
+    {
+        using var component = Component.FromTextFile(
+            engine, Path.Combine(AppContext.BaseDirectory, "bridge-values.wat"));
+        using var linker = new ComponentLinker(engine);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var observed = 0;
+        using (var root = linker.Root())
+        {
+            NativeCallbackBridge.DefineAsyncFunction(root, "text", async (arguments, cancellation) =>
+            {
+                CountAsyncCallback();
+                Volatile.Read(ref started).TrySetResult();
+                try
+                {
+                    await Task.Delay(Timeout.Infinite, cancellation);
+                }
+                catch (OperationCanceledException)
+                {
+                    Interlocked.Increment(ref observed);
+                }
+                // Returning owned values after Wasmtime dropped the future must not leak or write freed memory.
+                return new[] { ComponentValue.String(new string('z', 8192)) };
+            });
+            NativeCallbackBridge.DefineAsyncFunction(root, "bytes", (arguments, _) =>
+                Task.FromResult(new[] { arguments[0] }));
+        }
+        for (var i = 0; i < iterations; i++)
+        {
+            Volatile.Write(ref started, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+            var before = Volatile.Read(ref observed);
+            using (var store = new Store(engine))
+            {
+                store.Fuel = ulong.MaxValue;
+                var text = (await linker.InstantiateAsync(store, component)).GetFunction("text")!;
+                using var cancellation = new CancellationTokenSource();
+                var call = text.CallAsync(new[] { ComponentValue.String("cancel me") }, cancellation.Token);
+                await Volatile.Read(ref started).Task.WaitAsync(TimeSpan.FromSeconds(30));
+                Interlocked.Increment(ref pendingPolls);
+                cancellation.Cancel();
+                try
+                {
+                    await call;
+                    throw new InvalidOperationException("Cancelled async import completed.");
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+            // The future (or at the latest its Store) is gone; the callback must have been told.
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+            while (Volatile.Read(ref observed) == before ||
+                NativeCallbackBridge.Counter(NativeCallbackBridge.BridgeCounter.LiveAsync) != 0)
+            {
+                if (DateTime.UtcNow > deadline)
+                {
+                    throw new TimeoutException("Async cancellation was not propagated or released.");
+                }
+                await Task.Delay(5);
+            }
+            Interlocked.Increment(ref lifecycleCycles);
+        }
+    }
+
+    private static async Task CheckAsyncErrors(Engine engine, Component component, int iterations)
+    {
+        using var linker = new ComponentLinker(engine);
+        var late = false;
+        using (var root = linker.Root())
+        {
+            NativeCallbackBridge.DefineAsyncFunction(root, "observe", async (arguments, cancellation) =>
+            {
+                CountAsyncCallback();
+                if (!Volatile.Read(ref late))
+                {
+                    throw new FormatException("early async failure");
+                }
+                await Task.Delay(1, cancellation);
+                throw new TimeoutException("late async failure");
+            });
+        }
+        for (var i = 0; i < iterations; i++)
+        {
+            foreach (var afterSuspension in new[] { false, true })
+            {
+                Volatile.Write(ref late, afterSuspension);
+                using var store = new Store(engine);
+                store.Fuel = ulong.MaxValue;
+                var instance = (await linker.InstantiateAsync(store, component));
+                try
+                {
+                    await instance.GetFunction("run")!.CallAsync(ComponentValue.S32(1));
+                    throw new InvalidOperationException("Async import failure was swallowed.");
+                }
+                catch (WasmtimeException error)
+                {
+                    if (afterSuspension)
+                    {
+                        if (Environment.GetEnvironmentVariable("WASMTIME_BRIDGE_TRACE") == "1")
+                        {
+                            Console.Error.WriteLine($"late failure surfaced as: {error.Message}");
+                        }
+                        // Wasmtime's C continuation cannot carry an error; placeholder results fail type checks.
+                        ExpectCause<TimeoutException>(store, error, "late async failure");
+                    }
+                    else
+                    {
+                        if (!error.Message.Contains("early async failure"))
+                        {
+                            throw;
+                        }
+                        ExpectCause<FormatException>(store, error, "early async failure");
+                    }
+                    Interlocked.Increment(ref recoveredTraps);
+                }
+                using var fresh = new Store(engine);
+                fresh.Fuel = ulong.MaxValue;
+                if ((await (await linker.InstantiateAsync(fresh, component)).GetFunction("spin")!
+                    .CallAsync(ComponentValue.S32(10)))!.AsS32() != 42)
+                {
+                    throw new InvalidOperationException("Fresh Store failed after an async import error.");
+                }
+            }
+        }
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -643,6 +1021,10 @@ internal static class Program
                 if (hostError && !error.Message.Contains("fiber-probe host failure"))
                 {
                     throw;
+                }
+                if (hostError)
+                {
+                    ExpectCause<InvalidOperationException>(store, error, "fiber-probe host failure");
                 }
             }
             using var freshStore = new Store(engine);
