@@ -17,6 +17,38 @@ namespace Wasmtime.Tests
         }
 
         [Fact]
+        public void ItDisablesComponentModelAsyncForDefaultEngines()
+        {
+            using var defaultEngine = new Engine();
+            using var configuredEngine = new Engine(new Config());
+
+            defaultEngine.IsComponentModelAsyncEnabled.Should().BeFalse();
+            configuredEngine.IsComponentModelAsyncEnabled.Should().BeFalse();
+        }
+
+        [Fact]
+        public void ItRequiresReferenceTypesForComponentModelAsync()
+        {
+            using var config = new Config().WithReferenceTypes(false);
+
+            Action act = () => config.WithComponentModelAsync(true);
+
+            act.Should().Throw<InvalidOperationException>()
+                .WithMessage("Component-model async execution requires WebAssembly reference types.");
+        }
+
+        [Fact]
+        public void ItCannotDisableReferenceTypesAfterEnablingComponentModelAsync()
+        {
+            using var config = new Config().WithComponentModelAsync(true);
+
+            Action act = () => config.WithReferenceTypes(false);
+
+            act.Should().Throw<InvalidOperationException>()
+                .WithMessage("Component-model async execution requires WebAssembly reference types.");
+        }
+
+        [Fact]
         public void ItSetsCompilerStrategy()
         {
             var config = new Config();

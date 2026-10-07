@@ -48,6 +48,24 @@ namespace Wasmtime.Tests
             await NativeFibersPreserveManagedState(scenario, serverGc, backgroundGc);
         }
 
+        public static IEnumerable<object[]> BridgeScenarios()
+        {
+            foreach (var scenario in new[] { "shared-linker", "bridge-values", "bridge-registration", "lifecycle" })
+            foreach (var serverGc in new[] { false, true })
+            foreach (var backgroundGc in new[] { false, true })
+            {
+                yield return new object[] { scenario, serverGc, backgroundGc };
+            }
+        }
+
+        [CallbackBridgeTheory]
+        [MemberData(nameof(BridgeScenarios))]
+        public async Task CallbackBridgePreservesValuesAndLifetimes(
+            string scenario, bool serverGc, bool backgroundGc)
+        {
+            await NativeFibersPreserveManagedState(scenario, serverGc, backgroundGc);
+        }
+
         [UnixFiberTheory]
         [MemberData(nameof(Scenarios))]
         public async Task NativeFibersPreserveManagedState(string scenario, bool serverGc, bool backgroundGc)
@@ -82,7 +100,8 @@ namespace Wasmtime.Tests
             var stdout = process.StandardOutput.ReadToEndAsync();
             var stderr = process.StandardError.ReadToEndAsync();
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(
-                int.Parse(Environment.GetEnvironmentVariable("WASMTIME_FIBER_TIMEOUT_SECONDS") ?? "120")));
+                int.Parse(Environment.GetEnvironmentVariable("WASMTIME_FIBER_TIMEOUT_SECONDS")
+                    ?? (scenario == "shared-linker" ? "600" : "120"))));
             try
             {
                 await process.WaitForExitAsync(timeout.Token);
@@ -108,6 +127,19 @@ namespace Wasmtime.Tests
             Assert.False(root.GetProperty("threadAffine").GetBoolean());
             var threadBackend = Environment.GetEnvironmentVariable("WASMTIME_THREAD_FIBER_EXPERIMENT") == "1";
             Assert.Equal(threadBackend, root.GetProperty("threadBackend").GetBoolean());
+            var callbackBridge = Environment.GetEnvironmentVariable("WASMTIME_CALLBACK_BRIDGE_EXPERIMENT") == "1";
+            Assert.Equal(callbackBridge, root.GetProperty("callbackBridge").GetBoolean());
+            if (callbackBridge)
+            {
+                Assert.Equal(0UL, root.GetProperty("bridgesLive").GetUInt64());
+                Assert.True(root.GetProperty("bridgeRequests").GetUInt64() >=
+                    (ulong)root.GetProperty("callbacks").GetInt32());
+                if (scenario is "callbacks" or "concurrent")
+                {
+                    Assert.True(root.GetProperty("callbackThreadCount").GetInt32() > 0);
+                    Assert.True(root.GetProperty("pollingThreadCount").GetInt32() >= 2);
+                }
+            }
             if (threadBackend)
             {
                 if (scenario == "sync-control")
@@ -136,13 +168,13 @@ namespace Wasmtime.Tests
             {
                 Assert.Equal(serverGc, root.GetProperty("serverGc").GetBoolean());
             }
-            if (scenario is not ("errors" or "sync-control" or "stack-overflow"))
+            if (scenario is not ("errors" or "sync-control" or "stack-overflow" or "bridge-values"))
             {
                 Assert.True(root.GetProperty("pendingPolls").GetInt32() > 0, "No actual yielding was observed.");
             }
-            if (scenario is "callbacks" or "concurrent" or "guest-gc")
+            if (scenario is "callbacks" or "concurrent" or "guest-gc" or "shared-linker")
             {
-                var calls = checked(iterations * (scenario is "concurrent" or "guest-gc" ? 4 : 1));
+                var calls = checked(iterations * (scenario is "concurrent" or "guest-gc" or "shared-linker" ? 4 : 1));
                 Assert.Equal(checked(calls * 100), root.GetProperty("callbacks").GetInt32());
                 Assert.Equal(checked(calls * 100), root.GetProperty("collections").GetInt32());
                 Assert.Equal(calls, root.GetProperty("migrations").GetInt32());
@@ -183,6 +215,35 @@ namespace Wasmtime.Tests
             if (scenario == "stack-overflow")
             {
                 Assert.Equal(iterations, root.GetProperty("stackOverflows").GetInt32());
+            }
+            if (scenario == "bridge-values")
+            {
+                Assert.Equal(checked(iterations * 2), root.GetProperty("callbacks").GetInt32());
+                Assert.Equal(checked(iterations * 2), root.GetProperty("collections").GetInt32());
+                Assert.Equal(checked((ulong)iterations * 2), root.GetProperty("bridgeRequests").GetUInt64());
+            }
+            if (scenario == "bridge-registration")
+            {
+                Assert.Equal(1, root.GetProperty("recoveredTraps").GetInt32());
+                Assert.Equal(checked(iterations * 100), root.GetProperty("callbacks").GetInt32());
+            }
+            if (callbackBridge && scenario == "shared-linker")
+            {
+                Assert.Equal(1, root.GetProperty("callbackThreadCount").GetInt32());
+                Assert.True(root.GetProperty("pollingThreadCount").GetInt32() >= 8);
+                Assert.Equal((ulong)root.GetProperty("callbacks").GetInt32(),
+                    root.GetProperty("bridgeRequests").GetUInt64());
+            }
+        }
+
+        public sealed class CallbackBridgeTheoryAttribute : UnixFiberTheoryAttribute
+        {
+            public CallbackBridgeTheoryAttribute()
+            {
+                if (Skip is null && Environment.GetEnvironmentVariable("WASMTIME_CALLBACK_BRIDGE_EXPERIMENT") != "1")
+                {
+                    Skip = "Opt-in native callback bridge confidence probes.";
+                }
             }
         }
 

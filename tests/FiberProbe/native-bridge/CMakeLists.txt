@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+project(wasmtime_callback_bridge C)
+find_package(Threads REQUIRED)
+add_library(wasmtime_callback_bridge SHARED bridge.c)
+target_compile_features(wasmtime_callback_bridge PRIVATE c_std_11)
+target_compile_options(wasmtime_callback_bridge PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(wasmtime_callback_bridge PRIVATE Threads::Threads)

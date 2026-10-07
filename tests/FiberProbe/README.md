@@ -7,6 +7,11 @@ the case without crashing the xUnit runner.
 The automated cases explicitly skip Windows, where native fibers are documented
 as unsupported by .NET. A skip is not a successful compatibility result.
 
+For an opt-in alternative that keeps managed callbacks off fibers while using
+stock Wasmtime, see the [native callback bridge prototype](native-bridge/README.md).
+It is separate from the [thread-backed backend experiment](thread-backed/README.md)
+and must not be enabled alongside it.
+
 ## Coverage
 
 The matrix requests workstation/server GC and background GC on/off for:

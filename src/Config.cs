@@ -72,6 +72,7 @@ namespace Wasmtime
         public Config()
         {
             handle = new Handle(Native.wasm_config_new());
+            Native.wasmtime_config_wasm_component_model_async_set(handle, false);
         }
 
         /// <summary>
@@ -174,7 +175,15 @@ namespace Wasmtime
         /// <returns>Returns the current config.</returns>
         public Config WithReferenceTypes(bool enable)
         {
-            Native.wasmtime_config_wasm_reference_types_set(handle, enable);
+            var configHandle = NativeHandle;
+            if (!enable && ComponentModelAsyncEnabled)
+            {
+                throw new InvalidOperationException(
+                    "Component-model async execution requires WebAssembly reference types.");
+            }
+
+            Native.wasmtime_config_wasm_reference_types_set(configHandle, enable);
+            ReferenceTypesEnabled = enable;
             return this;
         }
 
@@ -525,7 +534,14 @@ namespace Wasmtime
         /// </remarks>
         public Config WithComponentModelAsync(bool enabled)
         {
-            Native.wasmtime_config_wasm_component_model_async_set(NativeHandle, enabled);
+            var configHandle = NativeHandle;
+            if (enabled && !ReferenceTypesEnabled)
+            {
+                throw new InvalidOperationException(
+                    "Component-model async execution requires WebAssembly reference types.");
+            }
+
+            Native.wasmtime_config_wasm_component_model_async_set(configHandle, enabled);
             ComponentModelAsyncEnabled = enabled;
             return this;
         }
@@ -719,5 +735,6 @@ namespace Wasmtime
 
         private readonly Handle handle;
         internal bool ComponentModelAsyncEnabled { get; private set; }
+        private bool ReferenceTypesEnabled { get; set; } = true;
     }
 }

@@ -109,8 +109,12 @@ Use `dotnet` to build the repository:
 $ dotnet build Wasmtime.sln
 ```
 
-This will download the latest development snapshot of Wasmtime for your
-platform.
+This experiment downloads the native C API for your platform from the public
+`thread-backed-fibers` prerelease in `phillipcaofph/wasmtime`, with the
+thread-backed backend enabled. Archives and extracted libraries are cached in
+`src/obj/thread-backed-fibers/`, separately from upstream downloads. Remove that
+cache to fetch updated assets after another successful native release build.
+Set `WasmtimeNativeLibrary` to a local library path to bypass downloading.
 
 ### Testing
 
@@ -165,7 +169,10 @@ The `phillipcaofph/wasmtime` fork publishes public native C API assets whenever
 such as `nuget-experiment-51.0.0-experiment.1` to this repository. The experimental workflow
 packs the matching native assets into `Wasmtime.Experimental` and publishes it to NuGet.
 
-Configure the `NUGET_API_KEY` repository secret with a NuGet API key that can publish
-`Wasmtime.Experimental` before pushing the tag. Use a new `.experiment.N` suffix for each package
+Configure NuGet [Trusted Publishing](https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing)
+for repository owner `phillipcaofph`, repository `wasmtime-dotnet`, and workflow
+`publish-experimental.yml`. Store the NuGet account username (not email) in the GitHub
+`NUGET_USER` secret. The workflow uses GitHub Actions OIDC to obtain a temporary publishing key;
+it does not require a long-lived NuGet API key. Use a new `.experiment.N` suffix for each package
 version because NuGet package versions cannot be overwritten. This package is separate from the
 official `Wasmtime` package.

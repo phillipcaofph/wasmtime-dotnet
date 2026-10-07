@@ -10,5 +10,9 @@
     <ProjectReference Include="../../src/Wasmtime.csproj" />
     <None Include="../Components/fiber-probe.wat" Link="fiber-probe.wat" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../Components/fiber-gc-probe.wat" Link="fiber-gc-probe.wat" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="native-bridge/bridge-values.wat" Link="bridge-values.wat" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(NativeCallbackBridgeLibrary)' != ''">
+    <None Include="$(NativeCallbackBridgeLibrary)" Link="$([System.IO.Path]::GetFileName('$(NativeCallbackBridgeLibrary)'))" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

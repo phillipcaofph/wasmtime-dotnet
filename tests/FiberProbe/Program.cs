@@ -41,6 +41,12 @@ internal static class Program
         {
             var scenario = args[0];
             var iterations = int.Parse(args[1]);
+            if (NativeCallbackBridge.Enabled &&
+                (ThreadBackend || scenario is "nested-sync" or "nested-async" or "guest-gc"))
+            {
+                throw new InvalidOperationException(
+                    "The callback bridge is a separate experiment and does not support Store access or nested calls.");
+            }
             if (iterations < 1)
             {
                 throw new ArgumentOutOfRangeException(nameof(iterations));
@@ -75,7 +81,28 @@ internal static class Program
             using var component = Component.FromTextFile(engine, Path.Combine(AppContext.BaseDirectory,
                 scenario == "guest-gc" ? "fiber-gc-probe.wat" : "fiber-probe.wat"));
 
-            if (scenario == "stack-overflow")
+            if (scenario == "bridge-values")
+            {
+                await CheckBridgeValues(engine, iterations);
+            }
+            else if (scenario == "bridge-registration")
+            {
+                using (var linker = CreateLinker(engine, false))
+                using (var root = linker.Root())
+                {
+                    try
+                    {
+                        NativeCallbackBridge.DefineFunction(root, "observe", (_, _) => { });
+                        throw new InvalidOperationException("Duplicate bridge registration was accepted.");
+                    }
+                    catch (WasmtimeException)
+                    {
+                        Interlocked.Increment(ref recoveredTraps);
+                    }
+                }
+                await CheckPublicApi(engine, component, iterations, false);
+            }
+            else if (scenario == "stack-overflow")
             {
                 await CheckStackOverflow(engine, iterations);
             }
@@ -110,13 +137,17 @@ internal static class Program
             }
             else
             {
-                var workers = scenario is "concurrent" or "concurrent-baseline" or "sync-control" or "guest-gc" ? 4 : 1;
+                var workers = scenario is "concurrent" or "concurrent-baseline" or "sync-control" or "guest-gc" or "shared-linker" ? 4 : 1;
+                using var sharedLinker = scenario == "shared-linker" ? CreateLinker(engine, false) : null;
                 using var barrier = new Barrier(workers);
                 await Task.WhenAll(Enumerable.Range(0, workers).Select(_ => Task.Run(() =>
                 {
                     using var store = new Store(engine);
                     store.Fuel = ulong.MaxValue;
-                    using var linker = CreateLinker(engine, false, scenario == "guest-gc" ? store : null);
+                    using var ownedLinker = sharedLinker is null
+                        ? CreateLinker(engine, false, scenario == "guest-gc" ? store : null)
+                        : null;
+                    var linker = sharedLinker ?? ownedLinker!;
                     var instance = linker.Instantiate(store, component);
                     if (scenario != "sync-control")
                     {
@@ -146,7 +177,7 @@ internal static class Program
                 })));
             }
 
-            if (scenario is not ("errors" or "sync-control" or "stack-overflow") && pendingPolls == 0)
+            if (scenario is not ("errors" or "sync-control" or "stack-overflow" or "bridge-values") && pendingPolls == 0)
             {
                 throw new InvalidOperationException("The probe never observed a pending native future.");
             }
@@ -158,6 +189,13 @@ internal static class Program
             var nativeThreadsStarted = ThreadBackend ? wasmtime_thread_fiber_started() : 0;
             var nativeThreadsLive = ThreadBackend ? wasmtime_thread_fiber_live() : 0;
             var nativeTlsSuspensions = ThreadBackend ? wasmtime_thread_fiber_tls_suspensions() : 0;
+            NativeCallbackBridge.Finish();
+            var bridgeRequests = NativeCallbackBridge.Enabled ? NativeCallbackBridge.bridge_completed() : 0;
+            if (NativeCallbackBridge.Enabled &&
+                (bridgeRequests < (ulong)callbacks || callbackThreads.Keys.Any(pollingThreads.ContainsKey)))
+            {
+                throw new InvalidOperationException("Callback bridge coverage or dispatcher isolation failed.");
+            }
             if (ThreadBackend && scenario is not ("errors" or "sync-control" or "stack-overflow") &&
                 nativeTlsSuspensions == 0)
             {
@@ -186,6 +224,9 @@ internal static class Program
                 threadAffine = ThreadAffine,
                 forcedGc = ForceGc,
                 threadBackend = ThreadBackend,
+                callbackBridge = NativeCallbackBridge.Enabled,
+                bridgeRequests,
+                bridgesLive = NativeCallbackBridge.Enabled ? NativeCallbackBridge.bridge_live() : 0,
                 macosMachPorts,
                 nativeThreadsStarted,
                 nativeThreadsLive,
@@ -206,13 +247,17 @@ internal static class Program
             Console.Error.WriteLine(error);
             return 1;
         }
+        finally
+        {
+            NativeCallbackBridge.Finish();
+        }
     }
 
     private static ComponentLinker CreateLinker(Engine engine, bool throws, Store? collectGuest = null)
     {
         var linker = new ComponentLinker(engine);
         using var root = linker.Root();
-        root.DefineFunction("observe", (arguments, results) =>
+        NativeCallbackBridge.DefineFunction(root, "observe", (arguments, results) =>
         {
             if (throws)
             {
@@ -233,11 +278,50 @@ internal static class Program
     private static void CheckManagedCallback()
     {
         Interlocked.Increment(ref callbacks);
-        if (ThreadBackend)
+        if (ThreadBackend || NativeCallbackBridge.Enabled)
         {
             callbackThreads.TryAdd(Environment.CurrentManagedThreadId, 0);
         }
         CheckRoots();
+    }
+
+    private static async Task CheckBridgeValues(Engine engine, int iterations)
+    {
+        using var component = Component.FromTextFile(
+            engine, Path.Combine(AppContext.BaseDirectory, "bridge-values.wat"));
+        using var store = new Store(engine);
+        store.Fuel = ulong.MaxValue;
+        using var linker = new ComponentLinker(engine);
+        using (var root = linker.Root())
+        {
+            foreach (var name in new[] { "text", "bytes" })
+            {
+                NativeCallbackBridge.DefineFunction(root, name, (arguments, results) =>
+                {
+                    CheckManagedCallback();
+                    results[0] = arguments[0];
+                });
+            }
+        }
+        var instance = linker.Instantiate(store, component);
+        var text = instance.GetFunction("text")!;
+        var bytes = instance.GetFunction("bytes")!;
+        for (var i = 0; i < iterations; i++)
+        {
+            var expected = i % 2 == 0 ? "" : "bridge \u03bb \ud83d\ude80\0" + new string('x', 4096);
+            if ((await text.CallAsync(ComponentValue.String(expected)))!.AsString() != expected)
+            {
+                throw new InvalidOperationException("Bridged string was corrupted.");
+            }
+            var values = Enumerable.Range(0, i % 2 == 0 ? 0 : 256)
+                .Select(value => ComponentValue.U8((byte)value)).ToArray();
+            var echoed = (await bytes.CallAsync(ComponentValue.List(values)))!.AsList();
+            if (echoed.Count != values.Length ||
+                echoed.Where((value, index) => value.AsU8() != values[index].AsU8()).Any())
+            {
+                throw new InvalidOperationException("Bridged list was corrupted.");
+            }
+        }
     }
 
     private static async Task CheckStackOverflow(Engine engine, int iterations)
@@ -623,7 +707,7 @@ internal static class Program
                 {
                     try
                     {
-                        if (ThreadBackend)
+                        if (ThreadBackend || NativeCallbackBridge.Enabled)
                         {
                             pollingThreads.TryAdd(Environment.CurrentManagedThreadId, 0);
                         }
