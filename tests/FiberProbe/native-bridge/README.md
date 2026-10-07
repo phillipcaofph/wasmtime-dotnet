@@ -534,3 +534,19 @@ native binary reproduced SIGSEGV (exit 139). Enabling it passed the correspondin
 four GC configurations, including exact callback/collection/migration counts.
 These results support further development, not production readiness. Windows,
 x64, .NET 9, and extended `DOTNET_GCStress` runs were not validated here.
+
+## Wasmtime 49 compatibility
+
+The bridge was validated against the official Wasmtime **v49.0.2** C API
+artifacts. The macOS Arm64 library passed 80 component, async-yield, and host
+callback isolation tests, including the isolated callback worker and Store
+owner-operation paths. The required component and context symbols are present
+in the v49 shared library; the header comparison found no removals from v48,
+only additive component extern and configuration APIs.
+
+The Linux probe runner accepts the v49 Linux C API artifacts through its existing
+library argument. Its empty optional restore-configuration array is now safe
+under `set -u`. A Linux Arm64 probe run was started with v49, but the container
+SDK could not restore from NuGet because its certificate chain was unavailable;
+this is an environment limitation rather than a Wasmtime or bridge failure.
+The v48 results above remain historical and are not relabeled as v49 coverage.
