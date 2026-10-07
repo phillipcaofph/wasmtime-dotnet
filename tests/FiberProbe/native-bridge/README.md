@@ -537,16 +537,32 @@ x64, .NET 9, and extended `DOTNET_GCStress` runs were not validated here.
 
 ## Wasmtime 49 compatibility
 
-The bridge was validated against the official Wasmtime **v49.0.2** C API
-artifacts. The macOS Arm64 library passed 80 component, async-yield, and host
-callback isolation tests, including the isolated callback worker and Store
-owner-operation paths. The required component and context symbols are present
-in the v49 shared library; the header comparison found no removals from v48,
-only additive component extern and configuration APIs.
+The bridge is compatible with the official Wasmtime **v49.0.2** C API artifacts,
+the latest stable release as of 2026-10-08. This release includes Wasmtime's fix
+for async component callback result-count validation
+([GHSA-32h6-97mm-8q3c](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-32h6-97mm-8q3c)).
+The bridge's staged async-result path and error cases are included in the
+validation below.
 
-The Linux probe runner accepts the v49 Linux C API artifacts through its existing
-library argument. Its empty optional restore-configuration array is now safe
-under `set -u`. A Linux Arm64 probe run was started with v49, but the container
-SDK could not restore from NuGet because its certificate chain was unavailable;
-this is an environment limitation rather than a Wasmtime or bridge failure.
-The v48 results above remain historical and are not relabeled as v49 coverage.
+| Check | Result |
+|---|---|
+| Full unit suite, official macOS Arm64 C API | 534 passed, 4 opt-in skips |
+| Original matrix + bridge scenarios, official Linux Arm64 C API | 88/88 |
+| Original matrix + bridge scenarios, official Linux x64 C API (emulated) | 88/88 |
+| Library and test builds | 0 errors; only expected SourceLink warnings in Docker |
+
+The required component and Store-context symbols are present in the v49 shared
+libraries. Comparing the v48.0.2 and v49.0.2 C headers found no removals: v49
+adds component extern/implements and configuration APIs.
+
+[`stock-wasmtime.yml`](../../../.github/workflows/stock-wasmtime.yml) makes this
+compatibility durable. It downloads checksum-pinned official v49.0.2 C API
+artifacts and runs the component, async-yield, epoch, linker, and host callback
+isolation tests on Linux x64/Arm64, macOS x64/Arm64, and Windows x64. This is
+separate from the custom thread-backed native build, so both stock Wasmtime and
+the experimental native artifacts remain covered. Windows and macOS x64 runtime
+results depend on that CI job; their official archive names and layouts were
+verified locally.
+
+The v48 results above remain historical evidence and are not relabeled as v49
+coverage.

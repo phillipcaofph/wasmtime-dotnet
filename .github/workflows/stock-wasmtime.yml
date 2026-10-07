@@ -1,0 +1,89 @@
+name: Stock Wasmtime compatibility
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/stock-wasmtime.yml'
+  schedule:
+    - cron: '30 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  WASMTIME_STOCK_VERSION: 49.0.2
+
+jobs:
+  test:
+    name: Wasmtime 49.0.2 (${{ matrix.rid }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-linux
+            archive: tar.xz
+            sha256: 4818e139aeb83b7adbaaf41b267bf18992c18463ae26d1a9acdcfc63ea9eb316
+            library: lib/libwasmtime.so
+          - rid: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-linux
+            archive: tar.xz
+            sha256: a97a874152b5fb49c4720b39b96a71d00ba61eab5ad59976163b7ddd1a3b14c0
+            library: lib/libwasmtime.so
+          - rid: osx-x64
+            os: macos-15-intel
+            target: x86_64-macos
+            archive: tar.xz
+            sha256: 1a1fd4bcec77d65bab1bdd4c38e4168825b7679c2f105bf573c4ef1cf5e779b1
+            library: lib/libwasmtime.dylib
+          - rid: osx-arm64
+            os: macos-15
+            target: aarch64-macos
+            archive: tar.xz
+            sha256: f7000ab1661495d09b9dc87a11b356941b4e6097f295434bcb30a8cf1393b0d5
+            library: lib/libwasmtime.dylib
+          - rid: win-x64
+            os: windows-2025
+            target: x86_64-windows
+            archive: zip
+            sha256: 928dad67acbf4a4f97be8d528b271ac72f8e329da21e327b0724d3af86fe3f44
+            library: lib/wasmtime.dll
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: '10.0.x'
+      - name: Download stock Wasmtime
+        shell: pwsh
+        run: |
+          $name = "wasmtime-v$env:WASMTIME_STOCK_VERSION-${{ matrix.target }}-c-api"
+          $archive = "$name.${{ matrix.archive }}"
+          $url = "https://github.com/bytecodealliance/wasmtime/releases/download/v$env:WASMTIME_STOCK_VERSION/$archive"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actual -ne "${{ matrix.sha256 }}") {
+            throw "SHA-256 mismatch for $archive`: expected ${{ matrix.sha256 }}, got $actual"
+          }
+          if ("${{ matrix.archive }}" -eq "zip") {
+            Expand-Archive -Path $archive -DestinationPath .
+          } else {
+            tar -xJf $archive
+          }
+          "WASMTIME_STOCK_ROOT=$((Resolve-Path $name).Path)" >> $env:GITHUB_ENV
+      - name: Test component and callback compatibility
+        shell: pwsh
+        env:
+          WASMTIME_REQUIRE_HOST_CALLBACK_ISOLATION: '1'
+        run: |
+          dotnet test tests/Wasmtime.Tests.csproj -c Release `
+            -p:TestTargetFramework=net10.0 `
+            -p:NuGetAudit=false `
+            -p:BuildCallbackBridge=true `
+            "-p:WasmtimeNativeLibrary=$env:WASMTIME_STOCK_ROOT/${{ matrix.library }}" `
+            --filter "FullyQualifiedName~HostCallbackIsolationTests|FullyQualifiedName~ComponentAsyncYieldTests|FullyQualifiedName~Epoch|FullyQualifiedName~ComponentFunction|FullyQualifiedName~ComponentLinker|FullyQualifiedName~ComponentAsync"
