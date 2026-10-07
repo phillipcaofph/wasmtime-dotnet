@@ -32,12 +32,12 @@ if [ -e "$output/runner" ]; then
   exit 1
 fi
 repo="$(cd "$(dirname "$0")/../../.." && pwd)"
-cmake -S "$repo/tests/FiberProbe/native-bridge" -B "$output/native" -DCMAKE_BUILD_TYPE=Release
+cmake -S "$repo/src/native/callback-bridge" -B "$output/native" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$output/native"
 cd "$repo"
 dotnet build tests/Wasmtime.Tests.csproj -c "$configuration" \
   -p:TestTargetFramework="$framework" -p:NuGetAudit=false \
-  -p:NativeCallbackBridgeLibrary="$output/native/$library_name" "${native_args[@]}"
+  -p:NativeCallbackBridgeLibrary="$output/native/out/$library_name" "${native_args[@]}"
 mkdir "$output/runner"
 cp -R "tests/bin/$configuration/$framework/." "$output/runner/"
 unset WASMTIME_THREAD_FIBER_EXPERIMENT

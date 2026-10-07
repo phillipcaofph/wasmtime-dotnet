@@ -32,6 +32,9 @@ namespace Wasmtime
         /// </summary>
         public int? ExitCode { get; private set; }
 
+        internal WasmtimeException WithCause(Exception cause) =>
+            new(Message, cause) { Frames = Frames, ExitCode = ExitCode };
+
         internal static WasmtimeException FromOwnedError(IntPtr error)
         {
             try

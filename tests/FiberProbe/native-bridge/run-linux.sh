@@ -36,8 +36,8 @@ if [ -n "${WASMTIME_BRIDGE_RESTORE_CONFIG:-}" ]; then
   restore_args+=(-v "$WASMTIME_BRIDGE_RESTORE_CONFIG:/restore.config:ro" -e RestoreConfigFile=/restore.config)
 fi
 docker run --rm --platform "$platform" \
-  -v "$repo/tests/FiberProbe/native-bridge:/source:ro" -v "$output:/output" \
-  "$compiler" cc -std=c11 -shared -fPIC -O2 -pthread -Wall -Wextra -Werror \
+  -v "$repo/src/native/callback-bridge:/source:ro" -v "$output:/output" \
+  "$compiler" cc -std=c11 -shared -fPIC -O2 -pthread -Wall -Wextra -Werror -fvisibility=hidden \
   /source/bridge.c -o /output/libwasmtime_callback_bridge.so
 docker run --rm --platform "$platform" \
   -v "$repo:/repo:ro" -v "$library:/native/libwasmtime.so:ro" \
@@ -46,6 +46,8 @@ docker run --rm --platform "$platform" \
   -e TestTargetFramework="$framework" -e Configuration="$configuration" \
   -e WASMTIME_FIBER_ITERATIONS="${WASMTIME_FIBER_ITERATIONS:-20}" \
   -e WASMTIME_FIBER_GC_STRESS="${WASMTIME_FIBER_GC_STRESS:-}" \
+  ${WASMTIME_FIBER_TIMEOUT_SECONDS:+-e WASMTIME_FIBER_TIMEOUT_SECONDS="$WASMTIME_FIBER_TIMEOUT_SECONDS"} \
+  -e TEST_FILTER="${WASMTIME_BRIDGE_TEST_FILTER:-FullyQualifiedName~NativeFibersPreserveManagedState|FullyQualifiedName~CallbackBridgePreservesValuesAndLifetimes}" \
   "$sdk" bash -lc '
     set -euo pipefail
     mkdir /work
@@ -61,6 +63,6 @@ docker run --rm --platform "$platform" \
     export WASMTIME_CALLBACK_BRIDGE_EXPERIMENT=1
     export WASMTIME_FIBER_DUMP_DIRECTORY=/output/dumps
     dotnet vstest /output/runner/Wasmtime.Tests.dll \
-      "--TestCaseFilter:FullyQualifiedName~NativeFibersPreserveManagedState|FullyQualifiedName~CallbackBridgePreservesValuesAndLifetimes" \
+      "--TestCaseFilter:$TEST_FILTER" \
       "--Logger:trx;LogFileName=callback-bridge.trx" --ResultsDirectory:/output
   '

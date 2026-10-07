@@ -54,7 +54,7 @@ namespace Wasmtime.Tests
             {
                 "shared-linker", "bridge-values", "bridge-registration", "lifecycle", "nested-sync", "nested-async",
                 "guest-gc", "bridge-reentrant", "bridge-exhaustion", "bridge-async", "bridge-async-cancel",
-                "bridge-async-errors"
+                "bridge-async-errors", "bridge-store-guard"
             })
             foreach (var serverGc in new[] { false, true })
             foreach (var backgroundGc in new[] { false, true })
@@ -148,8 +148,12 @@ namespace Wasmtime.Tests
             {
                 Assert.Equal(0UL, root.GetProperty("bridgesLive").GetUInt64());
                 Assert.Equal(0UL, root.GetProperty("bridgeLiveAsync").GetUInt64());
+                // Each async-errors iteration fails late once per result shape: s32, none and bool.
+                Assert.Equal(scenario == "bridge-async-errors" ? checked((ulong)iterationsArgument * 3) : 0UL,
+                    root.GetProperty("bridgeLateFailures").GetUInt64());
                 Assert.Equal(scenario == "bridge-async-errors" ? (ulong)iterationsArgument : 0UL,
-                    root.GetProperty("bridgeUnreportableFailures").GetUInt64());
+                    root.GetProperty("bridgePoisonedResults").GetUInt64());
+                Assert.Equal(0, root.GetProperty("bridgePendingCauses").GetInt32());
                 Assert.True(root.GetProperty("bridgeThreadsStarted").GetUInt64() <= 64);
                 Assert.True(root.GetProperty("bridgeRequests").GetUInt64() >=
                     (ulong)root.GetProperty("callbacks").GetInt32());
@@ -273,8 +277,18 @@ namespace Wasmtime.Tests
             }
             if (scenario == "bridge-async-errors")
             {
-                Assert.Equal(checked(iterations * 2), root.GetProperty("recoveredTraps").GetInt32());
-                Assert.Equal(checked(iterations * 2), root.GetProperty("causesTransferred").GetInt32());
+                Assert.Equal(checked(iterations * 6), root.GetProperty("recoveredTraps").GetInt32());
+                Assert.Equal(checked(iterations * 6), root.GetProperty("causesTransferred").GetInt32());
+            }
+            if (scenario == "bridge-store-guard")
+            {
+                // Per iteration: two rejections in each of three sync callbacks, two in one async callback.
+                Assert.Equal(checked(iterations * 8), root.GetProperty("storeGuardRejections").GetInt32());
+                // The async callback reads fuel and collects garbage both before and after its first yield.
+                Assert.Equal(checked(iterations * 13), root.GetProperty("ownerFuelOperations").GetInt32());
+                // Each sync callback also proxies one GC and one epoch deadline update. Operations after
+                // the async callback yields run on the poll loop, not through the native stub.
+                Assert.Equal(checked((ulong)iterations * 17), root.GetProperty("bridgeOwnerOperations").GetUInt64());
             }
             if (scenario == "stack-overflow")
             {
@@ -301,11 +315,13 @@ namespace Wasmtime.Tests
             }
         }
 
-        public sealed class CallbackBridgeTheoryAttribute : UnixFiberTheoryAttribute
+        public sealed class CallbackBridgeTheoryAttribute : TheoryAttribute
         {
             public CallbackBridgeTheoryAttribute()
             {
-                if (Skip is null && Environment.GetEnvironmentVariable("WASMTIME_CALLBACK_BRIDGE_EXPERIMENT") != "1")
+                // Isolated callbacks never run managed code on a Wasmtime fiber, so these probes
+                // also run on Windows.
+                if (Environment.GetEnvironmentVariable("WASMTIME_CALLBACK_BRIDGE_EXPERIMENT") != "1")
                 {
                     Skip = "Opt-in native callback bridge confidence probes.";
                 }

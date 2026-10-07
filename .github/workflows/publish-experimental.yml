@@ -9,8 +9,13 @@ permissions:
   contents: read
 
 jobs:
+  callback-bridge:
+    if: github.repository == 'phillipcaofph/wasmtime-dotnet'
+    uses: ./.github/workflows/callback-bridge.yml
+
   publish:
     if: github.repository == 'phillipcaofph/wasmtime-dotnet'
+    needs: callback-bridge
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -30,6 +35,12 @@ jobs:
             exit 1
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
+      - name: Download host callback isolation libraries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: callback-bridge-*
+          path: ${{ runner.temp }}/callback-bridge
+          merge-multiple: true
       - name: Pack
         env:
           PACKAGE_VERSION: ${{ steps.version.outputs.value }}
@@ -43,7 +54,8 @@ jobs:
             /p:WasmtimeVersion=51.0.0 \
             "/p:BaseURL=https://github.com/$NATIVE_RELEASE_REPOSITORY/releases/download" \
             "/p:ReleaseURLBase=https://github.com/$NATIVE_RELEASE_REPOSITORY/releases/download/thread-backed-fibers" \
-            /p:ReleaseFileNameBase=wasmtime-dev
+            /p:ReleaseFileNameBase=wasmtime-dev \
+            "/p:CallbackBridgeNativeDirectory=$RUNNER_TEMP/callback-bridge"
       - name: NuGet login
         uses: NuGet/login@v1
         id: login
