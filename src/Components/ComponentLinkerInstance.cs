@@ -30,13 +30,15 @@ public sealed class ComponentLinkerInstance : IDisposable
 {
     private readonly Handle handle;
     private readonly Action onDisposed;
+    private readonly bool isolateHostCallbacks;
     private ComponentLinkerInstance? child;
     private bool disposed;
 
-    internal ComponentLinkerInstance(IntPtr handle, Action onDisposed)
+    internal ComponentLinkerInstance(IntPtr handle, Action onDisposed, bool isolateHostCallbacks = false)
     {
         this.handle = new Handle(handle);
         this.onDisposed = onDisposed;
+        this.isolateHostCallbacks = isolateHostCallbacks;
     }
 
     internal Handle NativeHandle
@@ -86,7 +88,7 @@ public sealed class ComponentLinkerInstance : IDisposable
                     throw WasmtimeException.FromOwnedError(error);
                 }
 
-                child = new ComponentLinkerInstance(nested, () => child = null);
+                child = new ComponentLinkerInstance(nested, () => child = null, isolateHostCallbacks);
                 return child;
             }
         }
@@ -133,6 +135,10 @@ public sealed class ComponentLinkerInstance : IDisposable
     /// </summary>
     /// <param name="name">The name of the function.</param>
     /// <param name="callback">The implementation of the function.</param>
+    /// <remarks>
+    /// When the owning linker had <see cref="ComponentLinker.IsolateHostCallbacks"/> enabled
+    /// before this instance was obtained, the callback runs on an isolated worker thread.
+    /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown if an argument is null.</exception>
     public void DefineFunction(string name, ComponentFunctionCallback callback)
     {
@@ -146,6 +152,59 @@ public sealed class ComponentLinkerInstance : IDisposable
             throw new ArgumentNullException(nameof(callback));
         }
 
+        if (isolateHostCallbacks)
+        {
+            HostCallbackDispatcher.DefineFunction(NativeHandle, name, callback);
+            return;
+        }
+
+        DefineDirectFunction(name, callback);
+    }
+
+    /// <summary>
+    /// Defines a function implemented asynchronously by the host. The callback always runs
+    /// isolated from Wasmtime fiber stacks, see <see cref="HostCallbackIsolation"/>.
+    /// </summary>
+    /// <param name="name">The name of the function.</param>
+    /// <param name="callback">The implementation of the function.</param>
+    /// <remarks>
+    /// <para>
+    /// The guest is suspended while the returned task is pending, so the component must be
+    /// instantiated with <see cref="ComponentLinker.InstantiateAsync"/> on a Store whose engine
+    /// enables asynchronous support, and the function must be called with
+    /// <see cref="ComponentFunction.CallAsync(ComponentValue[])"/>.
+    /// </para>
+    /// <para>
+    /// If the task fails after the guest suspended, Wasmtime cannot trap the call. The guest
+    /// sees placeholder results and the failure is thrown from the pending
+    /// <see cref="ComponentFunction.CallAsync(ComponentValue[])"/> instead; a host import returning <c>bool</c>
+    /// receives a deliberately mistyped value so the call traps.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown if an argument is null.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// Thrown when <see cref="HostCallbackIsolation.IsSupported"/> is false.
+    /// </exception>
+    public void DefineAsyncFunction(string name, ComponentAsyncFunctionCallback callback)
+    {
+        if (name is null)
+        {
+            throw new ArgumentNullException(nameof(name));
+        }
+
+        if (callback is null)
+        {
+            throw new ArgumentNullException(nameof(callback));
+        }
+
+        HostCallbackDispatcher.DefineAsyncFunction(NativeHandle, name, callback);
+    }
+
+    internal void DefineIsolatedFunction(string name, ComponentFunctionCallback callback) =>
+        HostCallbackDispatcher.DefineFunction(NativeHandle, name, callback);
+
+    internal void DefineDirectFunction(string name, ComponentFunctionCallback callback)
+    {
         var current = NativeHandle;
         var nameBytes = Encoding.UTF8.GetBytes(name);
 

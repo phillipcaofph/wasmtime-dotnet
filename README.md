@@ -116,6 +116,11 @@ thread-backed backend enabled. Archives and extracted libraries are cached in
 cache to fetch updated assets after another successful native release build.
 Set `WasmtimeNativeLibrary` to a local library path to bypass downloading.
 
+Component host callback isolation also needs the small native library in
+`src/native/callback-bridge`. Add `-p:BuildCallbackBridge=true` to build it for your
+platform with CMake and a C11 compiler; without it, isolation tests are skipped. See
+[src/native/callback-bridge/README.md](src/native/callback-bridge/README.md).
+
 ### Testing
 
 Use `dotnet` to run the unit tests:
@@ -167,7 +172,9 @@ to build and publish the package to NuGet.
 The `phillipcaofph/wasmtime` fork publishes public native C API assets whenever
 `experiment/thread-backed-fibers` is updated. After that workflow succeeds, push a unique tag
 such as `nuget-experiment-51.0.0-experiment.1` to this repository. The experimental workflow
-packs the matching native assets into `Wasmtime.Experimental` and publishes it to NuGet.
+builds the host callback isolation library for every supported RID
+(`callback-bridge.yml`), then packs it with the matching native assets into
+`Wasmtime.Experimental` and publishes it to NuGet.
 
 Configure NuGet [Trusted Publishing](https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing)
 for repository owner `phillipcaofph`, repository `wasmtime-dotnet`, and workflow

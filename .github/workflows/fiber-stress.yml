@@ -22,9 +22,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+        # Windows only runs the isolated probes: managed callbacks on Windows fibers are unsupported.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025]
         configuration: [Debug, Release]
         framework: [net9.0, net10.0]
+        isolation: ["off", "on"]
+        exclude:
+          - configuration: Debug
+            isolation: "on"
+          - os: windows-2025
+            isolation: "off"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -40,16 +47,18 @@ jobs:
           WASMTIME_FIBER_GC_STRESS: ${{ inputs.gc_stress || '' }}
           WASMTIME_FIBER_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds || '120' }}
           WASMTIME_FIBER_DUMP_DIRECTORY: ${{ runner.temp }}/wasmtime-fiber-dumps
+          WASMTIME_CALLBACK_BRIDGE_EXPERIMENT: ${{ matrix.isolation == 'on' && '1' || '' }}
         run: >
           dotnet test tests/Wasmtime.Tests.csproj
           -c ${{ matrix.configuration }} -p:TestTargetFramework=${{ matrix.framework }}
-          --filter FullyQualifiedName~ComponentFiberStressTests
+          -p:BuildCallbackBridge=${{ matrix.isolation == 'on' }}
+          --filter "FullyQualifiedName~ComponentFiberStressTests|FullyQualifiedName~HostCallbackIsolationTests|FullyQualifiedName~ComponentAsyncYieldTests"
           --logger trx --results-directory TestResults
       - name: Collect reports and crash dumps
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: fiber-${{ matrix.os }}-${{ matrix.configuration }}-${{ matrix.framework }}
+          name: fiber-${{ matrix.os }}-${{ matrix.configuration }}-${{ matrix.framework }}-isolation-${{ matrix.isolation }}
           path: |
             TestResults
             ${{ runner.temp }}/wasmtime-fiber-dumps
