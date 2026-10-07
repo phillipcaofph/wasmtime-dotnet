@@ -42,7 +42,7 @@ docker run --rm --platform "$platform" \
 docker run --rm --platform "$platform" \
   -v "$repo:/repo:ro" -v "$library:/native/libwasmtime.so:ro" \
   -v "${NUGET_PACKAGES:-$HOME/.nuget/packages}:/root/.nuget/packages:ro" \
-  -v "$output:/output" "${restore_args[@]}" \
+  -v "$output:/output" ${restore_args[@]+"${restore_args[@]}"} \
   -e TestTargetFramework="$framework" -e Configuration="$configuration" \
   -e WASMTIME_FIBER_ITERATIONS="${WASMTIME_FIBER_ITERATIONS:-20}" \
   -e WASMTIME_FIBER_GC_STRESS="${WASMTIME_FIBER_GC_STRESS:-}" \
