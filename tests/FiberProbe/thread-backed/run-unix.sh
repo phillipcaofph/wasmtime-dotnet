@@ -36,7 +36,8 @@ fi
 repo="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$repo"
 dotnet build tests/Wasmtime.Tests.csproj -c "$configuration" \
-  -p:TestTargetFramework="$framework" -p:NuGetAudit=false
+  -p:TestTargetFramework="$framework" -p:NuGetAudit=false \
+  -p:WasmtimeNativeLibrary="$library"
 mkdir "$output/runner"
 cp -R "tests/bin/$configuration/$framework/." "$output/runner/"
 cp "$library" "$output/runner/FiberProbe/$library_name"

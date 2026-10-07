@@ -6,14 +6,18 @@ Wasmtime library, rather than the callback API, is changed.
 
 ## Mechanism and scope
 
-The pinned Wasmtime 48.0.2 patch opts into its existing Miri thread-backed
-implementation via `--cfg wasmtime_thread_fibers`, without enabling `cfg(miri)`
-globally. A real OS thread holds each execution stack; a mutex/condition-variable
-handshake resumes and parks it. Calls can be polled from different threads, but
-the execution stack and its managed callbacks stay on their original thread.
-The refined patch also changes Wasmtime's runtime handshake: only an owned
-`Waker` crosses from the poller, and the worker detaches/restores its Wasmtime
-activation list at suspension/resumption.
+The current experimental Wasmtime branch contains the thread-backed fiber
+implementation selected by `--cfg wasmtime_thread_fibers`, without enabling
+`cfg(miri)` globally. A real OS thread holds each execution stack; a
+mutex/condition-variable handshake resumes and parks it. Calls can be polled
+from different threads, but the execution stack and its managed callbacks stay
+on their original thread. The runtime handshake transfers an owned `Waker` and
+detaches/restores the worker's Wasmtime activation list at suspension/resumption.
+
+The measured matrices and detailed results below were produced with an earlier
+v48.0.2 patch. They are historical evidence for that revision, not validation
+of the current Wasmtime branch; rerun the probes against the matching current
+source checkout before drawing compatibility conclusions.
 
 ### Focused worker-handoff safety review
 
@@ -73,13 +77,15 @@ to have fixed its TLS or Rust soundness limitations. In particular:
   pool. Suspended stackful tasks can retain those threads.
 - Selected P3 async-lifted reads and resource-destructor paths are now covered
   below; this does not establish all futures/streams or nested async paths.
-  Pooling allocation, memory protection keys and Windows remain unsupported
-  or unvalidated.
+  Pooling allocation for component-model async execution, memory protection
+  keys and Windows remain unsupported or unvalidated.
   macOS has a separately measured Mach-port incompatibility described below.
   The refined backend explicitly rejects active protection keys. Pooled
   custom stack allocation is unsupported and fails native unit tests.
-  Engine creation now rejects pooling and configured custom stack creators
-  before allocation; on-demand execution remains supported.
+  Engine creation rejects pooling when component-model async is enabled and
+  rejects configured custom stack creators before allocation. Synchronous
+  configurations can use pooling with component-model async disabled;
+  on-demand execution remains supported for the async experiment.
 
 ### P3 reads and resource-destructor lifecycle
 
@@ -281,14 +287,15 @@ the current matrix silently.
 
 ## Reproducing
 
-Use a fresh source checkout of upstream tag `v48.0.2`, Rust 1.95 or later,
-CMake, a native compiler/linker, and the .NET SDK/runtimes required by the probes.
-Keep the native checkout outside this repository. The patch is intentionally
-applied only once to a clean source tree.
+Use the current experimental Wasmtime source checkout containing
+`wasmtime_thread_fibers`, Rust 1.97 or later, CMake, a native compiler/linker,
+and the .NET SDK/runtimes required by the probes. Keep the native checkout
+outside this repository. No source patch is applied; the backend is compiled
+directly from the matching branch.
 
 ```sh
-git clone --branch v48.0.2 --depth 1 \
-  https://github.com/bytecodealliance/wasmtime /tmp/wasmtime-thread-experiment
+git clone https://github.com/bytecodealliance/wasmtime /tmp/wasmtime-thread-experiment
+# Check out the same Wasmtime branch used by the binding before building.
 bash tests/FiberProbe/thread-backed/build.sh /tmp/wasmtime-thread-experiment default
 
 # Linux; use a new output directory for each run.
@@ -605,8 +612,8 @@ been tested.
 
 ## macOS Arm64: conditional compatibility, not default compatibility
 
-Native validation uses macOS 27.0.1, Rust 1.95.0 and the same Wasmtime 48.0.2
-patch/default C API features. The Apple linker produced a dylib that dyld
+Historical native validation used macOS 27.0.1, Rust 1.95.0 and the Wasmtime
+48.0.2 patch/default C API features. The Apple linker produced a dylib that dyld
 rejected with `mis-aligned LINKEDIT string pool`. Relinking the final C API
 artifact with Homebrew LLD 21.1.8 and the installed macOS 26.5 SDK produced a
 loadable dylib with the required diagnostic exports. This is a build-toolchain

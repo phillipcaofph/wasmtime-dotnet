@@ -18,13 +18,11 @@ if [ -n "$macos_linker" ]; then
   fi
 fi
 source_dir="$(cd "$1" && pwd)"
-script_dir="$(cd "$(dirname "$0")" && pwd)"
 cd "$source_dir"
-if ! grep -q '^version = "48.0.2"$' Cargo.toml; then
-  echo "This patch is pinned to Wasmtime 48.0.2." >&2
+if ! grep -q 'wasmtime_thread_fibers' crates/fiber/src/lib.rs; then
+  echo "This Wasmtime source checkout does not contain the thread-backed fiber backend." >&2
   exit 1
 fi
-patch -p1 --forward < "$script_dir/wasmtime-v48.0.2.patch"
 export RUSTFLAGS="${RUSTFLAGS:-} --cfg wasmtime_thread_fibers --check-cfg=cfg(wasmtime_thread_fibers)"
 args=(--locked --release -p wasmtime-c-api)
 if [ "$mode" = minimal ]; then

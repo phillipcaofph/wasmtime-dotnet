@@ -172,7 +172,7 @@ public sealed class ComponentLinkerInstance : IDisposable
         }
     }
 
-    private static IntPtr Invoke(
+    internal static IntPtr Invoke(
         ComponentFunctionCallback callback,
         string name,
         IntPtr args,
