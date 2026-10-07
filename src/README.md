@@ -111,6 +111,8 @@ var instance = await linker.InstantiateAsync(store, component);
 `AssemblyLoadContext`, and when the package has no native isolation library for the
 platform. Linkers then default to the direct path, and setting `IsolateHostCallbacks` to
 true throws. Set it explicitly to isolate synchronous engines too, or to false to opt out.
+The isolation bridge is validated against the stock Wasmtime v49.0.2 C API in addition
+to the repository's custom native artifacts.
 
 - `HostCallbackIsolation.MaxWorkerThreads` caps the worker pool (default 64).
   Initializing the first isolated callback starts one ready worker; additional workers
