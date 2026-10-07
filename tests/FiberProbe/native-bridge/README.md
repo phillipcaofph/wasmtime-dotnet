@@ -564,5 +564,10 @@ the experimental native artifacts remain covered. Windows and macOS x64 runtime
 results depend on that CI job; their official archive names and layouts were
 verified locally.
 
+The experimental NuGet workflow packages the stock v49.0.2 native C API
+artifacts and publishes versions such as
+`49.0.2-bridge-experiement.1` from tags named
+`nuget-bridge-experiement-49.0.2-bridge-experiement.1`.
+
 The v48 results above remain historical evidence and are not relabeled as v49
 coverage.
