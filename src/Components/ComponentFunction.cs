@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -133,9 +134,10 @@ public class ComponentFunction
                 ? IntPtr.Zero
                 : scope.Allocate(resultCount * ComponentValueMarshaller.ValueSize);
 
+            var context = store.Context.handle;
             var error = Native.wasmtime_component_func_call(
                 in func,
-                store.Context.handle,
+                context,
                 argumentBuffer,
                 (nuint)argumentCount,
                 resultBuffer,
@@ -145,7 +147,7 @@ public class ComponentFunction
 
             if (error != IntPtr.Zero)
             {
-                throw WasmtimeException.FromOwnedError(error);
+                throw ComponentCallbackHooks.AttachCause(WasmtimeException.FromOwnedError(error), context);
             }
 
             if (resultCount == 0)
@@ -252,11 +254,12 @@ public class ComponentFunction
             Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
 
             IntPtr future;
+            var context = store.Context.handle;
             try
             {
                 future = Native.wasmtime_component_func_call_async(
                     functionBuffer,
-                    store.Context.handle,
+                    context,
                     argumentBuffer,
                     (nuint)argumentCount,
                     resultBuffer,
@@ -288,29 +291,33 @@ public class ComponentFunction
 
             try
             {
-                await PollFutureAsync(future, cancellationToken).ConfigureAwait(false);
+                await PollFutureAsync(future, store, context, cancellationToken).ConfigureAwait(false);
                 Native.wasmtime_call_future_delete(future);
                 future = IntPtr.Zero;
                 var error = Marshal.ReadIntPtr(errorBuffer);
                 if (error != IntPtr.Zero)
                 {
                     Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
-                    throw WasmtimeException.FromOwnedError(error);
+                    throw ComponentCallbackHooks.AttachCause(WasmtimeException.FromOwnedError(error), context);
                 }
 
                 if (resultCount == 0)
                 {
+                    ComponentCallbackHooks.ThrowIfHostFailed(context);
                     return null;
                 }
 
+                ComponentValue result;
                 try
                 {
-                    return ComponentValueMarshaller.Read(resultBuffer);
+                    result = ComponentValueMarshaller.Read(resultBuffer);
                 }
                 finally
                 {
                     ComponentValueNative.wasmtime_component_val_delete(resultBuffer);
                 }
+                ComponentCallbackHooks.ThrowIfHostFailed(context);
+                return result;
             }
             finally
             {
@@ -334,12 +341,46 @@ public class ComponentFunction
         }
     }
 
-    internal static async Task PollFutureAsync(IntPtr future, CancellationToken cancellationToken)
+    internal static async Task PollFutureAsync(IntPtr future, Store store, IntPtr context, CancellationToken cancellationToken)
     {
-        while (!Native.wasmtime_call_future_poll(future))
+        using var owner = ComponentCallbackHooks.BeginPolling?.Invoke(context);
+        while (true)
         {
-            await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+            // Wasmtime does not borrow the Store between polls, so callbacks' Store operations run here.
+            owner?.Serve();
+            if (Native.wasmtime_call_future_poll(future))
+            {
+                return;
+            }
+
+            if (store.AsyncYieldsEnabled && !ComponentCallbackHooks.HostWorkPending(context))
+            {
+                // The guest suspended at an epoch or fuel yield point and can resume immediately;
+                // hop through the thread pool so other work gets a turn first.
+                cancellationToken.ThrowIfCancellationRequested();
+                await default(ThreadPoolHop);
+                continue;
+            }
+
+            await ComponentCallbackHooks.WaitAsync(context, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private readonly struct ThreadPoolHop : ICriticalNotifyCompletion
+    {
+        public ThreadPoolHop GetAwaiter() => this;
+
+        public bool IsCompleted => false;
+
+        public void GetResult()
+        {
+        }
+
+        public void OnCompleted(Action continuation) =>
+            ThreadPool.QueueUserWorkItem(static state => ((Action)state!)(), continuation);
+
+        public void UnsafeOnCompleted(Action continuation) =>
+            ThreadPool.UnsafeQueueUserWorkItem(static state => ((Action)state!)(), continuation);
     }
 
     private static bool ReadHasResult(IntPtr type)

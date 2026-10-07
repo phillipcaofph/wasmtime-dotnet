@@ -107,6 +107,7 @@ The .NET embedding of Wasmtime enables .NET code to instantiate WebAssembly modu
       <RID>linux-x64</RID>
       <FileExtension>tar.xz</FileExtension>
       <LibraryFilename>libwasmtime.so</LibraryFilename>
+      <BridgeLibraryFilename>libwasmtime_callback_bridge.so</BridgeLibraryFilename>
     </Wasmtime>
 
     <Wasmtime Include="linux-aarch64">
@@ -116,6 +117,7 @@ The .NET embedding of Wasmtime enables .NET code to instantiate WebAssembly modu
       <RID>linux-arm64</RID>
       <FileExtension>tar.xz</FileExtension>
       <LibraryFilename>libwasmtime.so</LibraryFilename>
+      <BridgeLibraryFilename>libwasmtime_callback_bridge.so</BridgeLibraryFilename>
     </Wasmtime>
 
     <Wasmtime Include="macos-x86_64">
@@ -125,6 +127,7 @@ The .NET embedding of Wasmtime enables .NET code to instantiate WebAssembly modu
       <RID>osx-x64</RID>
       <FileExtension>tar.xz</FileExtension>
       <LibraryFilename>libwasmtime.dylib</LibraryFilename>
+      <BridgeLibraryFilename>libwasmtime_callback_bridge.dylib</BridgeLibraryFilename>
     </Wasmtime>
 
     <Wasmtime Include="macos-aarch64">
@@ -134,6 +137,7 @@ The .NET embedding of Wasmtime enables .NET code to instantiate WebAssembly modu
       <RID>osx-arm64</RID>
       <FileExtension>tar.xz</FileExtension>
       <LibraryFilename>libwasmtime.dylib</LibraryFilename>
+      <BridgeLibraryFilename>libwasmtime_callback_bridge.dylib</BridgeLibraryFilename>
     </Wasmtime>
 
     <Wasmtime Include="windows-x86_64">
@@ -143,6 +147,7 @@ The .NET embedding of Wasmtime enables .NET code to instantiate WebAssembly modu
       <RID>win-x64</RID>
       <FileExtension>zip</FileExtension>
       <LibraryFilename>wasmtime.dll</LibraryFilename>
+      <BridgeLibraryFilename>wasmtime_callback_bridge.dll</BridgeLibraryFilename>
     </Wasmtime>
 
     <Wasmtime Include="windows-aarch64">
@@ -152,6 +157,7 @@ The .NET embedding of Wasmtime enables .NET code to instantiate WebAssembly modu
       <RID>win-arm64</RID>
       <FileExtension>zip</FileExtension>
       <LibraryFilename>wasmtime.dll</LibraryFilename>
+      <BridgeLibraryFilename>wasmtime_callback_bridge.dll</BridgeLibraryFilename>
     </Wasmtime>
   </ItemGroup>
 
@@ -182,6 +188,56 @@ The .NET embedding of Wasmtime enables .NET code to instantiate WebAssembly modu
         <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
         <Link>$([System.IO.Path]::GetFileName('$(WasmtimeNativeLibrary)'))</Link>
         <Pack>false</Pack>
+      </Content>
+    </ItemGroup>
+  </Target>
+
+  <!--
+    Host callback isolation (src/native/callback-bridge). For local builds either pass a prebuilt
+    library with -p:NativeCallbackBridgeLibrary=<path>, or set -p:BuildCallbackBridge=true to
+    compile it with CMake for the host. Packing consumes per-RID prebuilt libraries from
+    CallbackBridgeNativeDirectory, laid out as <dir>/<rid>/<library>.
+  -->
+  <PropertyGroup>
+    <CallbackBridgeSourceDirectory>$(MSBuildThisFileDirectory)native/callback-bridge/</CallbackBridgeSourceDirectory>
+    <CallbackBridgeBuildDirectory Condition="'$(CallbackBridgeBuildDirectory)'==''">$(BaseIntermediateOutputPath)callback-bridge/$(TargetFramework)/</CallbackBridgeBuildDirectory>
+    <CallbackBridgeHostLibrary Condition="$([MSBuild]::IsOsPlatform('Windows'))">wasmtime_callback_bridge.dll</CallbackBridgeHostLibrary>
+    <CallbackBridgeHostLibrary Condition="$([MSBuild]::IsOsPlatform('OSX'))">libwasmtime_callback_bridge.dylib</CallbackBridgeHostLibrary>
+    <CallbackBridgeHostLibrary Condition="'$(CallbackBridgeHostLibrary)'==''">libwasmtime_callback_bridge.so</CallbackBridgeHostLibrary>
+  </PropertyGroup>
+
+  <Target Name="BuildCallbackBridge" BeforeTargets="CopyCallbackBridgeLibrary"
+          Condition="'$(BuildCallbackBridge)'=='true' And '$(NativeCallbackBridgeLibrary)'=='' And '$(TargetFramework)'!=''"
+          Inputs="$(CallbackBridgeSourceDirectory)bridge.c;$(CallbackBridgeSourceDirectory)CMakeLists.txt"
+          Outputs="$(CallbackBridgeBuildDirectory)out/$(CallbackBridgeHostLibrary)">
+    <!-- One build directory per target framework, so parallel inner builds never share CMake state. -->
+    <Exec Command="cmake -S &quot;$(CallbackBridgeSourceDirectory.TrimEnd('/'))&quot; -B &quot;$(CallbackBridgeBuildDirectory.TrimEnd('/'))&quot; -DCMAKE_BUILD_TYPE=Release" />
+    <Exec Command="cmake --build &quot;$(CallbackBridgeBuildDirectory.TrimEnd('/'))&quot; --config Release" />
+  </Target>
+
+  <Target Name="CopyCallbackBridgeLibrary" BeforeTargets="BeforeBuild">
+    <PropertyGroup>
+      <_CallbackBridgeLibrary Condition="'$(NativeCallbackBridgeLibrary)'!=''">$(NativeCallbackBridgeLibrary)</_CallbackBridgeLibrary>
+      <_CallbackBridgeLibrary Condition="'$(NativeCallbackBridgeLibrary)'=='' And '$(BuildCallbackBridge)'=='true'">$(CallbackBridgeBuildDirectory)out/$(CallbackBridgeHostLibrary)</_CallbackBridgeLibrary>
+    </PropertyGroup>
+    <Error Condition="'$(_CallbackBridgeLibrary)'!='' And !Exists('$(_CallbackBridgeLibrary)')"
+           Text="The host callback isolation library '$(_CallbackBridgeLibrary)' does not exist." />
+    <ItemGroup Condition="'$(_CallbackBridgeLibrary)'!=''">
+      <Content Include="$(_CallbackBridgeLibrary)">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <Link>$([System.IO.Path]::GetFileName('$(_CallbackBridgeLibrary)'))</Link>
+        <Pack>false</Pack>
+      </Content>
+    </ItemGroup>
+  </Target>
+
+  <Target Name="PackCallbackBridge" BeforeTargets="DispatchToInnerBuilds"
+          Condition="'$(Packing)'=='true' And '$(CallbackBridgeNativeDirectory)'!=''">
+    <Error Condition="!Exists('$(CallbackBridgeNativeDirectory)/%(Wasmtime.RID)/%(Wasmtime.BridgeLibraryFilename)')"
+           Text="Missing host callback isolation library for %(Wasmtime.RID) in '$(CallbackBridgeNativeDirectory)'." />
+    <ItemGroup>
+      <Content Include="$(CallbackBridgeNativeDirectory)/%(Wasmtime.RID)/%(Wasmtime.BridgeLibraryFilename)">
+        <PackagePath>runtimes/%(Wasmtime.RID)/native/%(Wasmtime.BridgeLibraryFilename)</PackagePath>
       </Content>
     </ItemGroup>
   </Target>
