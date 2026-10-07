@@ -3,7 +3,7 @@ name: Publish experimental NuGet package
 on:
   push:
     tags:
-      - "nuget-experiment-*"
+      - "nuget-bridge-experiement-*"
 
 permissions:
   contents: read
@@ -29,9 +29,9 @@ jobs:
         id: version
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#nuget-experiment-}"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-experiment\.[0-9]+$ ]]; then
-            echo "Tag must be nuget-experiment-<major>.<minor>.<patch>-experiment.<number>." >&2
+          version="${GITHUB_REF_NAME#nuget-bridge-experiement-}"
+          if [[ ! "$version" =~ ^49\.0\.2-bridge-experiement\.[0-9]+$ ]]; then
+            echo "Tag must be nuget-bridge-experiement-49.0.2-bridge-experiement.<number>." >&2
             exit 1
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
@@ -44,17 +44,15 @@ jobs:
       - name: Pack
         env:
           PACKAGE_VERSION: ${{ steps.version.outputs.value }}
-          NATIVE_RELEASE_REPOSITORY: ${{ github.repository_owner }}/wasmtime
         run: |
           dotnet pack src/Wasmtime.csproj \
             --configuration Release \
             /p:Packing=true \
             /p:PackageId=Wasmtime.Experimental \
             "/p:WasmtimePackageVersion=$PACKAGE_VERSION" \
-            /p:WasmtimeVersion=51.0.0 \
-            "/p:BaseURL=https://github.com/$NATIVE_RELEASE_REPOSITORY/releases/download" \
-            "/p:ReleaseURLBase=https://github.com/$NATIVE_RELEASE_REPOSITORY/releases/download/thread-backed-fibers" \
-            /p:ReleaseFileNameBase=wasmtime-dev \
+            /p:WasmtimeVersion=49.0.2 \
+            /p:ReleaseURLBase=https://github.com/bytecodealliance/wasmtime/releases/download/v49.0.2 \
+            /p:ReleaseFileNameBase=wasmtime-v49.0.2 \
             "/p:CallbackBridgeNativeDirectory=$RUNNER_TEMP/callback-bridge"
       - name: NuGet login
         uses: NuGet/login@v1
