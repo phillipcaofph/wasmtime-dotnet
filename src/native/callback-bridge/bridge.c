@@ -25,7 +25,13 @@ enum { MAX_WORKERS_LIMIT = 256, WORKER_STACK = 8 * 1024 * 1024 };
 enum { THREAD_START_ATTEMPTS = 3, THREAD_START_RETRY_MS = 1 };
 enum { THREAD_STARTED, THREAD_START_RETRY, THREAD_START_FAILED };
 
-static void fail(const char *message) {
+#ifdef _MSC_VER
+#define BRIDGE_NORETURN __declspec(noreturn)
+#else
+#define BRIDGE_NORETURN _Noreturn
+#endif
+
+static BRIDGE_NORETURN void fail(const char *message) {
     fprintf(stderr, "callback bridge: %s\n", message);
     abort();
 }
