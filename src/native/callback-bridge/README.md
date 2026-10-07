@@ -41,6 +41,30 @@ The [callback-bridge workflow](../../../.github/workflows/callback-bridge.yml) b
 library for linux-x64/arm64 (Ubuntu 22.04, glibc 2.35+), osx-x64/arm64 and
 win-x64/arm64. The experimental publish workflow packs those artifacts.
 
+## Native regression tests
+
+```sh
+cmake -S src/native/callback-bridge -B build-tests -DCMAKE_BUILD_TYPE=Release \
+  -DCALLBACK_BRIDGE_BUILD_TESTS=ON
+cmake --build build-tests --config Release
+ctest --test-dir build-tests -C Release --output-on-failure
+```
+
+These tests require only a C11 compiler and CMake, not Wasmtime or .NET. The test
+executable compiles the real bridge with thread-creation and retry-delay calls
+substituted at compile time. No fault-injection API or environment switch is added to
+the production library, and tests are disabled by default.
+
+Each scenario runs in a fresh process with a 15-second deadlock timeout. Tests check
+exact attempt and delay counts, failed-initialization recovery, eager-worker finalizer
+cleanup, worker-limit enforcement, pool growth failures, and reuse of a worker that
+finishes during backoff. Condition-variable handshakes control scheduling instead of
+timing-dependent sleeps. They also verify that backoff releases the queue mutex and
+that shutdown drains registrations and joins every worker.
+
+The native workflow runs these tests on Linux x64/arm64, macOS, and Windows before
+building publishable artifacts.
+
 ## Worker startup
 
 Initialization creates one ready worker; further workers are created on demand, up to
