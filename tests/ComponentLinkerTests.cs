@@ -172,6 +172,36 @@ namespace Wasmtime.Tests
             linker.Invoking(l => l.AddWasiPreview2()).Should().NotThrow();
         }
 
+        [Fact]
+        public void ItReplacesTheWasiPreview2WallClock()
+        {
+            using var linker = new ComponentLinker(fixture.Engine);
+            using var component = fixture.LoadComponent("wasi-wall-clock.wat");
+            using var store = fixture.CreateStore();
+            store.SetWasiConfiguration(new WasiConfiguration());
+            var expected = new DateTimeOffset(2025, 2, 3, 4, 5, 6, TimeSpan.FromHours(12))
+                .AddTicks(7);
+
+            linker.AddWasiPreview2(new WasiPreview2Configuration()
+                .WithWallClock(() => expected, TimeSpan.FromMilliseconds(2)));
+            linker.Invoking(l => l.Instantiate(store, component)).Should().NotThrow();
+            linker.AllowShadowing.Should().BeFalse();
+        }
+
+        [Fact]
+        public void ItValidatesTheWasiPreview2Configuration()
+        {
+            var configuration = new WasiPreview2Configuration();
+
+            configuration.Invoking(c => c.WithWallClock(null!))
+                .Should().Throw<ArgumentNullException>();
+            configuration.Invoking(c => c.WithWallClock(() => DateTimeOffset.UtcNow, TimeSpan.Zero))
+                .Should().Throw<ArgumentOutOfRangeException>();
+            using var linker = new ComponentLinker(fixture.Engine);
+            linker.Invoking(l => l.AddWasiPreview2(null!))
+                .Should().Throw<ArgumentNullException>();
+        }
+
         private static void DefineHost(ComponentLinker linker, Action<int> onTransform)
         {
             using var root = linker.Root();

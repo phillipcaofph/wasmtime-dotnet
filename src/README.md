@@ -73,6 +73,25 @@ $ dotnet run
 
 This should print `Hello from C#!`.
 
+## Replacing the WASI Preview 2 wall clock
+
+`ComponentLinker.AddWasiPreview2` can replace `wasi:clocks/wall-clock` with a host
+clock. This lets deterministic tests, replay engines, and simulations control standard
+guest APIs such as `DateTime.UtcNow`:
+
+```csharp
+using Wasmtime.Components;
+
+var currentTime = new DateTimeOffset(2025, 2, 3, 4, 5, 6, TimeSpan.Zero);
+linker.AddWasiPreview2(new WasiPreview2Configuration()
+    .WithWallClock(() => currentTime, TimeSpan.FromTicks(1)));
+store.SetWasiConfiguration(new WasiConfiguration());
+```
+
+The callback must return a timestamp at or after the Unix epoch. The configured
+resolution must be positive. Configuration is captured when it is added to the linker;
+the callback itself can return a different value on every invocation.
+
 ## Isolating component host callbacks
 
 Asynchronous component calls (`ComponentLinker.InstantiateAsync` and
