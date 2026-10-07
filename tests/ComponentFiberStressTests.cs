@@ -50,7 +50,12 @@ namespace Wasmtime.Tests
 
         public static IEnumerable<object[]> BridgeScenarios()
         {
-            foreach (var scenario in new[] { "shared-linker", "bridge-values", "bridge-registration", "lifecycle" })
+            foreach (var scenario in new[]
+            {
+                "shared-linker", "bridge-values", "bridge-registration", "lifecycle", "nested-sync", "nested-async",
+                "guest-gc", "bridge-reentrant", "bridge-exhaustion", "bridge-async", "bridge-async-cancel",
+                "bridge-async-errors"
+            })
             foreach (var serverGc in new[] { false, true })
             foreach (var backgroundGc in new[] { false, true })
             {
@@ -84,6 +89,15 @@ namespace Wasmtime.Tests
             start.Environment["DOTNET_gcConcurrent"] = backgroundGc ? "1" : "0";
             start.Environment.Remove("WASMTIME_FIBER_DIAGNOSTIC_AFFINITY");
             start.Environment.Remove("WASMTIME_FIBER_DIAGNOSTIC_NO_FORCED_GC");
+            start.Environment.Remove("WASMTIME_BRIDGE_UNSAFE_DIRECT_STORE_ACCESS");
+            if (scenario == "bridge-exhaustion")
+            {
+                start.Environment["WASMTIME_BRIDGE_MAX_WORKERS"] = "1";
+            }
+            else
+            {
+                start.Environment.Remove("WASMTIME_BRIDGE_MAX_WORKERS");
+            }
             var gcStress = Environment.GetEnvironmentVariable("WASMTIME_FIBER_GC_STRESS");
             if (!string.IsNullOrEmpty(gcStress))
             {
@@ -128,10 +142,15 @@ namespace Wasmtime.Tests
             var threadBackend = Environment.GetEnvironmentVariable("WASMTIME_THREAD_FIBER_EXPERIMENT") == "1";
             Assert.Equal(threadBackend, root.GetProperty("threadBackend").GetBoolean());
             var callbackBridge = Environment.GetEnvironmentVariable("WASMTIME_CALLBACK_BRIDGE_EXPERIMENT") == "1";
+            var iterationsArgument = int.Parse(start.ArgumentList[2]);
             Assert.Equal(callbackBridge, root.GetProperty("callbackBridge").GetBoolean());
             if (callbackBridge)
             {
                 Assert.Equal(0UL, root.GetProperty("bridgesLive").GetUInt64());
+                Assert.Equal(0UL, root.GetProperty("bridgeLiveAsync").GetUInt64());
+                Assert.Equal(scenario == "bridge-async-errors" ? (ulong)iterationsArgument : 0UL,
+                    root.GetProperty("bridgeUnreportableFailures").GetUInt64());
+                Assert.True(root.GetProperty("bridgeThreadsStarted").GetUInt64() <= 64);
                 Assert.True(root.GetProperty("bridgeRequests").GetUInt64() >=
                     (ulong)root.GetProperty("callbacks").GetInt32());
                 if (scenario is "callbacks" or "concurrent")
@@ -168,7 +187,8 @@ namespace Wasmtime.Tests
             {
                 Assert.Equal(serverGc, root.GetProperty("serverGc").GetBoolean());
             }
-            if (scenario is not ("errors" or "sync-control" or "stack-overflow" or "bridge-values"))
+            if (scenario is not ("errors" or "sync-control" or "stack-overflow" or "bridge-values" or
+                "bridge-async-errors"))
             {
                 Assert.True(root.GetProperty("pendingPolls").GetInt32() > 0, "No actual yielding was observed.");
             }
@@ -211,6 +231,50 @@ namespace Wasmtime.Tests
             if (scenario == "guest-gc")
             {
                 Assert.Equal(checked(iterations * 400), root.GetProperty("guestCollections").GetInt32());
+                if (callbackBridge)
+                {
+                    // Every Store GC ran natively on the activation that owns the Wasm frames.
+                    Assert.Equal(checked((ulong)iterations * 400), root.GetProperty("bridgeOwnerOperations").GetUInt64());
+                }
+            }
+            if (callbackBridge && scenario is "lifecycle" or "errors")
+            {
+                Assert.Equal(scenario == "lifecycle" ? iterations : 1, root.GetProperty("causesTransferred").GetInt32());
+            }
+            if (scenario == "bridge-reentrant")
+            {
+                Assert.Equal(checked(iterations * 19), root.GetProperty("callbacks").GetInt32());
+                Assert.Equal(checked(iterations * 3), root.GetProperty("nestedCalls").GetInt32());
+                Assert.Equal(iterations, root.GetProperty("recoveredTraps").GetInt32());
+                Assert.Equal(iterations, root.GetProperty("stackOverflows").GetInt32());
+                Assert.True(root.GetProperty("bridgePeakWorkers").GetUInt64() >= 4);
+            }
+            if (scenario == "bridge-exhaustion")
+            {
+                Assert.Equal(checked(iterations * 10), root.GetProperty("callbacks").GetInt32());
+                Assert.Equal(iterations, root.GetProperty("recoveredTraps").GetInt32());
+                Assert.Equal((ulong)iterations, root.GetProperty("bridgeExhaustions").GetUInt64());
+                Assert.Equal(1UL, root.GetProperty("bridgeThreadsStarted").GetUInt64());
+            }
+            if (scenario == "bridge-async")
+            {
+                Assert.Equal(checked(iterations * 352), root.GetProperty("callbacks").GetInt32());
+                Assert.Equal(checked((ulong)iterations * 352), root.GetProperty("bridgeRequests").GetUInt64());
+                // Pending async imports do not pin a thread each.
+                Assert.True(root.GetProperty("bridgePeakAsync").GetUInt64() >= 8);
+                Assert.True(root.GetProperty("bridgeThreadsStarted").GetUInt64() <
+                    root.GetProperty("bridgePeakAsync").GetUInt64());
+            }
+            if (scenario == "bridge-async-cancel")
+            {
+                Assert.Equal(iterations, root.GetProperty("lifecycleCycles").GetInt32());
+                Assert.Equal((ulong)iterations, root.GetProperty("bridgeAsyncCancelled").GetUInt64());
+                Assert.Equal((ulong)iterations, root.GetProperty("bridgeStagedDeleted").GetUInt64());
+            }
+            if (scenario == "bridge-async-errors")
+            {
+                Assert.Equal(checked(iterations * 2), root.GetProperty("recoveredTraps").GetInt32());
+                Assert.Equal(checked(iterations * 2), root.GetProperty("causesTransferred").GetInt32());
             }
             if (scenario == "stack-overflow")
             {
@@ -229,7 +293,8 @@ namespace Wasmtime.Tests
             }
             if (callbackBridge && scenario == "shared-linker")
             {
-                Assert.Equal(1, root.GetProperty("callbackThreadCount").GetInt32());
+                Assert.InRange((ulong)root.GetProperty("callbackThreadCount").GetInt32(), 1UL,
+                    root.GetProperty("bridgeThreadsStarted").GetUInt64());
                 Assert.True(root.GetProperty("pollingThreadCount").GetInt32() >= 8);
                 Assert.Equal((ulong)root.GetProperty("callbacks").GetInt32(),
                     root.GetProperty("bridgeRequests").GetUInt64());
