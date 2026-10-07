@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -16,6 +17,7 @@ public class ComponentLinker
     private readonly Handle handle;
     private ComponentLinkerInstance? root;
     private bool isolateHostCallbacks;
+    private bool allowShadowing;
 
     /// <summary>
     /// Creates a new <see cref="ComponentLinker"/> for the given engine.
@@ -65,9 +67,11 @@ public class ComponentLinker
     /// <value>True to allow shadowing.</value>
     public bool AllowShadowing
     {
+        get => allowShadowing;
         set
         {
             Native.wasmtime_component_linker_allow_shadowing(NativeHandle, value);
+            allowShadowing = value;
         }
     }
 
@@ -138,6 +142,75 @@ public class ComponentLinker
             throw WasmtimeException.FromOwnedError(error);
         }
     }
+
+    /// <summary>
+    /// Adds all WASI Preview 2 interfaces to this linker and applies custom host implementations.
+    /// </summary>
+    /// <param name="configuration">The custom WASI Preview 2 interface configuration.</param>
+    /// <remarks>
+    /// The store used for instantiation must have a WASI configuration set with
+    /// <see cref="Store.SetWasiConfiguration"/>.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// Thrown if <paramref name="configuration"/> is null.
+    /// </exception>
+    public void AddWasiPreview2(WasiPreview2Configuration configuration)
+    {
+        if (configuration is null)
+        {
+            throw new ArgumentNullException(nameof(configuration));
+        }
+
+        AddWasiPreview2();
+
+        if (configuration.WallClock is null)
+        {
+            return;
+        }
+
+        var wallClockProvider = configuration.WallClock;
+        var wallClockResolution = configuration.WallClockResolution;
+        var previousAllowShadowing = AllowShadowing;
+        AllowShadowing = true;
+        try
+        {
+            using var root = Root();
+            using var wallClock = root.AddInstance("wasi:clocks/wall-clock@0.2.12");
+            wallClock.DefineFunction("now", (_, results) =>
+                results[0] = WallClockValue(wallClockProvider()));
+            wallClock.DefineFunction("resolution", (_, results) =>
+                results[0] = WallClockResolution(wallClockResolution));
+        }
+        finally
+        {
+            AllowShadowing = previousAllowShadowing;
+        }
+    }
+
+    private static ComponentValue WallClockValue(DateTimeOffset value)
+    {
+        if (value < DateTimeOffset.FromUnixTimeSeconds(0))
+        {
+            throw new ArgumentOutOfRangeException(nameof(value),
+                "WASI wall-clock timestamps cannot precede the Unix epoch.");
+        }
+
+        return WallClockValue(
+            checked((ulong)value.ToUnixTimeSeconds()),
+            checked((uint)(value.UtcDateTime.Ticks % TimeSpan.TicksPerSecond * 100)));
+    }
+
+    private static ComponentValue WallClockResolution(TimeSpan value) =>
+        WallClockValue(
+            checked((ulong)(value.Ticks / TimeSpan.TicksPerSecond)),
+            checked((uint)(value.Ticks % TimeSpan.TicksPerSecond * 100)));
+
+    private static ComponentValue WallClockValue(ulong seconds, uint nanoseconds) =>
+        ComponentValue.Record(new[]
+        {
+            new KeyValuePair<string, ComponentValue>("seconds", ComponentValue.U64(seconds)),
+            new KeyValuePair<string, ComponentValue>("nanoseconds", ComponentValue.U32(nanoseconds)),
+        });
 
     /// <summary>
     /// Defines every import of the given component that is not already defined as a function
