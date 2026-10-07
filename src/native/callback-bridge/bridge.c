@@ -31,7 +31,7 @@ enum { THREAD_STARTED, THREAD_START_RETRY, THREAD_START_FAILED };
 #define BRIDGE_NORETURN _Noreturn
 #endif
 
-static BRIDGE_NORETURN void fail(const char *message) {
+BRIDGE_NORETURN static void fail(const char *message) {
     fprintf(stderr, "callback bridge: %s\n", message);
     abort();
 }
@@ -376,7 +376,7 @@ static void *run_owner_op(int op, void *context, void *argument) {
     case OP_SET_EPOCH_DEADLINE:
         ((set_epoch_deadline_type)store_ops[op])(context, *(uint64_t *)argument);
         return NULL;
-    default: fail("unknown owner operation"); return NULL;
+    default: fail("unknown owner operation");
     }
 }
 

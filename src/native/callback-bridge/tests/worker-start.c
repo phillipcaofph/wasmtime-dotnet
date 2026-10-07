@@ -86,7 +86,6 @@ static int test_nanosleep(const struct timespec *delay, struct timespec *remaini
 
 static void *unexpected_error(const char *message) {
     fail(message);
-    return NULL;
 }
 
 static void unexpected_delete(void *value) {
