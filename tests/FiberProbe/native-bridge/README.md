@@ -436,6 +436,32 @@ while the callback is suspended and checks that its later `Fuel` read throws.
   load. It now records the 20 exact Store context handles it creates and verifies that
   each one was removed; the revised check passed 20 repeated runs.
 
+### Permanent native worker regression tests
+
+The former temporary thread-start injection checks now have permanent coverage in
+[worker-start.c](../../../src/native/callback-bridge/tests/worker-start.c), built with
+`-DCALLBACK_BRIDGE_BUILD_TESTS=ON` and run with CTest. The executable includes the real
+bridge implementation and replaces only OS thread-start and delay calls. Production
+builds have no test hooks and retain the same 18 exports.
+
+Nine process-isolated cases cover invalid configuration, transient and permanent
+startup errors, retrying initialization after failure, cleanup without a prior callback,
+pool-limit refusal, transient and sustained growth failures, and reuse of an existing
+worker during unlocked backoff. Tests assert exact attempts, delays, counters, cleanup,
+and worker joins. Scheduling is controlled with condition variables, not timed sleeps.
+
+| Check | Result |
+|---|---|
+| macOS Release CTest suite, 50 repetitions per case | 450/450 passed |
+| Linux arm64 and x64, native executable (x64 emulated) | 9/9 each |
+| Linux arm64, AddressSanitizer and UndefinedBehaviorSanitizer | 9/9 |
+| Windows x64 test executable, Zig cross-compile, warnings as errors | passed; runtime execution awaits CI |
+| Negative controls: retries disabled, eager worker removed, mutex held during backoff | corresponding tests failed; deadlock bounded by 15-second timeout |
+
+The native workflow runs the suite on Linux x64/arm64, macOS, and Windows before
+building publishable library artifacts. These small tests require no Wasmtime or .NET;
+they complement, rather than replace, the managed integration and GCStress probes.
+
 ## Late-failure, waker, Store-guard and portability results
 
 Stock Wasmtime 48.0.2, .NET 10 Release, Arm64, 20 iterations per worker:
