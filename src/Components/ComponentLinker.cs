@@ -15,6 +15,7 @@ public class ComponentLinker
 {
     private readonly Handle handle;
     private ComponentLinkerInstance? root;
+    private bool isolateHostCallbacks;
 
     /// <summary>
     /// Creates a new <see cref="ComponentLinker"/> for the given engine.
@@ -68,6 +69,40 @@ public class ComponentLinker
     }
 
     /// <summary>
+    /// Gets or sets whether host functions defined through
+    /// <see cref="ComponentLinkerInstance.DefineFunction"/> run on isolated native worker
+    /// threads instead of on Wasmtime fiber stacks. See <see cref="HostCallbackIsolation"/>.
+    /// The value is captured when <see cref="Root"/> is called, and nested instances inherit it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Defaults to false. Enable it when calling components asynchronously: asynchronous calls
+    /// otherwise run managed host callbacks on Wasmtime fiber stacks, which the .NET garbage
+    /// collector cannot safely scan.
+    /// </para>
+    /// <para>
+    /// Inside an isolated callback the calling <see cref="Store"/> cannot be used, and throws.
+    /// Isolation adds a few microseconds per call.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="PlatformNotSupportedException">
+    /// Thrown when enabling isolation and <see cref="HostCallbackIsolation.IsSupported"/> is false.
+    /// </exception>
+    public bool IsolateHostCallbacks
+    {
+        get => isolateHostCallbacks;
+        set
+        {
+            if (value)
+            {
+                HostCallbackDispatcher.ThrowIfUnsupported();
+            }
+
+            isolateHostCallbacks = value;
+        }
+    }
+
+    /// <summary>
     /// Returns the root instance of this linker, used to define names into the root namespace.
     /// </summary>
     /// <returns>The root instance. The linker cannot be used again until this is disposed.</returns>
@@ -76,7 +111,8 @@ public class ComponentLinker
         var current = NativeHandle;
         root = new ComponentLinkerInstance(
             Native.wasmtime_component_linker_root(current),
-            () => root = null);
+            () => root = null,
+            isolateHostCallbacks);
 
         return root;
     }
@@ -142,14 +178,15 @@ public class ComponentLinker
         store.BeginComponentOperation();
         try
         {
+            var context = store.Context.handle;
             var error = Native.wasmtime_component_linker_instantiate(
-                NativeHandle, store.Context.handle, component.NativeHandle, out var instance);
+                NativeHandle, context, component.NativeHandle, out var instance);
 
             GC.KeepAlive(store);
 
             if (error != IntPtr.Zero)
             {
-                throw WasmtimeException.FromOwnedError(error);
+                throw HostCallbackDispatcher.AttachCause(WasmtimeException.FromOwnedError(error), context);
             }
 
             return new ComponentInstance(store, instance);
@@ -209,9 +246,10 @@ public class ComponentLinker
             Marshal.StructureToPtr(default(ComponentInstance.Native.Instance), instanceBuffer, false);
             Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
 
+            var context = store.Context.handle;
             future = Native.wasmtime_component_linker_instantiate_async(
                 NativeHandle,
-                store.Context.handle,
+                context,
                 component.NativeHandle,
                 instanceBuffer,
                 errorBuffer);
@@ -237,7 +275,7 @@ public class ComponentLinker
                 if (error != IntPtr.Zero)
                 {
                     Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
-                    throw WasmtimeException.FromOwnedError(error);
+                    throw HostCallbackDispatcher.AttachCause(WasmtimeException.FromOwnedError(error), context);
                 }
 
                 var instance = Marshal.PtrToStructure<ComponentInstance.Native.Instance>(instanceBuffer);

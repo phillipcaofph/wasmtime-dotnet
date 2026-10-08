@@ -30,13 +30,15 @@ public sealed class ComponentLinkerInstance : IDisposable
 {
     private readonly Handle handle;
     private readonly Action onDisposed;
+    private readonly bool isolateHostCallbacks;
     private ComponentLinkerInstance? child;
     private bool disposed;
 
-    internal ComponentLinkerInstance(IntPtr handle, Action onDisposed)
+    internal ComponentLinkerInstance(IntPtr handle, Action onDisposed, bool isolateHostCallbacks = false)
     {
         this.handle = new Handle(handle);
         this.onDisposed = onDisposed;
+        this.isolateHostCallbacks = isolateHostCallbacks;
     }
 
     internal Handle NativeHandle
@@ -86,7 +88,7 @@ public sealed class ComponentLinkerInstance : IDisposable
                     throw WasmtimeException.FromOwnedError(error);
                 }
 
-                child = new ComponentLinkerInstance(nested, () => child = null);
+                child = new ComponentLinkerInstance(nested, () => child = null, isolateHostCallbacks);
                 return child;
             }
         }
@@ -133,6 +135,10 @@ public sealed class ComponentLinkerInstance : IDisposable
     /// </summary>
     /// <param name="name">The name of the function.</param>
     /// <param name="callback">The implementation of the function.</param>
+    /// <remarks>
+    /// When the owning linker had <see cref="ComponentLinker.IsolateHostCallbacks"/> enabled
+    /// before this instance was obtained, the callback runs on an isolated worker thread.
+    /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown if an argument is null.</exception>
     public void DefineFunction(string name, ComponentFunctionCallback callback)
     {
@@ -146,6 +152,17 @@ public sealed class ComponentLinkerInstance : IDisposable
             throw new ArgumentNullException(nameof(callback));
         }
 
+        if (isolateHostCallbacks)
+        {
+            HostCallbackDispatcher.DefineFunction(NativeHandle, name, callback);
+            return;
+        }
+
+        DefineDirectFunction(name, callback);
+    }
+
+    private void DefineDirectFunction(string name, ComponentFunctionCallback callback)
+    {
         var current = NativeHandle;
         var nameBytes = Encoding.UTF8.GetBytes(name);
 
@@ -172,7 +189,7 @@ public sealed class ComponentLinkerInstance : IDisposable
         }
     }
 
-    private static IntPtr Invoke(
+    internal static IntPtr Invoke(
         ComponentFunctionCallback callback,
         string name,
         IntPtr args,

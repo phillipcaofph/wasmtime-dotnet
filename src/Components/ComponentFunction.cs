@@ -134,9 +134,10 @@ public class ComponentFunction
                 ? IntPtr.Zero
                 : scope.Allocate(resultCount * ComponentValueMarshaller.ValueSize);
 
+            var context = store.Context.handle;
             var error = Native.wasmtime_component_func_call(
                 in func,
-                store.Context.handle,
+                context,
                 argumentBuffer,
                 (nuint)argumentCount,
                 resultBuffer,
@@ -146,7 +147,7 @@ public class ComponentFunction
 
             if (error != IntPtr.Zero)
             {
-                throw WasmtimeException.FromOwnedError(error);
+                throw HostCallbackDispatcher.AttachCause(WasmtimeException.FromOwnedError(error), context);
             }
 
             if (resultCount == 0)
@@ -253,11 +254,12 @@ public class ComponentFunction
             Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
 
             IntPtr future;
+            var context = store.Context.handle;
             try
             {
                 future = Native.wasmtime_component_func_call_async(
                     functionBuffer,
-                    store.Context.handle,
+                    context,
                     argumentBuffer,
                     (nuint)argumentCount,
                     resultBuffer,
@@ -296,7 +298,7 @@ public class ComponentFunction
                 if (error != IntPtr.Zero)
                 {
                     Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
-                    throw WasmtimeException.FromOwnedError(error);
+                    throw HostCallbackDispatcher.AttachCause(WasmtimeException.FromOwnedError(error), context);
                 }
 
                 if (resultCount == 0)
