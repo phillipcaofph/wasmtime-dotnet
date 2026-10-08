@@ -141,32 +141,6 @@ namespace Wasmtime.Tests
         }
 
         [HostCallbackIsolationFact]
-        public void ItRejectsStoreUseFromIsolatedCallbacks()
-        {
-            using var engine = new Engine(new Config().WithComponentModel(true).WithFuelConsumption(true));
-            using var store = new Store(engine);
-            store.Fuel = 1_000_000;
-            using var linker = new ComponentLinker(engine) { IsolateHostCallbacks = true };
-
-            Exception? rejected = null;
-            DefineHost(linker, (arguments, results) =>
-            {
-                // The Store's thread is blocked in native code waiting for this callback.
-                rejected = Record.Exception(() => store.Fuel);
-                results[0] = ComponentValue.S32(arguments[0].AsS32() * 2);
-            });
-
-            using var component = Component.FromTextFile(engine, "Components/host-import.wat");
-            linker.Instantiate(store, component);
-
-            rejected.Should().BeOfType<InvalidOperationException>()
-                .Which.Message.Should().Contain("isolated host callback");
-
-            // The guard is scoped to the callback.
-            store.Fuel.Should().BeGreaterThan(0);
-        }
-
-        [HostCallbackIsolationFact]
         public async Task ItRunsSynchronousCallbacksIsolatedDuringAsyncCalls()
         {
             using var engine = new Engine(AsyncConfig());
@@ -189,6 +163,40 @@ namespace Wasmtime.Tests
             }
 
             callbackThreadName.Should().Be(WorkerThreadName);
+        }
+
+        [HostCallbackIsolationFact]
+        public void ItProxiesSupportedStoreOperationsAndRejectsOthers()
+        {
+            using var engine = new Engine(new Config().WithComponentModel(true).WithFuelConsumption(true));
+            using var store = new Store(engine);
+            store.Fuel = 1_000_000;
+            using var linker = new ComponentLinker(engine) { IsolateHostCallbacks = true };
+
+            ulong observedFuel = 0;
+            Exception? rejected = null;
+            Exception? limitsRejected = null;
+            DefineHost(linker, (arguments, results) =>
+            {
+                observedFuel = store.Fuel;
+                store.Fuel = 500_000;
+                store.GC();
+                rejected = Record.Exception(() => store.SetWasiConfiguration(new WasiConfiguration()));
+                limitsRejected = Record.Exception(() => store.SetLimits(memorySize: 1 << 20));
+                results[0] = ComponentValue.S32(arguments[0].AsS32() * 2);
+            });
+
+            using var component = Component.FromTextFile(engine, "Components/host-import.wat");
+            linker.Instantiate(store, component);
+
+            observedFuel.Should().BeGreaterThan(0).And.BeLessThanOrEqualTo(1_000_000);
+            store.Fuel.Should().BeLessThanOrEqualTo(500_000).And.BeGreaterThan(0);
+            rejected.Should().BeOfType<InvalidOperationException>()
+                .Which.Message.Should().Contain("isolated host callback");
+            limitsRejected.Should().BeOfType<InvalidOperationException>();
+
+            // The guard is scoped to the callback.
+            store.SetWasiConfiguration(new WasiConfiguration());
         }
 
         private static Config AsyncConfig() =>

@@ -18,6 +18,7 @@
 #include <string.h>
 
 enum { JOB_SYNC = 1, JOB_RELEASE = 4 };
+enum { OP_GC = 0, OP_GET_FUEL = 1, OP_SET_FUEL = 2, OP_SET_EPOCH_DEADLINE = 3, OP_COUNT = 4 };
 enum { MAX_WORKERS_LIMIT = 256, WORKER_STACK = 8 * 1024 * 1024 };
 enum { THREAD_START_ATTEMPTS = 3, THREAD_START_RETRY_MS = 1 };
 enum { THREAD_STARTED, THREAD_START_RETRY, THREAD_START_FAILED };
@@ -168,6 +169,10 @@ static void spin_for(atomic_int *first, atomic_int *second) {
 
 typedef void (*handler_type)(void *job);
 typedef void *(*error_new_type)(const char *message);
+typedef void *(*context_gc_type)(void *context);
+typedef void *(*get_fuel_type)(void *context, uint64_t *fuel);
+typedef void *(*set_fuel_type)(void *context, uint64_t fuel);
+typedef void (*set_epoch_deadline_type)(void *context, uint64_t ticks);
 
 typedef struct registration {
     void *managed;             /* GCHandle owned by managed code */
@@ -175,6 +180,10 @@ typedef struct registration {
 
 typedef struct sync_request {
     bridge_cond changed;
+    int op;                    /* owner-thread operation posted by the worker */
+    void *op_argument;
+    void *op_result;
+    atomic_int op_pending;
     atomic_int done;
     void *error;
 } sync_request;
@@ -204,10 +213,11 @@ static size_t thread_count;
 static int shutting_down;
 static handler_type handler;
 static error_new_type error_new;
+static void *store_ops[OP_COUNT];
 static atomic_int work_queued; /* mirrors queued so idle workers can spin without the mutex */
 
 static atomic_uint_fast64_t live_registrations, completed_requests, peak_busy,
-    exhaustions, threads_started;
+    exhaustions, owner_ops, threads_started;
 
 static void max_store(atomic_uint_fast64_t *target, uint64_t value) {
     uint_fast64_t seen = atomic_load(target);
@@ -333,6 +343,19 @@ static void *refused_locked(int reason) {
     }
 }
 
+/* Store operations that depend on the calling thread's Wasm activation. Native-only. */
+static void *run_owner_op(int op, void *context, void *argument) {
+    switch (op) {
+    case OP_GC: return ((context_gc_type)store_ops[op])(context);
+    case OP_GET_FUEL: return ((get_fuel_type)store_ops[op])(context, argument);
+    case OP_SET_FUEL: return ((set_fuel_type)store_ops[op])(context, *(uint64_t *)argument);
+    case OP_SET_EPOCH_DEADLINE:
+        ((set_epoch_deadline_type)store_ops[op])(context, *(uint64_t *)argument);
+        return NULL;
+    default: fail("unknown owner operation");
+    }
+}
+
 /* Synchronous Wasmtime callback. Runs on the fiber and never enters the CLR. */
 static void *sync_callback(void *env, void *context, void *type, void *args,
                            size_t nargs, void *results, size_t nresults) {
@@ -348,15 +371,49 @@ static void *sync_callback(void *env, void *context, void *type, void *args,
         cond_destroy(&r.changed);
         return error;
     }
-    mutex_unlock(&mutex);
-    spin_for(&r.done, NULL);
-    /* Always re-acquire: the completer may still be signalling r.changed. */
-    mutex_lock(&mutex);
-    while (!r.done)
-        cond_wait(&r.changed, &mutex);
+    for (;;) {
+        mutex_unlock(&mutex);
+        spin_for(&r.done, &r.op_pending);
+        /* Always re-acquire: the completer may still be signalling r.changed. */
+        mutex_lock(&mutex);
+        while (!r.done && !r.op_pending)
+            cond_wait(&r.changed, &mutex);
+        if (r.done)
+            break;
+        int op = r.op;
+        void *argument = r.op_argument;
+        mutex_unlock(&mutex);
+        void *result = run_owner_op(op, context, argument);
+        atomic_fetch_add(&owner_ops, 1);
+        mutex_lock(&mutex);
+        r.op_result = result;
+        r.op_pending = 0;
+        cond_broadcast(&r.changed);
+    }
     mutex_unlock(&mutex);
     cond_destroy(&r.changed);
     return r.error;
+}
+
+/*
+ * Called by a worker while it handles a JOB_SYNC request; runs op on the blocked stub's
+ * thread.
+ */
+BRIDGE_EXPORT void *bridge_owner_call(job *j, int op, void *argument) {
+    require(j->kind == JOB_SYNC, "owner calls require a synchronous callback");
+    require(op >= 0 && op < OP_COUNT && store_ops[op], "owner operation is not configured");
+    sync_request *r = j->sync;
+    mutex_lock(&mutex);
+    require(!r->done && !r->op_pending, "owner call outside an active callback");
+    r->op = op;
+    r->op_argument = argument;
+    r->op_pending = 1;
+    cond_broadcast(&r->changed);
+    while (r->op_pending)
+        cond_wait(&r->changed, &mutex);
+    void *result = r->op_result;
+    mutex_unlock(&mutex);
+    return result;
 }
 
 BRIDGE_EXPORT void bridge_sync_complete(job *j, void *error) {
@@ -440,6 +497,16 @@ BRIDGE_EXPORT int bridge_init(handler_type managed_handler, error_new_type new_e
     return status;
 }
 
+/* Registers a Wasmtime Store function that owner operations run on the stub's thread. */
+BRIDGE_EXPORT int bridge_set_store_op(int op, void *function) {
+    if (op < 0 || op >= OP_COUNT || !function)
+        return 0;
+    mutex_lock(&mutex);
+    store_ops[op] = function;
+    mutex_unlock(&mutex);
+    return 1;
+}
+
 /* How long a waiting thread busy-polls before sleeping; 0 disables spinning. */
 BRIDGE_EXPORT void bridge_set_spin(uint64_t nanoseconds) {
     atomic_store(&spin_budget_ns, nanoseconds);
@@ -487,6 +554,7 @@ BRIDGE_EXPORT uint64_t bridge_counter(int which) {
     case 1: return atomic_load(&completed_requests);
     case 2: return atomic_load(&peak_busy);
     case 3: return atomic_load(&exhaustions);
+    case 4: return atomic_load(&owner_ops);
     case 10: return atomic_load(&threads_started);
     default: return UINT64_MAX;
     }

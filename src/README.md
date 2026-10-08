@@ -107,9 +107,9 @@ platform; setting `IsolateHostCallbacks` to true then throws.
   Initializing the first isolated callback starts one ready worker; additional workers
   start on demand. A call that would need more workers traps instead of waiting.
 - `HostCallbackIsolation.SpinDuration` trades CPU for latency (default 20 µs).
-- The calling `Store` cannot be used from inside an isolated callback, because its thread
-  is waiting for the callback; doing so throws `InvalidOperationException`. Other Stores
-  remain usable.
+- Inside an isolated callback, the calling `Store` only supports `Fuel`, `GC()` and
+  `SetEpochDeadline`. They run on the Wasmtime stack that is waiting for the callback.
+  Other Store use throws `InvalidOperationException`; other Stores remain usable.
 - An exception thrown by an isolated callback traps the call, and becomes the
   `InnerException` of the resulting `WasmtimeException`.
 - Core-Wasm host functions need no isolation: core calls are synchronous and run on the

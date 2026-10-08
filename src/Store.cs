@@ -189,14 +189,27 @@ namespace Wasmtime
         {
             get
             {
-                ulong fuel = Context.GetFuel();
+                ulong fuel = 0;
+                if (Components.HostCallbackDispatcher.TryOwnerOperation(
+                        contextHandle, Components.StoreOperation.GetFuel, ref fuel))
+                {
+                    System.GC.KeepAlive(this);
+                    return fuel;
+                }
+
+                fuel = Context.GetFuel();
                 System.GC.KeepAlive(this);
                 return fuel;
             }
 
             set
             {
-                Context.SetFuel(value);
+                if (!Components.HostCallbackDispatcher.TryOwnerOperation(
+                        contextHandle, Components.StoreOperation.SetFuel, ref value))
+                {
+                    Context.SetFuel(value);
+                }
+
                 System.GC.KeepAlive(this);
             }
         }
@@ -251,7 +264,13 @@ namespace Wasmtime
         /// </summary>
         public void GC()
         {
-            Context.GC();
+            ulong unused = 0;
+            if (!Components.HostCallbackDispatcher.TryOwnerOperation(
+                    contextHandle, Components.StoreOperation.GC, ref unused))
+            {
+                Context.GC();
+            }
+
             System.GC.KeepAlive(this);
         }
 
@@ -271,7 +290,12 @@ namespace Wasmtime
         /// <param name="ticksBeyondCurrent"></param>
         public void SetEpochDeadline(ulong ticksBeyondCurrent)
         {
-            Context.SetEpochDeadline(ticksBeyondCurrent);
+            if (!Components.HostCallbackDispatcher.TryOwnerOperation(
+                    contextHandle, Components.StoreOperation.SetEpochDeadline, ref ticksBeyondCurrent))
+            {
+                Context.SetEpochDeadline(ticksBeyondCurrent);
+            }
+
             System.GC.KeepAlive(this);
         }
 
