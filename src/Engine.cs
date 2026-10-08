@@ -14,10 +14,7 @@ namespace Wasmtime
         /// <summary>
         /// Constructs a new default engine.
         /// </summary>
-        public Engine()
-        {
-            handle = new Handle(Native.wasm_engine_new());
-        }
+        public Engine() : this(new Config()) { }
 
         /// <summary>
         /// Constructs a new engine using the given configuration.

@@ -177,9 +177,9 @@ public class ComponentFunction
     {
         /// <summary>
         /// Mirrors <c>wasmtime_component_func_t</c>. The first two fields sit in an anonymous
-        /// struct, so the trailing field lands at offset 16 and the whole thing is 24 bytes.
+        /// struct, so the trailing fields land at offsets 16 and 24 and the whole thing is 32 bytes.
         /// </summary>
-        [StructLayout(LayoutKind.Explicit, Size = 24)]
+        [StructLayout(LayoutKind.Explicit, Size = 32)]
         internal struct Func
         {
             [FieldOffset(0)]
@@ -190,6 +190,9 @@ public class ComponentFunction
 
             [FieldOffset(16)]
             public uint Private2;
+
+            [FieldOffset(24)]
+            public IntPtr Private3;
         }
 
         [DllImport(Engine.LibraryName)]
