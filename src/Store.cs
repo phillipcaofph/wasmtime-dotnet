@@ -353,6 +353,9 @@ namespace Wasmtime
         /// </summary>
         internal bool AsyncYieldsEnabled => epochAsyncYields || fuelAsyncYields;
 
+        /// <summary>True when asynchronous calls suspend at fuel intervals, so fuel consumption is enabled.</summary>
+        internal bool FuelAsyncYieldsEnabled => fuelAsyncYields;
+
         private void ThrowIfNotAsync()
         {
             if (!IsComponentModelAsyncEnabled)

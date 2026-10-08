@@ -13,7 +13,6 @@ internal static unsafe partial class HostCallbackDispatcher
     private const int FinishFailed = 0, FinishOk = 1, FinishFailedPoisoned = 2;
     private const byte ValTypeBool = 0;
     private static readonly TimeSpan PendingFallback = TimeSpan.FromMilliseconds(20);
-    private static readonly TimeSpan IdlePoll = TimeSpan.FromMilliseconds(1);
     private static readonly ConcurrentDictionary<IntPtr, CancellationTokenSource> inflight = new();
     private static readonly ConcurrentDictionary<IntPtr, ProgressSignal> signals = new();
     private static readonly AsyncLocal<PollSession?> session = new();
@@ -33,20 +32,21 @@ internal static unsafe partial class HostCallbackDispatcher
         initialized && signals.TryGetValue(context, out var signal) && Volatile.Read(ref signal.Pending) > 0;
 
     /// <summary>
-    /// Completes when a pending asynchronous call on the Store context may be able to make
-    /// progress, or after a short fallback delay, because Wasmtime futures can also become
-    /// ready without a host callback finishing.
+    /// Waits until a pending asynchronous call on the Store context may be able to make
+    /// progress, or for at most <paramref name="delay"/>, because Wasmtime futures can also become
+    /// ready without a host callback finishing. Returns true when an isolated callback signalled.
     /// </summary>
-    internal static Task WaitForProgressAsync(IntPtr context, CancellationToken cancellationToken)
+    internal static Task<bool> WaitForProgressAsync(IntPtr context, TimeSpan delay,
+        CancellationToken cancellationToken)
     {
         if (!signals.TryGetValue(context, out var signal))
         {
-            return Task.Delay(IdlePoll, cancellationToken);
+            return PollBackoff.DelayAsync(delay, cancellationToken);
         }
 
-        // With an isolated request outstanding, completion is signalled; otherwise keep the 1 ms poll.
-        return signal.Ready.WaitAsync(
-            Volatile.Read(ref signal.Pending) > 0 ? PendingFallback : IdlePoll, cancellationToken);
+        // Completion of an outstanding isolated request is signalled, so its fallback can be longer.
+        var timeout = Volatile.Read(ref signal.Pending) > 0 && PendingFallback > delay ? PendingFallback : delay;
+        return signal.Ready.WaitAsync(timeout, cancellationToken);
     }
 
     /// <summary>

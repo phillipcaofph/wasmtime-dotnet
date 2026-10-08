@@ -167,3 +167,22 @@ await function.CallAsync(arguments, timeout.Token);
 
 Both methods throw `InvalidOperationException` unless the engine was configured with
 `WithComponentModelAsync(true)`, and only asynchronous calls can be suspended.
+
+### How asynchronous calls are polled
+
+Wasmtime's C API has no waker: polling a pending call reports that it is not ready, but
+nothing reports when it can continue. The binding therefore decides when to poll again:
+
+- When an isolated asynchronous host callback completes, it signals the call, which is
+  polled again immediately.
+- A call that suspended at an epoch or fuel yield point is polled again after a thread-pool
+  hop. A poll counts as progress when the guest consumed fuel or ran for at least 50 µs;
+  after 16 polls in a row without progress the call waits instead, so a call that is
+  pending for another reason cannot keep a thread busy.
+- Otherwise the call waits, starting at 1 ms and doubling after each wait that ends without
+  a signal, up to 50 ms. Any signal or progress resets the delay. On Windows the shortest
+  wait is the system timer resolution, typically about 15 ms.
+
+A waker callback for `wasmtime_call_future_poll` in Wasmtime's C API would let a pending
+call resume exactly when it can make progress and make these heuristics unnecessary. It
+is a possible future improvement.

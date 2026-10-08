@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -344,10 +345,13 @@ public class ComponentFunction
     internal static async Task PollFutureAsync(IntPtr future, Store store, IntPtr context, CancellationToken cancellationToken)
     {
         using var owner = HostCallbackDispatcher.BeginPolling(context);
+        var backoff = new PollBackoff();
+        var fuel = store.FuelAsyncYieldsEnabled ? store.Context.GetFuel() : 0;
         while (true)
         {
             // Wasmtime does not borrow the Store between polls, so callbacks' Store operations run here.
             owner?.Serve();
+            var started = Stopwatch.GetTimestamp();
             if (Native.wasmtime_call_future_poll(future))
             {
                 return;
@@ -355,15 +359,36 @@ public class ComponentFunction
 
             if (store.AsyncYieldsEnabled && !HostCallbackDispatcher.HasPendingWork(context))
             {
-                // The guest suspended at an epoch or fuel yield point and can resume immediately;
-                // hop through the thread pool so other work gets a turn first.
-                cancellationToken.ThrowIfCancellationRequested();
-                await default(ThreadPoolHop);
-                continue;
+                // The guest may have suspended at an epoch or fuel yield point, so it can resume
+                // immediately; hop through the thread pool so other work gets a turn first.
+                var progressed = PollBackoff.RanGuest(Stopwatch.GetTimestamp() - started) |
+                    ConsumedFuel(store, ref fuel);
+                if (backoff.ShouldHop(progressed))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    await default(ThreadPoolHop);
+                    continue;
+                }
             }
 
-            await HostCallbackDispatcher.WaitForProgressAsync(context, cancellationToken).ConfigureAwait(false);
+            var signalled = await HostCallbackDispatcher
+                .WaitForProgressAsync(context, backoff.Delay, cancellationToken)
+                .ConfigureAwait(false);
+            backoff.OnWaited(signalled);
         }
+    }
+
+    /// <summary>True when the guest consumed fuel since <paramref name="fuel"/> was last read.</summary>
+    private static bool ConsumedFuel(Store store, ref ulong fuel)
+    {
+        if (!store.FuelAsyncYieldsEnabled)
+        {
+            return false;
+        }
+
+        var previous = fuel;
+        fuel = store.Context.GetFuel();
+        return fuel < previous;
     }
 
     private readonly struct ThreadPoolHop : ICriticalNotifyCompletion
