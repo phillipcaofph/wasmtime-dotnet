@@ -458,6 +458,7 @@ namespace Wasmtime
                 return;
             }
 
+            Components.HostCallbackDispatcher.ReleaseContext(contextHandle);
             handle.Dispose();
         }
 
@@ -470,6 +471,7 @@ namespace Wasmtime
                     throw new ObjectDisposedException(typeof(Store).FullName);
                 }
 
+                Components.HostCallbackDispatcher.ThrowIfServing(contextHandle);
                 return handle;
             }
         }
@@ -492,6 +494,8 @@ namespace Wasmtime
                 throw new InvalidOperationException(
                     "A component operation is already in progress on this store.");
             }
+
+            Components.HostCallbackDispatcher.BeginOperation(contextHandle);
         }
 
         internal void EndComponentOperation()
@@ -518,6 +522,7 @@ namespace Wasmtime
                     throw new ObjectDisposedException(typeof(Store).FullName);
                 }
 
+                Components.HostCallbackDispatcher.ThrowIfServing(contextHandle);
                 return new StoreContext(contextHandle);
             }
         }

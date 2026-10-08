@@ -73,6 +73,48 @@ $ dotnet run
 
 This should print `Hello from C#!`.
 
+## Isolating component host callbacks
+
+Asynchronous component calls (`ComponentLinker.InstantiateAsync` and
+`ComponentFunction.CallAsync`) run guest code on Wasmtime fiber stacks. The .NET garbage
+collector cannot safely scan managed frames on those stacks, so on .NET 8 and later a
+linker can run component host callbacks on native worker threads instead:
+
+```csharp
+using Wasmtime;
+using Wasmtime.Components;
+
+using var engine = new Engine(new Config().WithComponentModel(true).WithComponentModelAsync(true));
+using var store = new Store(engine);
+using var linker = new ComponentLinker(engine) { IsolateHostCallbacks = true };
+
+using (var root = linker.Root())
+using (var host = root.AddInstance("host"))
+{
+    // The setting is captured by Root(), so callbacks defined below run on a worker thread.
+    host.DefineFunction("transform", (args, results) =>
+        results[0] = ComponentValue.S32(args[0].AsS32() * 2));
+}
+
+var instance = await linker.InstantiateAsync(store, component);
+```
+
+`HostCallbackIsolation.IsSupported` is false on .NET Standard, inside a collectible
+`AssemblyLoadContext`, and when the package has no native isolation library for the
+platform; setting `IsolateHostCallbacks` to true then throws.
+
+- `HostCallbackIsolation.MaxWorkerThreads` caps the worker pool (default 64).
+  Initializing the first isolated callback starts one ready worker; additional workers
+  start on demand. A call that would need more workers traps instead of waiting.
+- `HostCallbackIsolation.SpinDuration` trades CPU for latency (default 20 µs).
+- The calling `Store` cannot be used from inside an isolated callback, because its thread
+  is waiting for the callback; doing so throws `InvalidOperationException`. Other Stores
+  remain usable.
+- An exception thrown by an isolated callback traps the call, and becomes the
+  `InnerException` of the resulting `WasmtimeException`.
+- Core-Wasm host functions need no isolation: core calls are synchronous and run on the
+  caller's stack, even on async engines.
+
 ## Time-slicing asynchronous component calls
 
 Epoch and fuel limits can suspend an asynchronous call instead of trapping it. Control

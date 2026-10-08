@@ -112,6 +112,11 @@ $ dotnet build Wasmtime.sln
 This will download the latest development snapshot of Wasmtime for your
 platform.
 
+Component host callback isolation also needs the small native library in
+`src/native/callback-bridge`. Add `-p:BuildCallbackBridge=true` to build it for your
+platform with CMake and a C11 compiler; without it, isolation tests are skipped. See
+[src/native/callback-bridge/README.md](src/native/callback-bridge/README.md).
+
 ### Testing
 
 Use `dotnet` to run the unit tests:
