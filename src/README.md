@@ -126,6 +126,9 @@ platform; setting `IsolateHostCallbacks` to true then throws.
   `InstantiateAsync`.
 - An exception thrown by an isolated callback traps the call, and becomes the
   `InnerException` of the resulting `WasmtimeException`.
+- On an engine with `WithComponentModelAsync(true)`, `Store.SetEpochDeadlineCallback`
+  callbacks run on an isolated worker whenever `HostCallbackIsolation.IsSupported` is true.
+  The same Store restrictions apply; return the new deadline from the callback.
 - Core-Wasm host functions need no isolation: core calls are synchronous and run on the
   caller's stack, even on async engines.
 
@@ -134,8 +137,8 @@ platform; setting `IsolateHostCallbacks` to true then throws.
 Epoch and fuel limits can suspend an asynchronous call instead of trapping it. Control
 returns to .NET at each suspension and the call resumes immediately, so a long-running
 guest cooperates with other tasks and observes its `CancellationToken`. No managed code runs
-at all at each deadline, so prefer these over `Store.SetEpochDeadlineCallback`, whose callback
-runs on the WebAssembly stack:
+at all at each deadline, so prefer these over `Store.SetEpochDeadlineCallback` when you only
+need time-slicing:
 
 ```csharp
 using var engine = new Engine(new Config()
