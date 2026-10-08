@@ -13,9 +13,14 @@ permissions:
   id-token: write
 
 jobs:
+  callback-bridge:
+    if: github.repository == 'bytecodealliance/wasmtime-dotnet'
+    uses: ./.github/workflows/callback-bridge.yml
+
   publish:
     name: "Publish NuGet Package"
     if: github.repository == 'bytecodealliance/wasmtime-dotnet'
+    needs: callback-bridge
     runs-on: ubuntu-latest
     env:
       DevBuild: 'false'
@@ -24,10 +29,16 @@ jobs:
     - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
       with:
         dotnet-version: '9.0.x'
+    - name: Download host callback isolation libraries
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      with:
+        pattern: callback-bridge-*
+        path: ${{ runner.temp }}/callback-bridge
+        merge-multiple: true
     - name: Create NuGet package
       run: |
         cd src
-        dotnet pack -c Release /p:Packing=true
+        dotnet pack -c Release /p:Packing=true "/p:CallbackBridgeNativeDirectory=$RUNNER_TEMP/callback-bridge"
     - name: NuGet login
       uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841
       id: login
