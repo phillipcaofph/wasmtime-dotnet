@@ -1,0 +1,43 @@
+(component
+  (type $bytes (list u8))
+  (import "text" (func $text (param "value" string) (result string)))
+  (import "bytes" (func $bytes-echo (param "value" $bytes) (result $bytes)))
+  (core module $heap
+    (memory (export "memory") 16)
+    (global $bump (mut i32) (i32.const 1024))
+    (func (export "realloc") (param i32 i32 i32) (param $size i32) (result i32)
+      (local $result i32)
+      (local.set $result (global.get $bump))
+      (global.set $bump
+        (i32.and
+          (i32.add (i32.add (global.get $bump) (local.get $size)) (i32.const 7))
+          (i32.const -8)))
+      (local.get $result)))
+  (core instance $heap (instantiate $heap))
+  (core func $text-lower (canon lower (func $text)
+    (memory (core memory $heap "memory"))
+    (realloc (core func $heap "realloc"))))
+  (core func $bytes-lower (canon lower (func $bytes-echo)
+    (memory (core memory $heap "memory"))
+    (realloc (core func $heap "realloc"))))
+  (core module $forward
+    (import "" "text" (func $text (param i32 i32 i32)))
+    (import "" "bytes" (func $bytes (param i32 i32 i32)))
+    (func (export "text") (param i32 i32) (result i32)
+      (call $text (local.get 0) (local.get 1) (i32.const 0))
+      (i32.const 0))
+    (func (export "bytes") (param i32 i32) (result i32)
+      (call $bytes (local.get 0) (local.get 1) (i32.const 0))
+      (i32.const 0)))
+  (core instance $forward (instantiate $forward
+    (with "" (instance
+      (export "text" (func $text-lower))
+      (export "bytes" (func $bytes-lower))))))
+  (func (export "text") (param "value" string) (result string)
+    (canon lift (core func $forward "text")
+      (memory (core memory $heap "memory"))
+      (realloc (core func $heap "realloc"))))
+  (func (export "bytes") (param "value" $bytes) (result $bytes)
+    (canon lift (core func $forward "bytes")
+      (memory (core memory $heap "memory"))
+      (realloc (core func $heap "realloc")))))
