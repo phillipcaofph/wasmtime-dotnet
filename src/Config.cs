@@ -74,7 +74,8 @@ namespace Wasmtime
             handle = new Handle(Native.wasm_config_new());
 
             // Wasmtime enables component-model async by default, and that requires reference
-            // types; keep it off so disabling reference types cannot make engine creation abort.
+            // types; keep it off until WithComponentModelAsync opts in, so the native setting
+            // matches Engine.IsComponentModelAsyncEnabled.
             Native.wasmtime_config_wasm_component_model_async_set(handle, false);
         }
 
@@ -178,7 +179,15 @@ namespace Wasmtime
         /// <returns>Returns the current config.</returns>
         public Config WithReferenceTypes(bool enable)
         {
-            Native.wasmtime_config_wasm_reference_types_set(handle, enable);
+            var configHandle = NativeHandle;
+            if (!enable && ComponentModelAsyncEnabled)
+            {
+                throw new InvalidOperationException(
+                    "Component-model async execution requires WebAssembly reference types.");
+            }
+
+            Native.wasmtime_config_wasm_reference_types_set(configHandle, enable);
+            ReferenceTypesEnabled = enable;
             return this;
         }
 
@@ -517,6 +526,59 @@ namespace Wasmtime
             return this;
         }
 
+        /// <summary>
+        /// Enables or disables asynchronous WebAssembly component execution.
+        /// </summary>
+        /// <param name="enabled">True to enable asynchronous component execution.</param>
+        /// <returns>The current configuration.</returns>
+        /// <remarks>
+        /// Requires WebAssembly reference types, which are enabled by default.
+        /// </remarks>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when enabling while reference types are disabled.
+        /// </exception>
+        public Config WithComponentModelAsync(bool enabled)
+        {
+            var configHandle = NativeHandle;
+            if (enabled && !ReferenceTypesEnabled)
+            {
+                throw new InvalidOperationException(
+                    "Component-model async execution requires WebAssembly reference types.");
+            }
+
+            Native.wasmtime_config_wasm_component_model_async_set(configHandle, enabled);
+            ComponentModelAsyncEnabled = enabled;
+            return this;
+        }
+
+        /// <summary>
+        /// Enables or disables additional asynchronous component-model built-ins.
+        /// </summary>
+        /// <param name="enabled">True to enable the additional built-ins.</param>
+        /// <returns>The current configuration.</returns>
+        /// <remarks>
+        /// This option requires asynchronous component execution to be enabled.
+        /// </remarks>
+        public Config WithComponentModelMoreAsyncBuiltins(bool enabled)
+        {
+            Native.wasmtime_config_wasm_component_model_more_async_builtins_set(NativeHandle, enabled);
+            return this;
+        }
+
+        /// <summary>
+        /// Enables or disables stackful coroutine support for asynchronous components.
+        /// </summary>
+        /// <param name="enabled">True to enable stackful coroutine support.</param>
+        /// <returns>The current configuration.</returns>
+        /// <remarks>
+        /// This option requires asynchronous component execution to be enabled.
+        /// </remarks>
+        public Config WithComponentModelAsyncStackful(bool enabled)
+        {
+            Native.wasmtime_config_wasm_component_model_async_stackful_set(NativeHandle, enabled);
+            return this;
+        }
+
         /// <inheritdoc/>
         public void Dispose()
         {
@@ -665,11 +727,19 @@ namespace Wasmtime
             public static extern void wasmtime_config_wasm_component_model_async_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);
 
             [DllImport(Engine.LibraryName)]
+            public static extern void wasmtime_config_wasm_component_model_more_async_builtins_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);
+
+            [DllImport(Engine.LibraryName)]
+            public static extern void wasmtime_config_wasm_component_model_async_stackful_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);
+
+            [DllImport(Engine.LibraryName)]
             public static extern void wasmtime_config_wasm_exceptions_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);
 
             // todo: void wasmtime_config_host_memory_creator_set(wasm_config_t *, wasmtime_memory_creator_t *)
         }
 
         private readonly Handle handle;
+        internal bool ComponentModelAsyncEnabled { get; private set; }
+        private bool ReferenceTypesEnabled { get; set; } = true;
     }
 }
