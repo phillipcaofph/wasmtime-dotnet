@@ -379,13 +379,17 @@ namespace Wasmtime
         /// <returns>The new deadline, in ticks beyond the current epoch, after which execution resumes.</returns>
         /// <remarks>
         /// <para>
-        /// The callback runs on the thread executing the WebAssembly code. Throwing from it terminates
+        /// The callback normally runs on the thread executing the WebAssembly code. Throwing from it terminates
         /// the execution; the exception becomes the InnerException of the resulting <see cref="WasmtimeException"/>.
         /// </para>
         /// <para>
-        /// During an asynchronous component call that stack is a Wasmtime fiber, which the .NET runtime
-        /// cannot safely scan. Use <see cref="SetEpochDeadlineAsyncYieldAndUpdate"/> to time-slice
-        /// asynchronous calls instead.
+        /// When the engine enables asynchronous component support and
+        /// <see cref="Components.HostCallbackIsolation.IsSupported"/> is true, the callback instead runs on an
+        /// isolated host callback thread while the WebAssembly stack waits in native code, because that stack
+        /// may be a Wasmtime fiber the .NET runtime cannot safely scan. The store passed to the callback then
+        /// only supports <see cref="Fuel"/>, <see cref="GC()"/> and <see cref="SetEpochDeadline"/>; return the
+        /// new deadline rather than touching other store state. Without isolation, use
+        /// <see cref="SetEpochDeadlineAsyncYieldAndUpdate"/> for asynchronous calls instead.
         /// </para>
         /// </remarks>
         public delegate ulong EpochDeadlineCallback(Store store);
@@ -412,6 +416,13 @@ namespace Wasmtime
                 throw new ArgumentNullException(nameof(callback));
             }
 
+            if (IsComponentModelAsyncEnabled && Components.HostCallbackDispatcher.IsSupported &&
+                Components.HostCallbackDispatcher.SetEpochDeadlineCallback(NativeHandle, callback))
+            {
+                epochAsyncYields = false;
+                return;
+            }
+
             unsafe
             {
                 Native.WasmtimeEpochDeadlineCallback trampoline =
@@ -431,7 +442,7 @@ namespace Wasmtime
             epochAsyncYields = false;
         }
 
-        private static unsafe IntPtr InvokeEpochDeadlineCallback(EpochDeadlineCallback callback, IntPtr context, ulong* epochDeadlineDelta)
+        internal static unsafe IntPtr InvokeEpochDeadlineCallback(EpochDeadlineCallback callback, IntPtr context, ulong* epochDeadlineDelta)
         {
             try
             {

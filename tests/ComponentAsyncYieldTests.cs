@@ -90,6 +90,75 @@ namespace Wasmtime.Tests
             store.Invoking(s => s.SetFuelAsyncYieldInterval(10_000)).Should().Throw<WasmtimeException>();
         }
 
+        [HostCallbackIsolationFact]
+        public async Task ItRunsEpochDeadlineCallbacksOffTheWasmtimeStack()
+        {
+            using var engine = new Engine(AsyncConfig().WithEpochInterruption(true).WithFuelConsumption(true));
+            using var store = new Store(engine);
+            store.Fuel = ulong.MaxValue;
+            var instance = await InstantiateAsync(engine, store);
+
+            var calls = 0;
+            var threadName = "";
+            ulong fuelSeen = 0;
+            store.SetEpochDeadlineCallback(s =>
+            {
+                calls++;
+                threadName = Thread.CurrentThread.Name;
+                fuelSeen = s.Fuel;
+                s.SetEpochDeadline(1);
+                return 1;
+            });
+
+            using var ticker = StartTicker(engine);
+            (await instance.GetFunction("spin")!.CallAsync(ComponentValue.U32(50_000_000)))!
+                .AsU32().Should().Be(50_000_000);
+
+            calls.Should().BePositive();
+            threadName.Should().Be("Wasmtime host callback");
+            fuelSeen.Should().BeGreaterThan(0);
+        }
+
+        [HostCallbackIsolationFact]
+        public async Task ItReportsExceptionsFromIsolatedEpochDeadlineCallbacks()
+        {
+            using var engine = new Engine(AsyncConfig().WithEpochInterruption(true));
+            using var store = new Store(engine);
+            var instance = await InstantiateAsync(engine, store);
+            store.SetEpochDeadlineCallback(_ => throw new InvalidOperationException("deadline reached"));
+
+            using var ticker = StartTicker(engine);
+            var error = await FluentActions.Awaiting(() => instance.GetFunction("forever")!
+                    .CallAsync(Array.Empty<ComponentValue>()))
+                .Should().ThrowAsync<WasmtimeException>();
+            error.Which.InnerException.Should().BeOfType<InvalidOperationException>()
+                .Which.Message.Should().Be("deadline reached");
+        }
+
+        [HostCallbackIsolationFact]
+        public async Task ItReplacesIsolatedEpochDeadlineCallbacks()
+        {
+            using var engine = new Engine(AsyncConfig().WithEpochInterruption(true));
+            using var store = new Store(engine);
+            var instance = await InstantiateAsync(engine, store);
+
+            var replacedCalls = 0;
+            var calls = 0;
+            for (var i = 0; i < 100; i++)
+            {
+                store.SetEpochDeadlineCallback(_ => { replacedCalls++; return 1; });
+            }
+
+            store.SetEpochDeadlineCallback(_ => { calls++; return 1; });
+
+            using var ticker = StartTicker(engine);
+            (await instance.GetFunction("spin")!.CallAsync(ComponentValue.U32(20_000_000)))!
+                .AsU32().Should().Be(20_000_000);
+
+            replacedCalls.Should().Be(0);
+            calls.Should().BePositive();
+        }
+
         private static Config AsyncConfig() =>
             new Config().WithComponentModel(true).WithComponentModelAsync(true);
 

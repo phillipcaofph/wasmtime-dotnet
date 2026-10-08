@@ -164,9 +164,16 @@ internal static unsafe partial class HostCallbackDispatcher
             AsyncCallback = asyncCallback;
         }
 
+        public Registration(Store.EpochDeadlineCallback epochCallback)
+        {
+            Name = "epoch deadline callback";
+            EpochCallback = epochCallback;
+        }
+
         public string Name { get; }
         public ComponentFunctionCallback? Callback { get; }
         public ComponentAsyncFunctionCallback? AsyncCallback { get; }
+        public Store.EpochDeadlineCallback? EpochCallback { get; }
     }
 
     private static void Register(ComponentLinkerInstance.Handle instance, string name, Registration registration)
@@ -218,8 +225,10 @@ internal static unsafe partial class HostCallbackDispatcher
         try
         {
             // Results are written directly: the stub keeps Wasmtime's buffers alive while it waits.
-            error = ComponentLinkerInstance.Invoke(registration.Callback!, registration.Name,
-                args, nargs, results, nresults);
+            error = registration.EpochCallback is { } epochCallback
+                ? Store.InvokeEpochDeadlineCallback(epochCallback, context, (ulong*)results)
+                : ComponentLinkerInstance.Invoke(registration.Callback!, registration.Name,
+                    args, nargs, results, nresults);
         }
         finally
         {

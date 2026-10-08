@@ -420,6 +420,15 @@ static void *sync_callback(void *env, void *context, void *type, void *args,
 }
 
 /*
+ * Epoch deadline callback. Runs as a JOB_SYNC request whose results point at the deadline
+ * delta (nresults == 0 marks it as an epoch job). The update kind is left at "continue".
+ */
+static void *epoch_callback(void *context, void *data, uint64_t *delta, uint8_t *kind) {
+    (void)kind;
+    return sync_callback(data, context, NULL, NULL, 0, delta, 0);
+}
+
+/*
  * Called by a worker while it handles a JOB_SYNC request, or the synchronous part of a
  * JOB_ASYNC_START request; runs op on the blocked stub's thread.
  */
@@ -759,6 +768,7 @@ BRIDGE_EXPORT void bridge_registration_abandon(registration *r) {
 
 BRIDGE_EXPORT void *bridge_sync_callback(void) { return (void *)sync_callback; }
 BRIDGE_EXPORT void *bridge_async_callback(void) { return (void *)async_callback; }
+BRIDGE_EXPORT void *bridge_epoch_callback(void) { return (void *)epoch_callback; }
 BRIDGE_EXPORT void *bridge_registration_finalizer(void) { return (void *)registration_finalize; }
 
 /* Waits for queued work, then joins every worker. Must not be called from a worker. */
