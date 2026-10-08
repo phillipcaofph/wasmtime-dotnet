@@ -94,6 +94,13 @@ using (var host = root.AddInstance("host"))
     // The setting is captured by Root(), so callbacks defined below run on a worker thread.
     host.DefineFunction("transform", (args, results) =>
         results[0] = ComponentValue.S32(args[0].AsS32() * 2));
+
+    // Asynchronous callbacks suspend the guest until the task completes.
+    host.DefineAsyncFunction("fetch", async (args, cancellationToken) =>
+    {
+        await Task.Delay(10, cancellationToken);
+        return new[] { ComponentValue.String("done") };
+    });
 }
 
 var instance = await linker.InstantiateAsync(store, component);
@@ -108,8 +115,15 @@ platform; setting `IsolateHostCallbacks` to true then throws.
   start on demand. A call that would need more workers traps instead of waiting.
 - `HostCallbackIsolation.SpinDuration` trades CPU for latency (default 20 µs).
 - Inside an isolated callback, the calling `Store` only supports `Fuel`, `GC()` and
-  `SetEpochDeadline`. They run on the Wasmtime stack that is waiting for the callback.
-  Other Store use throws `InvalidOperationException`; other Stores remain usable.
+  `SetEpochDeadline`. Other Store use throws `InvalidOperationException`; other Stores
+  remain usable. Synchronous callbacks, and asynchronous callbacks until they first yield,
+  run these on the Wasmtime stack that is waiting for them. After an asynchronous callback
+  yields, the `CallAsync` or `InstantiateAsync` driving the call runs them between polls,
+  and the callback's thread blocks until they complete. Once that call has completed or
+  been cancelled, these operations throw too.
+- `ComponentLinkerInstance.DefineAsyncFunction` callbacks are always isolated. If one fails
+  after the guest suspended, the failure is thrown from the pending `CallAsync` or
+  `InstantiateAsync`.
 - An exception thrown by an isolated callback traps the call, and becomes the
   `InnerException` of the resulting `WasmtimeException`.
 - Core-Wasm host functions need no isolation: core calls are synchronous and run on the

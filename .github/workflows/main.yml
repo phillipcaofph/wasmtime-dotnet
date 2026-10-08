@@ -54,7 +54,7 @@ jobs:
         WASMTIME_REQUIRE_HOST_CALLBACK_ISOLATION: '1'
       run: >-
         dotnet test tests/Wasmtime.Tests.csproj -c ${{ matrix.config }} -p:BuildCallbackBridge=true
-        --filter "FullyQualifiedName~HostCallbackIsolationTests"
+        --filter "FullyQualifiedName~HostCallbackIsolationTests|FullyQualifiedName~ComponentAsyncHostFunctionTests"
     - name: Benchmark
       if: matrix.config == 'release'
       run: dotnet run -c ${{ matrix.config }} --project benchmarks/simple/simple.csproj

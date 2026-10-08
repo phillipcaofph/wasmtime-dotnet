@@ -2,6 +2,8 @@ using System;
 using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
 namespace Wasmtime.Components;
@@ -16,6 +18,21 @@ namespace Wasmtime.Components;
 public delegate void ComponentFunctionCallback(
     ReadOnlySpan<ComponentValue> arguments,
     Span<ComponentValue> results);
+
+/// <summary>
+/// An asynchronous host implementation of a component function.
+/// </summary>
+/// <param name="arguments">A copy of the arguments passed by the guest.</param>
+/// <param name="cancellationToken">Cancelled when Wasmtime drops the pending call.</param>
+/// <returns>The results, one per component function result (an empty array for none).</returns>
+/// <remarks>
+/// The <see cref="Store"/> that called the function cannot be used from the callback or any
+/// of its continuations, except for <see cref="Store.Fuel"/>, <see cref="Store.GC"/> and
+/// <see cref="Store.SetEpochDeadline"/> while the call is running.
+/// </remarks>
+public delegate Task<ComponentValue[]> ComponentAsyncFunctionCallback(
+    ComponentValue[] arguments,
+    CancellationToken cancellationToken);
 
 /// <summary>
 /// An instance being defined within a <see cref="ComponentLinker"/>, used to define names into
@@ -159,6 +176,45 @@ public sealed class ComponentLinkerInstance : IDisposable
         }
 
         DefineDirectFunction(name, callback);
+    }
+
+    /// <summary>
+    /// Defines a function implemented asynchronously by the host. The callback always runs
+    /// isolated from Wasmtime fiber stacks, see <see cref="HostCallbackIsolation"/>.
+    /// </summary>
+    /// <param name="name">The name of the function.</param>
+    /// <param name="callback">The implementation of the function.</param>
+    /// <remarks>
+    /// <para>
+    /// The guest is suspended while the returned task is pending, so the component must be
+    /// instantiated with <see cref="ComponentLinker.InstantiateAsync"/> on a Store whose engine
+    /// enables asynchronous support, and the function must be called with
+    /// <see cref="ComponentFunction.CallAsync(ComponentValue[])"/>.
+    /// </para>
+    /// <para>
+    /// If the task fails after the guest suspended, Wasmtime cannot trap the call. The guest
+    /// sees placeholder results and the failure is thrown from the pending
+    /// <see cref="ComponentFunction.CallAsync(ComponentValue[])"/> instead; a host import returning <c>bool</c>
+    /// receives a deliberately mistyped value so the call traps.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown if an argument is null.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// Thrown when <see cref="HostCallbackIsolation.IsSupported"/> is false.
+    /// </exception>
+    public void DefineAsyncFunction(string name, ComponentAsyncFunctionCallback callback)
+    {
+        if (name is null)
+        {
+            throw new ArgumentNullException(nameof(name));
+        }
+
+        if (callback is null)
+        {
+            throw new ArgumentNullException(nameof(callback));
+        }
+
+        HostCallbackDispatcher.DefineAsyncFunction(NativeHandle, name, callback);
     }
 
     private void DefineDirectFunction(string name, ComponentFunctionCallback callback)

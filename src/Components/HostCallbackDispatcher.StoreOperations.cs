@@ -15,9 +15,14 @@ internal static unsafe partial class HostCallbackDispatcher
     /// </summary>
     internal static bool TryOwnerOperation(IntPtr context, StoreOperation operation, ref ulong value)
     {
-        if (!initialized || context == IntPtr.Zero || current is not { } active || active.Context != context)
+        if (!initialized || context == IntPtr.Zero)
         {
             return false;
+        }
+
+        if (current is not { } active || active.Context != context)
+        {
+            return TryDeferOwnerOperation(context, operation, ref value);
         }
 
         var argument = value;

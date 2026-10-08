@@ -291,7 +291,7 @@ public class ComponentFunction
 
             try
             {
-                await PollFutureAsync(future, store, cancellationToken).ConfigureAwait(false);
+                await PollFutureAsync(future, store, context, cancellationToken).ConfigureAwait(false);
                 Native.wasmtime_call_future_delete(future);
                 future = IntPtr.Zero;
                 var error = Marshal.ReadIntPtr(errorBuffer);
@@ -303,17 +303,21 @@ public class ComponentFunction
 
                 if (resultCount == 0)
                 {
+                    HostCallbackDispatcher.ThrowIfHostFailed(context);
                     return null;
                 }
 
+                ComponentValue result;
                 try
                 {
-                    return ComponentValueMarshaller.Read(resultBuffer);
+                    result = ComponentValueMarshaller.Read(resultBuffer);
                 }
                 finally
                 {
                     ComponentValueNative.wasmtime_component_val_delete(resultBuffer);
                 }
+                HostCallbackDispatcher.ThrowIfHostFailed(context);
+                return result;
             }
             finally
             {
@@ -337,11 +341,19 @@ public class ComponentFunction
         }
     }
 
-    internal static async Task PollFutureAsync(IntPtr future, Store store, CancellationToken cancellationToken)
+    internal static async Task PollFutureAsync(IntPtr future, Store store, IntPtr context, CancellationToken cancellationToken)
     {
-        while (!Native.wasmtime_call_future_poll(future))
+        using var owner = HostCallbackDispatcher.BeginPolling(context);
+        while (true)
         {
-            if (store.AsyncYieldsEnabled)
+            // Wasmtime does not borrow the Store between polls, so callbacks' Store operations run here.
+            owner?.Serve();
+            if (Native.wasmtime_call_future_poll(future))
+            {
+                return;
+            }
+
+            if (store.AsyncYieldsEnabled && !HostCallbackDispatcher.HasPendingWork(context))
             {
                 // The guest suspended at an epoch or fuel yield point and can resume immediately;
                 // hop through the thread pool so other work gets a turn first.
@@ -350,7 +362,7 @@ public class ComponentFunction
                 continue;
             }
 
-            await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+            await HostCallbackDispatcher.WaitForProgressAsync(context, cancellationToken).ConfigureAwait(false);
         }
     }
 

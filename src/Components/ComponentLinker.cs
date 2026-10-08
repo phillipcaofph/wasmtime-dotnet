@@ -269,7 +269,7 @@ public class ComponentLinker
 
             try
             {
-                await ComponentFunction.PollFutureAsync(future, store, cancellationToken).ConfigureAwait(false);
+                await ComponentFunction.PollFutureAsync(future, store, context, cancellationToken).ConfigureAwait(false);
                 ComponentFunction.Native.wasmtime_call_future_delete(future);
                 future = IntPtr.Zero;
                 var error = Marshal.ReadIntPtr(errorBuffer);
@@ -279,6 +279,7 @@ public class ComponentLinker
                     throw HostCallbackDispatcher.AttachCause(WasmtimeException.FromOwnedError(error), context);
                 }
 
+                HostCallbackDispatcher.ThrowIfHostFailed(context);
                 var instance = Marshal.PtrToStructure<ComponentInstance.Native.Instance>(instanceBuffer);
                 return new ComponentInstance(store, instance);
             }
