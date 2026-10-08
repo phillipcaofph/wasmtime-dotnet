@@ -88,6 +88,11 @@ static void *unexpected_error(const char *message) {
     fail(message);
 }
 
+static void unexpected_delete(void *value) {
+    (void)value;
+    fail("unexpected value deletion");
+}
+
 static void handle_job(void *argument) {
     job *j = argument;
     require(j->kind == JOB_RELEASE, "unexpected job kind");
@@ -105,7 +110,7 @@ static void handle_job(void *argument) {
 }
 
 static int initialize(size_t maximum) {
-    return bridge_init(handle_job, unexpected_error, maximum);
+    return bridge_init(handle_job, unexpected_error, unexpected_delete, 1, maximum);
 }
 
 static void assert_stopped(void) {
@@ -119,7 +124,7 @@ static job *new_release(void) {
     job *j = calloc(1, sizeof(*j));
     require(j != NULL, "test job allocation failed");
     j->kind = JOB_RELEASE;
-    j->registration = bridge_register(NULL);
+    j->registration = bridge_register(NULL, 0);
     require(j->registration != NULL, "test registration allocation failed");
     return j;
 }
@@ -151,7 +156,7 @@ static void test_startup(const char *scenario) {
     require(workers == 1 && idle == 1, "initialization did not create one ready worker");
     mutex_unlock(&mutex);
     require(atomic_load(&threads_started) == 1, "reinitialization created an extra worker");
-    registration *r = bridge_register(NULL);
+    registration *r = bridge_register(NULL, 0);
     require(r != NULL, "registration allocation failed");
     /* No callback has run: finalization must use the prestarted worker. */
     registration_finalize(r);

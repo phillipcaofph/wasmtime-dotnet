@@ -23,7 +23,7 @@ namespace Wasmtime.Components;
 internal static unsafe partial class HostCallbackDispatcher
 {
     internal const string Library = "wasmtime_callback_bridge";
-    private const int JobSync = 1, JobRelease = 4;
+    private const int JobSync = 1, JobAsyncStart = 2, JobAsyncCancel = 3, JobRelease = 4;
     private static readonly object gate = new();
     private static readonly ConcurrentDictionary<IntPtr, Exception> causes = new();
     private static readonly AsyncLocal<IntPtr> serving = new();
@@ -100,7 +100,11 @@ internal static unsafe partial class HostCallbackDispatcher
 
     internal static void DefineFunction(ComponentLinkerInstance.Handle instance, string name,
         ComponentFunctionCallback callback) =>
-        Register(instance, name, new Registration(name, callback));
+        Register(instance, name, new Registration(name, callback, null));
+
+    internal static void DefineAsyncFunction(ComponentLinkerInstance.Handle instance, string name,
+        ComponentAsyncFunctionCallback callback) =>
+        Register(instance, name, new Registration(name, null, callback));
 
     /// <summary>
     /// Attaches the managed exception recorded for a failed isolated callback on the Store
@@ -146,19 +150,23 @@ internal static unsafe partial class HostCallbackDispatcher
         if (initialized && context != IntPtr.Zero)
         {
             causes.TryRemove(context, out _);
+            signals.TryRemove(context, out _);
         }
     }
 
     private sealed class Registration
     {
-        public Registration(string name, ComponentFunctionCallback callback)
+        public Registration(string name, ComponentFunctionCallback? callback,
+            ComponentAsyncFunctionCallback? asyncCallback)
         {
             Name = name;
             Callback = callback;
+            AsyncCallback = asyncCallback;
         }
 
         public string Name { get; }
-        public ComponentFunctionCallback Callback { get; }
+        public ComponentFunctionCallback? Callback { get; }
+        public ComponentAsyncFunctionCallback? AsyncCallback { get; }
     }
 
     private static void Register(ComponentLinkerInstance.Handle instance, string name, Registration registration)
@@ -166,8 +174,9 @@ internal static unsafe partial class HostCallbackDispatcher
         ThrowIfUnsupported();
         EnsureInitialized();
         var bytes = Encoding.UTF8.GetBytes(name);
+        var isAsync = registration.AsyncCallback is not null;
         var managed = GCHandle.Alloc(registration);
-        var env = bridge_register(GCHandle.ToIntPtr(managed));
+        var env = bridge_register(GCHandle.ToIntPtr(managed), isAsync ? 1 : 0);
         if (env == IntPtr.Zero)
         {
             managed.Free();
@@ -178,8 +187,11 @@ internal static unsafe partial class HostCallbackDispatcher
         try
         {
             // From here Wasmtime owns env and always runs the finalizer, even on error.
-            error = wasmtime_component_linker_instance_add_func(
-                instance, bytes, (nuint)bytes.Length, bridge_sync_callback(), env, bridge_registration_finalizer());
+            error = isAsync
+                ? wasmtime_component_linker_instance_add_func_async(
+                    instance, bytes, (nuint)bytes.Length, bridge_async_callback(), env, bridge_registration_finalizer())
+                : wasmtime_component_linker_instance_add_func(
+                    instance, bytes, (nuint)bytes.Length, bridge_sync_callback(), env, bridge_registration_finalizer());
         }
         catch (ObjectDisposedException)
         {
@@ -206,7 +218,7 @@ internal static unsafe partial class HostCallbackDispatcher
         try
         {
             // Results are written directly: the stub keeps Wasmtime's buffers alive while it waits.
-            error = ComponentLinkerInstance.Invoke(registration.Callback, registration.Name,
+            error = ComponentLinkerInstance.Invoke(registration.Callback!, registration.Name,
                 args, nargs, results, nresults);
         }
         finally
@@ -254,7 +266,9 @@ internal static unsafe partial class HostCallbackDispatcher
             var wasmtime = NativeLibrary.Load("wasmtime", typeof(Engine).Assembly, null);
             delegate* unmanaged[Cdecl]<IntPtr, void> handler = &Handle;
             var initialization = bridge_init((IntPtr)handler,
-                NativeLibrary.GetExport(wasmtime, "wasmtime_error_new"), (nuint)maxWorkers);
+                NativeLibrary.GetExport(wasmtime, "wasmtime_error_new"),
+                NativeLibrary.GetExport(wasmtime, "wasmtime_component_val_delete"),
+                ComponentValueMarshaller.ValueSize, (nuint)maxWorkers);
             if (initialization < 0)
             {
                 throw new InvalidOperationException(
@@ -282,13 +296,21 @@ internal static unsafe partial class HostCallbackDispatcher
                 Thread.CurrentThread.Name ??= "Wasmtime host callback";
             }
 
-            bridge_job(job, out var kind, out var managed, out var context, out _, out var args,
-                out var nargs, out var results, out var nresults);
+            bridge_job(job, out var kind, out var managed, out var context, out var type, out var args,
+                out var nargs, out var results, out var nresults, out var request);
             switch (kind)
             {
                 case JobSync:
                     RunSync(job, (Registration)GCHandle.FromIntPtr(managed).Target!, context, args,
                         checked((int)nargs), results, checked((int)nresults));
+                    break;
+                case JobAsyncStart:
+                    StartAsync(job, (Registration)GCHandle.FromIntPtr(managed).Target!, context, type,
+                        args, checked((int)nargs), results, checked((int)nresults), request);
+                    break;
+                case JobAsyncCancel:
+                    CancelAsync(request);
+                    bridge_job_done(job);
                     break;
                 case JobRelease:
                     GCHandle.FromIntPtr(managed).Free();
@@ -320,13 +342,14 @@ internal static unsafe partial class HostCallbackDispatcher
         IntPtr callback, IntPtr env, IntPtr finalizer);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-    private static extern int bridge_init(IntPtr handler, IntPtr errorNew, nuint maxWorkers);
+    private static extern int bridge_init(IntPtr handler, IntPtr errorNew, IntPtr valueDelete,
+        nuint valueSize, nuint maxWorkers);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     private static extern void bridge_set_spin(ulong nanoseconds);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-    private static extern IntPtr bridge_register(IntPtr managed);
+    private static extern IntPtr bridge_register(IntPtr managed, int isAsync);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     private static extern void bridge_registration_abandon(IntPtr registration);
@@ -342,7 +365,8 @@ internal static unsafe partial class HostCallbackDispatcher
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     private static extern void bridge_job(IntPtr job, out int kind, out IntPtr managed, out IntPtr context,
-        out IntPtr type, out IntPtr args, out nuint nargs, out IntPtr results, out nuint nresults);
+        out IntPtr type, out IntPtr args, out nuint nargs, out IntPtr results, out nuint nresults,
+        out IntPtr request);
 
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
     private static extern void bridge_sync_complete(IntPtr job, IntPtr error);

@@ -527,6 +527,9 @@ namespace Wasmtime
             System.Threading.Volatile.Write(ref componentOperationState, 0);
         }
 
+        /// <summary>Gets the native context handle without dispatcher access checks.</summary>
+        internal IntPtr ContextHandleUnchecked => contextHandle;
+
         /// <summary>
         /// Gets the context of the store.
         /// </summary>
