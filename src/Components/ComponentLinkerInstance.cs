@@ -217,7 +217,10 @@ public sealed class ComponentLinkerInstance : IDisposable
         HostCallbackDispatcher.DefineAsyncFunction(NativeHandle, name, callback);
     }
 
-    private void DefineDirectFunction(string name, ComponentFunctionCallback callback)
+    internal void DefineIsolatedFunction(string name, ComponentFunctionCallback callback) =>
+        HostCallbackDispatcher.DefineFunction(NativeHandle, name, callback);
+
+    internal void DefineDirectFunction(string name, ComponentFunctionCallback callback)
     {
         var current = NativeHandle;
         var nameBytes = Encoding.UTF8.GetBytes(name);
