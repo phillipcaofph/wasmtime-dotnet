@@ -78,9 +78,9 @@ jobs:
           lib="artifact/${{ matrix.rid }}/${{ matrix.library }}"
           if [[ "$RUNNER_OS" == macOS ]]; then
             lipo -info "$lib"
-            nm -gU "$lib" | grep -q _bridge_sync_callback
+            nm -gU "$lib" | grep -q _bridge_set_store_op
           else
-            nm -D --defined-only "$lib" | grep -q bridge_sync_callback
+            nm -D --defined-only "$lib" | grep -q bridge_set_store_op
           fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

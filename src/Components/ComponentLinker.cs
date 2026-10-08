@@ -81,7 +81,8 @@ public class ComponentLinker
     /// collector cannot safely scan.
     /// </para>
     /// <para>
-    /// Inside an isolated callback the calling <see cref="Store"/> cannot be used, and throws.
+    /// Inside an isolated callback, the calling <see cref="Store"/> only supports <see cref="Store.Fuel"/>,
+    /// <see cref="Store.GC"/> and <see cref="Store.SetEpochDeadline"/>; other Store use throws.
     /// Isolation adds a few microseconds per call.
     /// </para>
     /// </remarks>

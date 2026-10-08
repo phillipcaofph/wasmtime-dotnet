@@ -20,7 +20,7 @@ namespace Wasmtime.Components;
 /// Until the first isolated function is defined, every hook used by <see cref="Store"/> and
 /// the component call paths is a no-op.
 /// </remarks>
-internal static unsafe class HostCallbackDispatcher
+internal static unsafe partial class HostCallbackDispatcher
 {
     internal const string Library = "wasmtime_callback_bridge";
     private const int JobSync = 1, JobRelease = 4;
@@ -126,8 +126,9 @@ internal static unsafe class HostCallbackDispatcher
         if (initialized && context != IntPtr.Zero && serving.Value == context)
         {
             throw new InvalidOperationException(
-                "This Store cannot be used directly from an isolated host callback while the component call " +
-                "that started the callback is running.");
+                "This Store cannot be used directly from an isolated host callback. Only Fuel, GC() and " +
+                "SetEpochDeadline are available, and only while the component call that started the " +
+                "callback is still running.");
         }
     }
 
@@ -197,7 +198,9 @@ internal static unsafe class HostCallbackDispatcher
     private static void RunSync(IntPtr job, Registration registration, IntPtr context,
         IntPtr args, int nargs, IntPtr results, int nresults)
     {
+        var previous = current;
         var previousServing = serving.Value;
+        current = (job, context);
         serving.Value = context;
         IntPtr error;
         try
@@ -208,6 +211,7 @@ internal static unsafe class HostCallbackDispatcher
         }
         finally
         {
+            current = previous;
             serving.Value = previousServing;
         }
 
@@ -235,7 +239,7 @@ internal static unsafe class HostCallbackDispatcher
             return false;
         }
 
-        return NativeLibrary.TryGetExport(bridge, "bridge_sync_callback", out _);
+        return NativeLibrary.TryGetExport(bridge, "bridge_set_store_op", out _);
     }
 
     private static void EnsureInitialized()
@@ -257,7 +261,7 @@ internal static unsafe class HostCallbackDispatcher
                     "Host callback isolation could not start its worker thread.");
             }
 
-            if (initialization == 0)
+            if (initialization == 0 || !ConfigureStoreOperations(wasmtime))
             {
                 throw new InvalidOperationException("Host callback isolation failed to initialize.");
             }
