@@ -72,6 +72,10 @@ namespace Wasmtime
         public Config()
         {
             handle = new Handle(Native.wasm_config_new());
+
+            // Wasmtime enables component-model async by default, and that requires reference
+            // types; keep it off so disabling reference types cannot make engine creation abort.
+            Native.wasmtime_config_wasm_component_model_async_set(handle, false);
         }
 
         /// <summary>
@@ -470,7 +474,7 @@ namespace Wasmtime
         /// <returns>Returns the current config.</returns>
         public Config WithMacosMachPorts(bool enable)
         {
-            Native.wasmtime_config_macos_use_mach_ports(handle, enable);
+            Native.wasmtime_config_macos_use_mach_ports_set(handle, enable);
             return this;
         }
 
@@ -652,10 +656,13 @@ namespace Wasmtime
             public static extern IntPtr wasmtime_config_cache_config_load(Handle config, [MarshalAs(Extensions.LPUTF8Str)] string? path);
 
             [DllImport(Engine.LibraryName)]
-            public static extern void wasmtime_config_macos_use_mach_ports(Handle config, [MarshalAs(UnmanagedType.I1)] bool enable);
+            public static extern void wasmtime_config_macos_use_mach_ports_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool enable);
 
             [DllImport(Engine.LibraryName)]
             public static extern void wasmtime_config_wasm_component_model_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);
+
+            [DllImport(Engine.LibraryName)]
+            public static extern void wasmtime_config_wasm_component_model_async_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);
 
             [DllImport(Engine.LibraryName)]
             public static extern void wasmtime_config_wasm_exceptions_set(Handle config, [MarshalAs(UnmanagedType.I1)] bool value);

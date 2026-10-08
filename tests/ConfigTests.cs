@@ -7,6 +7,15 @@ namespace Wasmtime.Tests
 {
     public sealed class ConfigTests
     {
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void ItSetsMacosMachPorts(bool enable)
+        {
+            using var config = new Config();
+            config.WithMacosMachPorts(enable);
+        }
+
         [Fact]
         public void ItSetsCompilerStrategy()
         {
