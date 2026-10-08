@@ -535,6 +535,7 @@ namespace Wasmtime
 
         internal void EndComponentOperation()
         {
+            Components.HostCallbackDispatcher.EndOperation(contextHandle);
             System.Threading.Volatile.Write(ref componentOperationState, 0);
         }
 

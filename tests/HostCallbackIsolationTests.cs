@@ -98,6 +98,56 @@ namespace Wasmtime.Tests
         }
 
 
+        private static readonly AsyncLocal<string?> ambient = new();
+
+        [HostCallbackIsolationFact]
+        public void ItFlowsTheCallersExecutionContextIntoSynchronousCallbacks()
+        {
+            using var engine = new Engine(new Config().WithComponentModel(true));
+            using var store = new Store(engine);
+            using var linker = new ComponentLinker(engine) { IsolateHostCallbacks = true };
+
+            string? observed = null;
+            System.Globalization.CultureInfo? culture = null;
+            DefineHost(linker, (arguments, results) =>
+            {
+                observed = ambient.Value;
+                culture = System.Globalization.CultureInfo.CurrentCulture;
+                // Changes made by the callback stay with the callback, as with an awaited method.
+                ambient.Value = "changed by callback";
+                results[0] = ComponentValue.S32(arguments[0].AsS32() * 2);
+            });
+
+            using var component = Component.FromTextFile(engine, "Components/host-import.wat");
+            var previousCulture = System.Globalization.CultureInfo.CurrentCulture;
+            try
+            {
+                System.Globalization.CultureInfo.CurrentCulture = new System.Globalization.CultureInfo("fr-FR");
+                ambient.Value = "instantiate";
+                var instance = linker.Instantiate(store, component);
+                observed.Should().Be("instantiate");
+                culture!.Name.Should().Be("fr-FR");
+
+                ambient.Value = "call";
+                instance.GetFunction("run")!.Call(ComponentValue.S32(1))!.AsS32().Should().Be(2);
+                observed.Should().Be("call");
+                ambient.Value.Should().Be("call");
+
+                // Suppressed flow is honoured: the callback sees an empty context.
+                using (ExecutionContext.SuppressFlow())
+                {
+                    instance.GetFunction("run")!.Call(ComponentValue.S32(1));
+                }
+
+                observed.Should().BeNull();
+            }
+            finally
+            {
+                System.Globalization.CultureInfo.CurrentCulture = previousCulture;
+                ambient.Value = null;
+            }
+        }
+
         [HostCallbackIsolationFact]
         public void NestedInstancesInheritIsolation()
         {

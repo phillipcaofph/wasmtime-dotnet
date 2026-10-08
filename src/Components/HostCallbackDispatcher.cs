@@ -26,6 +26,7 @@ internal static unsafe partial class HostCallbackDispatcher
     private const int JobSync = 1, JobAsyncStart = 2, JobAsyncCancel = 3, JobRelease = 4;
     private static readonly object gate = new();
     private static readonly ConcurrentDictionary<IntPtr, Exception> causes = new();
+    private static readonly ConcurrentDictionary<IntPtr, ExecutionContext> flows = new();
     private static readonly AsyncLocal<IntPtr> serving = new();
     private static bool? supported;
 #pragma warning disable CS0649 // Only the .NET 5+ dispatcher can initialize.
@@ -137,9 +138,27 @@ internal static unsafe partial class HostCallbackDispatcher
     }
 
     /// <summary>
-    /// Called before a top-level component operation starts on a Store context.
+    /// Called on the caller's thread when a top-level component operation starts on a Store
+    /// context, so isolated callbacks can run in the caller's <see cref="ExecutionContext"/>.
     /// </summary>
-    internal static void BeginOperation(IntPtr context) => ReleaseContext(context);
+    internal static void BeginOperation(IntPtr context)
+    {
+        ReleaseContext(context);
+        // Null when the caller suppressed flow; callbacks then run in an empty context.
+        if (initialized && context != IntPtr.Zero && ExecutionContext.Capture() is { } flow)
+        {
+            flows[context] = flow;
+        }
+    }
+
+    /// <summary>Called when a top-level component operation on a Store context ends.</summary>
+    internal static void EndOperation(IntPtr context)
+    {
+        if (initialized && context != IntPtr.Zero)
+        {
+            flows.TryRemove(context, out _);
+        }
+    }
 
     /// <summary>
     /// Forgets per-context state when a Store is disposed, or before an operation starts, so it
@@ -151,6 +170,7 @@ internal static unsafe partial class HostCallbackDispatcher
         {
             causes.TryRemove(context, out _);
             signals.TryRemove(context, out _);
+            flows.TryRemove(context, out _);
         }
     }
 
@@ -297,6 +317,9 @@ internal static unsafe partial class HostCallbackDispatcher
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static void Handle(IntPtr job)
     {
+        // The worker's own (empty) context. Restoring it after every job keeps one callback's
+        // ambient state, such as AsyncLocal values or culture, from leaking into the next.
+        var baseline = ExecutionContext.Capture();
         try
         {
             if (!workerNamed)
@@ -307,6 +330,13 @@ internal static unsafe partial class HostCallbackDispatcher
 
             bridge_job(job, out var kind, out var managed, out var context, out var type, out var args,
                 out var nargs, out var results, out var nresults, out var request);
+            if ((kind == JobSync || kind == JobAsyncStart) && flows.TryGetValue(context, out var flow))
+            {
+                // Callbacks see the ExecutionContext of the call that reached them, as they would
+                // on the direct path.
+                ExecutionContext.Restore(flow);
+            }
+
             switch (kind)
             {
                 case JobSync:
@@ -334,6 +364,13 @@ internal static unsafe partial class HostCallbackDispatcher
         {
             // A native stub blocked on this job cannot be unwound safely.
             Environment.FailFast("Wasmtime host callback worker failed.", error);
+        }
+        finally
+        {
+            if (baseline is not null)
+            {
+                ExecutionContext.Restore(baseline);
+            }
         }
     }
 

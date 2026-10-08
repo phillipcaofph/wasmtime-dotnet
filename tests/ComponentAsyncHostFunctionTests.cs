@@ -16,6 +16,8 @@ namespace Wasmtime.Tests
     public sealed class ComponentAsyncHostFunctionTests
     {
 
+        private static readonly AsyncLocal<string?> ambient = new();
+
         [HostCallbackIsolationFact]
         public async Task ItAwaitsAsynchronousCallbacks()
         {
@@ -48,6 +50,41 @@ namespace Wasmtime.Tests
             }
 
             calls.Should().Be(21);
+        }
+
+        [HostCallbackIsolationFact]
+        public async Task ItFlowsTheCallersExecutionContextIntoAsynchronousCallbacks()
+        {
+            using var engine = new Engine(AsyncConfig());
+            using var store = new Store(engine);
+            using var linker = new ComponentLinker(engine);
+
+            string? beforeYield = null, afterYield = null;
+            using (var root = linker.Root())
+            using (var host = root.AddInstance("host"))
+            {
+                host.DefineAsyncFunction("transform", async (arguments, cancellationToken) =>
+                {
+                    beforeYield = ambient.Value;
+                    await Task.Yield();
+                    afterYield = ambient.Value;
+                    return new[] { ComponentValue.S32(arguments[0].AsS32() * 2) };
+                });
+                host.DefineAsyncFunction("greet", (arguments, cancellationToken) =>
+                    Task.FromResult(new[] { ComponentValue.String(string.Empty) }));
+            }
+
+            using var component = Component.FromTextFile(engine, "Components/host-import.wat");
+            ambient.Value = "instantiate";
+            var instance = await linker.InstantiateAsync(store, component);
+            beforeYield.Should().Be("instantiate");
+            afterYield.Should().Be("instantiate");
+
+            ambient.Value = "call";
+            (await instance.GetFunction("run")!.CallAsync(ComponentValue.S32(4)))!.AsS32().Should().Be(8);
+            beforeYield.Should().Be("call");
+            afterYield.Should().Be("call");
+            ambient.Value = null;
         }
 
         [HostCallbackIsolationFact]

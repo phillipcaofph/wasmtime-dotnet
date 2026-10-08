@@ -121,6 +121,11 @@ platform; setting `IsolateHostCallbacks` to true then throws.
   yields, the `CallAsync` or `InstantiateAsync` driving the call runs them between polls,
   and the callback's thread blocks until they complete. Once that call has completed or
   been cancelled, these operations throw too.
+- Isolated callbacks run in the `ExecutionContext` of the `Call`, `CallAsync`,
+  `Instantiate` or `InstantiateAsync` that reached them. They see the caller's
+  `AsyncLocal` values, `Activity.Current`, logging scopes and culture. Changes a callback
+  makes to them do not flow back to the caller. If the caller suppressed flow with
+  `ExecutionContext.SuppressFlow()`, callbacks run in an empty context.
 - `ComponentLinkerInstance.DefineAsyncFunction` callbacks are always isolated. If one fails
   after the guest suspended, the failure is thrown from the pending `CallAsync` or
   `InstantiateAsync`.
