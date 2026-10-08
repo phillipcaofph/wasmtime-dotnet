@@ -30,6 +30,9 @@ public class ComponentLinker
         }
 
         handle = new Handle(Native.wasmtime_component_linker_new(engine.NativeHandle));
+
+        // Managed code on a Wasmtime fiber can crash the CLR, so async engines isolate by default.
+        isolateHostCallbacks = engine.IsComponentModelAsyncEnabled && HostCallbackDispatcher.IsSupported;
     }
 
     internal ComponentLinker(IntPtr handle)
@@ -76,9 +79,11 @@ public class ComponentLinker
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Defaults to false. Enable it when calling components asynchronously: asynchronous calls
-    /// otherwise run managed host callbacks on Wasmtime fiber stacks, which the .NET garbage
-    /// collector cannot safely scan.
+    /// Defaults to true when the engine enables asynchronous component support
+    /// (<see cref="Config.WithComponentModelAsync(bool)"/>) and
+    /// <see cref="HostCallbackIsolation.IsSupported"/> is true, and to false otherwise. Disabling
+    /// it for asynchronous calls runs managed code on Wasmtime fiber stacks, which the .NET
+    /// garbage collector cannot safely scan.
     /// </para>
     /// <para>
     /// Inside an isolated callback, the calling <see cref="Store"/> only supports <see cref="Store.Fuel"/>,
@@ -211,8 +216,8 @@ public class ComponentLinker
     /// The engine must be configured with <see cref="Config.WithComponentModelAsync(bool)"/>.
     /// Do not use this store for any other operation until the returned task completes.
     /// Cancellation disposes the native instantiation future; it does not roll back guest side effects.
-    /// Host functions reached by startup code run on a Wasmtime fiber stack, which the .NET
-    /// garbage collector cannot safely scan, so managed host callbacks can crash the process.
+    /// Startup code runs on a Wasmtime fiber stack. Host functions are isolated from it by default;
+    /// see <see cref="IsolateHostCallbacks"/>.
     /// </remarks>
     public async Task<ComponentInstance> InstantiateAsync(
         Store store,

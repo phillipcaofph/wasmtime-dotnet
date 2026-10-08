@@ -249,6 +249,65 @@ namespace Wasmtime.Tests
             store.SetWasiConfiguration(new WasiConfiguration());
         }
 
+        [HostCallbackIsolationFact]
+        public async Task ItIsolatesByDefaultForAsynchronousEngines()
+        {
+            using var engine = new Engine(AsyncConfig());
+            using var store = new Store(engine);
+            using var linker = new ComponentLinker(engine);
+            linker.IsolateHostCallbacks.Should().BeTrue();
+
+            string? callbackThreadName = null;
+            DefineHost(linker, (arguments, results) =>
+            {
+                callbackThreadName = Thread.CurrentThread.Name;
+                results[0] = ComponentValue.S32(arguments[0].AsS32() * 2);
+            });
+
+            using var component = Component.FromTextFile(engine, "Components/host-import.wat");
+            await linker.InstantiateAsync(store, component);
+
+            callbackThreadName.Should().Be(WorkerThreadName);
+        }
+
+        [Fact]
+        public unsafe void CoreHostFunctionsRunOnTheCallingStackOnAsynchronousEngines()
+        {
+            using var engine = new Engine(AsyncConfig());
+            using var store = new Store(engine);
+            using var linker = new Linker(engine);
+            using var module = Module.FromText(engine, "core", @"
+(module
+  (import ""env"" ""callback"" (func $callback (param i32) (result i32)))
+  (func (export ""run"") (param i32) (result i32)
+    local.get 0
+    call $callback))");
+
+            var callerMarker = 0;
+            var callerStack = (long)&callerMarker;
+            var callerThread = Environment.CurrentManagedThreadId;
+            int? callbackThread = null;
+            long callbackStack = 0;
+            linker.DefineFunction("env", "callback", (int value) =>
+            {
+                var marker = 0;
+                callbackStack = (long)&marker;
+                callbackThread = Environment.CurrentManagedThreadId;
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                return value * 2;
+            });
+
+            var run = linker.Instantiate(store, module).GetFunction<int, int>("run")!;
+
+            // Core calls are synchronous, so Wasmtime runs them without a fiber even on async engines:
+            // the callback runs on the caller's thread, a little further down the same stack.
+            run(21).Should().Be(42);
+            callbackThread.Should().Be(callerThread);
+            (callerStack - callbackStack).Should().BeInRange(0, 256 * 1024);
+        }
+
+
         private static Config AsyncConfig() =>
             new Config().WithComponentModel(true).WithComponentModelAsync(true);
 

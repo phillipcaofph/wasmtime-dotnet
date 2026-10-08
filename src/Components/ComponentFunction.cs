@@ -178,8 +178,8 @@ public class ComponentFunction
     /// The engine must be configured with <see cref="Config.WithComponentModelAsync(bool)"/>.
     /// Do not use this store for any other operation until the returned task completes.
     /// Cancellation disposes the native call future; it does not roll back guest side effects.
-    /// Host functions reached by the call run on a Wasmtime fiber stack, which the .NET garbage
-    /// collector cannot safely scan, so managed host callbacks can crash the process.
+    /// The guest runs on a Wasmtime fiber stack. Host functions are isolated from it by default;
+    /// see <see cref="ComponentLinker.IsolateHostCallbacks"/>.
     /// </remarks>
     public Task<ComponentValue?> CallAsync(params ComponentValue[] arguments) =>
         CallAsync((IReadOnlyList<ComponentValue>)arguments, CancellationToken.None);
@@ -196,8 +196,8 @@ public class ComponentFunction
     /// <exception cref="WasmtimeException">The function traps or fails.</exception>
     /// <remarks>
     /// Do not use this store for any other operation until the returned task completes.
-    /// Host functions reached by the call run on a Wasmtime fiber stack, which the .NET garbage
-    /// collector cannot safely scan, so managed host callbacks can crash the process.
+    /// The guest runs on a Wasmtime fiber stack. Host functions are isolated from it by default;
+    /// see <see cref="ComponentLinker.IsolateHostCallbacks"/>.
     /// </remarks>
     public async Task<ComponentValue?> CallAsync(
         IReadOnlyList<ComponentValue> arguments,

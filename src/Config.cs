@@ -532,7 +532,9 @@ namespace Wasmtime
         /// <param name="enabled">True to enable asynchronous component execution.</param>
         /// <returns>The current configuration.</returns>
         /// <remarks>
-        /// Requires WebAssembly reference types, which are enabled by default.
+        /// Requires WebAssembly reference types, which are enabled by default. Component linkers
+        /// for such engines isolate host callbacks from Wasmtime fiber stacks by default; see
+        /// <see cref="Components.ComponentLinker.IsolateHostCallbacks"/>.
         /// </remarks>
         /// <exception cref="InvalidOperationException">
         /// Thrown when enabling while reference types are disabled.

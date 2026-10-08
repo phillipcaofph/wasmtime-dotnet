@@ -77,8 +77,9 @@ This should print `Hello from C#!`.
 
 Asynchronous component calls (`ComponentLinker.InstantiateAsync` and
 `ComponentFunction.CallAsync`) run guest code on Wasmtime fiber stacks. The .NET garbage
-collector cannot safely scan managed frames on those stacks, so on .NET 8 and later a
-linker can run component host callbacks on native worker threads instead:
+collector cannot safely scan managed frames on those stacks, so on .NET 8 and later the
+linker runs component host callbacks on native worker threads instead. This is the default
+for engines with `WithComponentModelAsync(true)` when isolation is supported:
 
 ```csharp
 using Wasmtime;
@@ -86,7 +87,7 @@ using Wasmtime.Components;
 
 using var engine = new Engine(new Config().WithComponentModel(true).WithComponentModelAsync(true));
 using var store = new Store(engine);
-using var linker = new ComponentLinker(engine) { IsolateHostCallbacks = true };
+using var linker = new ComponentLinker(engine); // IsolateHostCallbacks is true here
 
 using (var root = linker.Root())
 using (var host = root.AddInstance("host"))
@@ -108,7 +109,8 @@ var instance = await linker.InstantiateAsync(store, component);
 
 `HostCallbackIsolation.IsSupported` is false on .NET Standard, inside a collectible
 `AssemblyLoadContext`, and when the package has no native isolation library for the
-platform; setting `IsolateHostCallbacks` to true then throws.
+platform. Linkers then default to the direct path, and setting `IsolateHostCallbacks` to
+true throws. Set it explicitly to isolate synchronous engines too, or to false to opt out.
 
 - `HostCallbackIsolation.MaxWorkerThreads` caps the worker pool (default 64).
   Initializing the first isolated callback starts one ready worker; additional workers
@@ -132,7 +134,8 @@ platform; setting `IsolateHostCallbacks` to true then throws.
 - An exception thrown by an isolated callback traps the call, and becomes the
   `InnerException` of the resulting `WasmtimeException`.
 - On an engine with `WithComponentModelAsync(true)`, `Store.SetEpochDeadlineCallback`
-  callbacks run on an isolated worker whenever `HostCallbackIsolation.IsSupported` is true.
+  callbacks run on an isolated worker whenever `HostCallbackIsolation.IsSupported` is true,
+  regardless of `IsolateHostCallbacks`.
   The same Store restrictions apply; return the new deadline from the callback.
 - Core-Wasm host functions need no isolation: core calls are synchronous and run on the
   caller's stack, even on async engines.
