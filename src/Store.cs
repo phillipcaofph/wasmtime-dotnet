@@ -85,8 +85,29 @@ namespace Wasmtime
             Native.wasmtime_context_set_epoch_deadline(handle, deadline);
         }
 
+        internal void SetEpochDeadlineAsyncYieldAndUpdate(ulong ticksBeyondCurrent)
+        {
+            Native.wasmtime_context_epoch_deadline_async_yield_and_update(handle, ticksBeyondCurrent);
+        }
+
+        internal void SetFuelAsyncYieldInterval(ulong interval)
+        {
+            var error = Native.wasmtime_context_fuel_async_yield_interval(handle, interval);
+            if (error != IntPtr.Zero)
+            {
+                throw WasmtimeException.FromOwnedError(error);
+            }
+        }
+
         private static class Native
         {
+            // async.h declares a wasmtime_error_t* result, but the implementation returns nothing.
+            [DllImport(Engine.LibraryName)]
+            public static extern void wasmtime_context_epoch_deadline_async_yield_and_update(IntPtr handle, ulong delta);
+
+            [DllImport(Engine.LibraryName)]
+            public static extern IntPtr wasmtime_context_fuel_async_yield_interval(IntPtr handle, ulong interval);
+
             [DllImport(Engine.LibraryName)]
             public static extern IntPtr wasmtime_context_gc(IntPtr handle);
 
@@ -255,6 +276,69 @@ namespace Wasmtime
         }
 
         /// <summary>
+        /// Configures the epoch deadline so that reaching it suspends an asynchronous call
+        /// instead of trapping, then moves the deadline <paramref name="ticksBeyondCurrent"/>
+        /// ticks beyond the current epoch.
+        /// </summary>
+        /// <param name="ticksBeyondCurrent">The number of epoch ticks until the next suspension.</param>
+        /// <remarks>
+        /// <para>
+        /// This time-slices asynchronous component calls (<c>ComponentFunction.CallAsync</c> and
+        /// <c>ComponentLinker.InstantiateAsync</c>): each suspension returns control to the .NET
+        /// caller, which resumes the call on the next poll. Unlike
+        /// <see cref="SetEpochDeadlineCallback"/>, no managed code runs on the WebAssembly
+        /// stack, so it is safe with Wasmtime's fiber stacks.
+        /// </para>
+        /// <para>
+        /// Requires an engine configured with epoch interruption and <see cref="Config.WithComponentModelAsync"/>. It
+        /// replaces any epoch deadline callback. Synchronous calls that reach the deadline trap.
+        /// </para>
+        /// </remarks>
+        /// <exception cref="InvalidOperationException">The engine was not configured with <see cref="Config.WithComponentModelAsync"/>.</exception>
+        public void SetEpochDeadlineAsyncYieldAndUpdate(ulong ticksBeyondCurrent)
+        {
+            ThrowIfNotAsync();
+            Context.SetEpochDeadlineAsyncYieldAndUpdate(ticksBeyondCurrent);
+            epochAsyncYields = true;
+            System.GC.KeepAlive(this);
+        }
+
+        /// <summary>
+        /// Configures asynchronous calls to suspend each time the given amount of fuel has been
+        /// consumed, so long-running WebAssembly periodically returns control to the .NET caller.
+        /// </summary>
+        /// <param name="interval">The amount of fuel consumed between suspensions, or 0 to disable.</param>
+        /// <remarks>
+        /// Requires an engine configured with fuel consumption and <see cref="Config.WithComponentModelAsync"/>. No
+        /// managed code runs on the WebAssembly stack. Every suspension costs a round trip
+        /// through the .NET scheduler, so prefer intervals of at least a few hundred thousand.
+        /// </remarks>
+        /// <exception cref="InvalidOperationException">The engine was not configured with <see cref="Config.WithComponentModelAsync"/>.</exception>
+        /// <exception cref="WasmtimeException">The engine does not consume fuel.</exception>
+        public void SetFuelAsyncYieldInterval(ulong interval)
+        {
+            ThrowIfNotAsync();
+            Context.SetFuelAsyncYieldInterval(interval);
+            fuelAsyncYields = interval != 0;
+            System.GC.KeepAlive(this);
+        }
+
+        /// <summary>
+        /// True when asynchronous calls may suspend at epoch or fuel yield points, so a poll that
+        /// makes no progress can be resumed immediately.
+        /// </summary>
+        internal bool AsyncYieldsEnabled => epochAsyncYields || fuelAsyncYields;
+
+        private void ThrowIfNotAsync()
+        {
+            if (!IsComponentModelAsyncEnabled)
+            {
+                throw new InvalidOperationException(
+                    "Yielding requires an engine configured with Config.WithComponentModelAsync(true).");
+            }
+        }
+
+        /// <summary>
         /// Retrieves the data stored in the Store context
         /// </summary>
         public object? GetData() => data;
@@ -270,8 +354,15 @@ namespace Wasmtime
         /// <param name="store">The store whose epoch deadline was reached.</param>
         /// <returns>The new deadline, in ticks beyond the current epoch, after which execution resumes.</returns>
         /// <remarks>
+        /// <para>
         /// The callback runs on the thread executing the WebAssembly code. Throwing from it terminates
         /// the execution; the exception becomes the InnerException of the resulting <see cref="WasmtimeException"/>.
+        /// </para>
+        /// <para>
+        /// During an asynchronous component call that stack is a Wasmtime fiber, which the .NET runtime
+        /// cannot safely scan. Use <see cref="SetEpochDeadlineAsyncYieldAndUpdate"/> to time-slice
+        /// asynchronous calls instead.
+        /// </para>
         /// </remarks>
         public delegate ulong EpochDeadlineCallback(Store store);
 
@@ -312,13 +403,16 @@ namespace Wasmtime
                     Finalizer
                 );
             }
+
+            epochAsyncYields = false;
         }
 
         private static unsafe IntPtr InvokeEpochDeadlineCallback(EpochDeadlineCallback callback, IntPtr context, ulong* epochDeadlineDelta)
         {
             try
             {
-                // The update kind is left at "continue"; yielding requires async support, which this binding does not enable.
+                // The update kind is left at "continue". Async calls that should yield use
+                // SetEpochDeadlineAsyncYieldAndUpdate, which runs no managed code on the fiber.
                 *epochDeadlineDelta = callback(new StoreContext(context).Store);
                 return IntPtr.Zero;
             }
@@ -381,6 +475,9 @@ namespace Wasmtime
         }
 
         internal bool IsComponentModelAsyncEnabled { get; }
+
+        private bool epochAsyncYields;
+        private bool fuelAsyncYields;
 
         internal void BeginComponentOperation()
         {
