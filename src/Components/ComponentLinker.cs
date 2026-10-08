@@ -230,7 +230,7 @@ public class ComponentLinker
 
             try
             {
-                await ComponentFunction.PollFutureAsync(future, cancellationToken).ConfigureAwait(false);
+                await ComponentFunction.PollFutureAsync(future, store, cancellationToken).ConfigureAwait(false);
                 ComponentFunction.Native.wasmtime_call_future_delete(future);
                 future = IntPtr.Zero;
                 var error = Marshal.ReadIntPtr(errorBuffer);

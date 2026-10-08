@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -288,7 +289,7 @@ public class ComponentFunction
 
             try
             {
-                await PollFutureAsync(future, cancellationToken).ConfigureAwait(false);
+                await PollFutureAsync(future, store, cancellationToken).ConfigureAwait(false);
                 Native.wasmtime_call_future_delete(future);
                 future = IntPtr.Zero;
                 var error = Marshal.ReadIntPtr(errorBuffer);
@@ -334,12 +335,38 @@ public class ComponentFunction
         }
     }
 
-    internal static async Task PollFutureAsync(IntPtr future, CancellationToken cancellationToken)
+    internal static async Task PollFutureAsync(IntPtr future, Store store, CancellationToken cancellationToken)
     {
         while (!Native.wasmtime_call_future_poll(future))
         {
+            if (store.AsyncYieldsEnabled)
+            {
+                // The guest suspended at an epoch or fuel yield point and can resume immediately;
+                // hop through the thread pool so other work gets a turn first.
+                cancellationToken.ThrowIfCancellationRequested();
+                await default(ThreadPoolHop);
+                continue;
+            }
+
             await Task.Delay(1, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private readonly struct ThreadPoolHop : ICriticalNotifyCompletion
+    {
+        public ThreadPoolHop GetAwaiter() => this;
+
+        public bool IsCompleted => false;
+
+        public void GetResult()
+        {
+        }
+
+        public void OnCompleted(Action continuation) =>
+            ThreadPool.QueueUserWorkItem(static state => ((Action)state!)(), continuation);
+
+        public void UnsafeOnCompleted(Action continuation) =>
+            ThreadPool.UnsafeQueueUserWorkItem(static state => ((Action)state!)(), continuation);
     }
 
     private static bool ReadHasResult(IntPtr type)
