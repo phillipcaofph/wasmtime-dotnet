@@ -19,9 +19,8 @@ namespace Wasmtime.Components;
 /// corrupts the heap.
 /// </para>
 /// <para>
-/// The native structures are written field by field rather than through the
-/// <c>wasmtime_component_vallist_new</c> family of helpers, because a value must be built in
-/// place inside an array element or a record entry.
+/// Argument values are written into caller-owned storage. Host results use Wasmtime's own
+/// constructors so their nested allocations have the correct owner.
 /// </para>
 /// </remarks>
 internal static class ComponentValueMarshaller
@@ -49,11 +48,6 @@ internal static class ComponentValueMarshaller
     {
         private readonly List<IntPtr> allocations = new List<IntPtr>();
         private bool disposed;
-
-        ~AllocationScope()
-        {
-            FreeAllocations();
-        }
 
         /// <summary>
         /// Allocates zeroed native memory whose lifetime is bound to this scope.
@@ -88,7 +82,6 @@ internal static class ComponentValueMarshaller
 
             disposed = true;
             FreeAllocations();
-            GC.SuppressFinalize(this);
         }
 
         private void FreeAllocations()
@@ -110,43 +103,16 @@ internal static class ComponentValueMarshaller
     /// <param name="scope">The scope owning any secondary allocations the value needs.</param>
     public static void Write(ComponentValue value, IntPtr destination, AllocationScope scope)
     {
+        if (WritePrimitive(value, destination))
+        {
+            return;
+        }
+
         Marshal.WriteByte(destination, (byte)value.Kind);
         var payload = destination + ValuePayloadOffset;
 
         switch (value.Kind)
         {
-            case ComponentValueKind.Bool:
-                Marshal.WriteByte(payload, (byte)(value.Integer != 0 ? 1 : 0));
-                break;
-
-            case ComponentValueKind.S8:
-            case ComponentValueKind.U8:
-                Marshal.WriteByte(payload, unchecked((byte)value.Integer));
-                break;
-
-            case ComponentValueKind.S16:
-            case ComponentValueKind.U16:
-                Marshal.WriteInt16(payload, unchecked((short)value.Integer));
-                break;
-
-            case ComponentValueKind.S32:
-            case ComponentValueKind.U32:
-                Marshal.WriteInt32(payload, unchecked((int)value.Integer));
-                break;
-
-            case ComponentValueKind.F32:
-                Marshal.WriteInt32(payload, Extensions.SingleToInt32Bits((float)value.Real));
-                break;
-
-            case ComponentValueKind.S64:
-            case ComponentValueKind.U64:
-                Marshal.WriteInt64(payload, value.Integer);
-                break;
-
-            case ComponentValueKind.F64:
-                Marshal.WriteInt64(payload, BitConverter.DoubleToInt64Bits(value.Real));
-                break;
-
             case ComponentValueKind.String:
             case ComponentValueKind.Enum:
                 WriteName(value.Text ?? string.Empty, payload, scope);
@@ -185,17 +151,232 @@ internal static class ComponentValueMarshaller
     /// <param name="value">The value to write.</param>
     /// <param name="destination">A pointer to <see cref="ValueSize"/> bytes of storage.</param>
     /// <remarks>
-    /// The value is first built with our own allocator and then deep-copied by Wasmtime, so that
-    /// every heap payload it ends up owning came from its own allocator. The extra copy is the
-    /// price of not having to mirror each vec constructor.
+    /// Heap-backed values are constructed with Wasmtime's allocator so Wasmtime can safely
+    /// deallocate the result after the host callback returns.
     /// </remarks>
     public static void WriteOwned(ComponentValue value, IntPtr destination)
     {
-        using (var scope = new AllocationScope())
+        ClearValue(destination);
+        try
         {
-            var scratch = scope.Allocate(ValueSize);
-            Write(value, scratch, scope);
-            ComponentValueNative.wasmtime_component_val_clone(scratch, destination);
+            if (!WritePrimitive(value, destination))
+            {
+                WriteOwnedHeapValue(value, destination);
+            }
+        }
+        catch
+        {
+            ComponentValueNative.wasmtime_component_val_delete(destination);
+            ClearValue(destination);
+            throw;
+        }
+    }
+
+    private static bool WritePrimitive(ComponentValue value, IntPtr destination)
+    {
+        var payload = destination + ValuePayloadOffset;
+
+        switch (value.Kind)
+        {
+            case ComponentValueKind.Bool:
+                Marshal.WriteByte(payload, (byte)(value.Integer != 0 ? 1 : 0));
+                break;
+
+            case ComponentValueKind.S8:
+            case ComponentValueKind.U8:
+                Marshal.WriteByte(payload, unchecked((byte)value.Integer));
+                break;
+
+            case ComponentValueKind.S16:
+            case ComponentValueKind.U16:
+                Marshal.WriteInt16(payload, unchecked((short)value.Integer));
+                break;
+
+            case ComponentValueKind.S32:
+            case ComponentValueKind.U32:
+                Marshal.WriteInt32(payload, unchecked((int)value.Integer));
+                break;
+
+            case ComponentValueKind.F32:
+                Marshal.WriteInt32(payload, Extensions.SingleToInt32Bits((float)value.Real));
+                break;
+
+            case ComponentValueKind.S64:
+            case ComponentValueKind.U64:
+                Marshal.WriteInt64(payload, value.Integer);
+                break;
+
+            case ComponentValueKind.F64:
+                Marshal.WriteInt64(payload, BitConverter.DoubleToInt64Bits(value.Real));
+                break;
+
+            default:
+                return false;
+        }
+
+        Marshal.WriteByte(destination, (byte)value.Kind);
+        return true;
+    }
+
+    private static void WriteOwnedHeapValue(ComponentValue value, IntPtr destination)
+    {
+        var payload = destination + ValuePayloadOffset;
+
+        switch (value.Kind)
+        {
+            case ComponentValueKind.String:
+            case ComponentValueKind.Enum:
+                Marshal.WriteByte(destination, (byte)value.Kind);
+                WriteOwnedName(value.Text ?? string.Empty, payload);
+                break;
+
+            case ComponentValueKind.List:
+            case ComponentValueKind.Tuple:
+                WriteOwnedVector(value.Items, destination, value.Kind);
+                break;
+
+            case ComponentValueKind.Record:
+                WriteOwnedRecord(value.Fields, destination);
+                break;
+
+            case ComponentValueKind.Option:
+                Marshal.WriteByte(destination, (byte)value.Kind);
+                if (value.Flag)
+                {
+                    Marshal.WriteIntPtr(payload, WriteOwnedBoxed(value.Payload!));
+                }
+
+                break;
+
+            case ComponentValueKind.Result:
+                Marshal.WriteByte(destination, (byte)value.Kind);
+                Marshal.WriteByte(payload, (byte)(value.Flag ? 1 : 0));
+                if (value.Payload is not null)
+                {
+                    Marshal.WriteIntPtr(payload + VectorDataOffset, WriteOwnedBoxed(value.Payload));
+                }
+
+                break;
+
+            default:
+                throw new NotSupportedException(
+                    $"Writing component values of kind {value.Kind} is not supported.");
+        }
+    }
+
+    private static void WriteOwnedName(string text, IntPtr destination)
+    {
+        var byteCount = Encoding.UTF8.GetByteCount(text);
+        ComponentValueNative.wasm_byte_vec_new_uninitialized(destination, (nuint)byteCount);
+
+        var data = Marshal.ReadIntPtr(destination + VectorDataOffset);
+        unsafe
+        {
+            fixed (char* textPtr = text)
+            {
+                Encoding.UTF8.GetBytes(textPtr, text.Length, (byte*)data, byteCount);
+            }
+        }
+    }
+
+    private static void WriteOwnedVector(
+        IReadOnlyList<ComponentValue> items,
+        IntPtr destination,
+        ComponentValueKind kind)
+    {
+        var count = items.Count;
+        checked
+        {
+            _ = count * ValueSize;
+        }
+
+        Marshal.WriteByte(destination, (byte)kind);
+        var vector = destination + ValuePayloadOffset;
+        if (kind == ComponentValueKind.List)
+        {
+            ComponentValueNative.wasmtime_component_vallist_new_uninit(vector, (nuint)count);
+        }
+        else
+        {
+            ComponentValueNative.wasmtime_component_valtuple_new_uninit(vector, (nuint)count);
+        }
+
+        var element = Marshal.ReadIntPtr(vector + VectorDataOffset);
+        for (var i = 0; i < count; i++)
+        {
+            ClearValue(element + (i * ValueSize));
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            WriteOwned(items[i], element + (i * ValueSize));
+        }
+    }
+
+    private static void WriteOwnedRecord(
+        IReadOnlyList<KeyValuePair<string, ComponentValue>> fields,
+        IntPtr destination)
+    {
+        var count = fields.Count;
+        checked
+        {
+            _ = count * RecordEntrySize;
+        }
+
+        Marshal.WriteByte(destination, (byte)ComponentValueKind.Record);
+        var vector = destination + ValuePayloadOffset;
+        ComponentValueNative.wasmtime_component_valrecord_new_uninit(vector, (nuint)count);
+
+        var entry = Marshal.ReadIntPtr(vector + VectorDataOffset);
+        for (var i = 0; i < count; i++)
+        {
+            unsafe
+            {
+                new Span<byte>((void*)(entry + (i * RecordEntrySize)), RecordEntrySize).Clear();
+            }
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            var currentEntry = entry + (i * RecordEntrySize);
+            WriteOwnedName(fields[i].Key, currentEntry);
+            WriteOwned(fields[i].Value, currentEntry + RecordEntryValueOffset);
+        }
+    }
+
+    private static IntPtr WriteOwnedBoxed(ComponentValue value)
+    {
+        unsafe
+        {
+            var boxed = stackalloc byte[ValueSize];
+            var pointer = (IntPtr)boxed;
+            ClearValue(pointer);
+
+            var initialized = false;
+            try
+            {
+                WriteOwned(value, pointer);
+                initialized = true;
+
+                var owned = ComponentValueNative.wasmtime_component_val_new(pointer);
+                initialized = false;
+                return owned;
+            }
+            finally
+            {
+                if (initialized)
+                {
+                    ComponentValueNative.wasmtime_component_val_delete(pointer);
+                }
+            }
+        }
+    }
+
+    private static void ClearValue(IntPtr value)
+    {
+        unsafe
+        {
+            new Span<byte>((void*)value, ValueSize).Clear();
         }
     }
 
@@ -284,13 +465,19 @@ internal static class ComponentValueMarshaller
 
     private static void WriteName(string text, IntPtr destination, AllocationScope scope)
     {
-        var bytes = Encoding.UTF8.GetBytes(text);
+        var byteCount = Encoding.UTF8.GetByteCount(text);
 
         // A zero-length allocation would still need a non-null pointer, so always take at least one byte.
-        var buffer = scope.Allocate(Math.Max(bytes.Length, 1));
-        Marshal.Copy(bytes, 0, buffer, bytes.Length);
+        var buffer = scope.Allocate(Math.Max(byteCount, 1));
+        unsafe
+        {
+            fixed (char* textPtr = text)
+            {
+                Encoding.UTF8.GetBytes(textPtr, text.Length, (byte*)buffer, byteCount);
+            }
+        }
 
-        Marshal.WriteIntPtr(destination, (IntPtr)bytes.Length);
+        Marshal.WriteIntPtr(destination, (IntPtr)byteCount);
         Marshal.WriteIntPtr(destination + VectorDataOffset, buffer);
     }
 

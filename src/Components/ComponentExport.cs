@@ -1,9 +1,13 @@
-﻿using Microsoft.Win32.SafeHandles;
-using System;
+﻿using System;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace Wasmtime.Components;
 
+/// <summary>
+/// The index of an export within a <see cref="Component"/> or <see cref="ComponentInstance"/>,
+/// used to look the export up without repeating a name search.
+/// </summary>
 public class ComponentExport
     : IDisposable
 {

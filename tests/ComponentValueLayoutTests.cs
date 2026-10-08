@@ -284,11 +284,26 @@ namespace Wasmtime.Tests
                 ComponentValue.String("a host-allocated string"),
                 ComponentValue.String(string.Empty),
                 ComponentValue.Enum("warning"),
+                ComponentValue.List([]),
                 ComponentValue.List(new[] { ComponentValue.String("a"), ComponentValue.String("b") }),
+                ComponentValue.Tuple(new[] { ComponentValue.S32(3), ComponentValue.String("tuple") }),
                 ComponentValue.Record(new[]
                 {
                     new KeyValuePair<string, ComponentValue>("name", ComponentValue.String("x")),
                     new KeyValuePair<string, ComponentValue>("value", ComponentValue.F64(1.5)),
+                }),
+                ComponentValue.Record(new[]
+                {
+                    new KeyValuePair<string, ComponentValue>("items", ComponentValue.List(new[]
+                    {
+                        ComponentValue.Some(ComponentValue.String("nested")),
+                        ComponentValue.None(),
+                    })),
+                    new KeyValuePair<string, ComponentValue>("result", ComponentValue.Ok(ComponentValue.Tuple(new[]
+                    {
+                        ComponentValue.U16(12),
+                        ComponentValue.String("done"),
+                    }))),
                 }),
                 ComponentValue.Some(ComponentValue.String("boxed")),
                 ComponentValue.None(),

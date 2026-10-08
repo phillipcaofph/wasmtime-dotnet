@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -179,16 +180,24 @@ public sealed class ComponentLinkerInstance : IDisposable
         IntPtr results,
         int resultCount)
     {
+        ComponentValue[]? arguments = null;
+        ComponentValue[]? produced = null;
+
         try
         {
-            var arguments = argumentCount == 0 ? Array.Empty<ComponentValue>() : new ComponentValue[argumentCount];
+            arguments = argumentCount == 0
+                ? Array.Empty<ComponentValue>()
+                : ArrayPool<ComponentValue>.Shared.Rent(argumentCount);
             for (var i = 0; i < argumentCount; i++)
             {
                 arguments[i] = ComponentValueMarshaller.Read(args + (i * ComponentValueMarshaller.ValueSize));
             }
 
-            var produced = resultCount == 0 ? Array.Empty<ComponentValue>() : new ComponentValue[resultCount];
-            callback(arguments, produced);
+            produced = resultCount == 0
+                ? Array.Empty<ComponentValue>()
+                : ArrayPool<ComponentValue>.Shared.Rent(resultCount);
+            Array.Clear(produced, 0, resultCount);
+            callback(arguments.AsSpan(0, argumentCount), produced.AsSpan(0, resultCount));
 
             for (var i = 0; i < resultCount; i++)
             {
@@ -208,6 +217,18 @@ public sealed class ComponentLinkerInstance : IDisposable
         catch (Exception ex)
         {
             return HandleCallbackException(ex);
+        }
+        finally
+        {
+            if (arguments is { Length: > 0 })
+            {
+                ArrayPool<ComponentValue>.Shared.Return(arguments, clearArray: true);
+            }
+
+            if (produced is { Length: > 0 })
+            {
+                ArrayPool<ComponentValue>.Shared.Return(produced, clearArray: true);
+            }
         }
     }
 

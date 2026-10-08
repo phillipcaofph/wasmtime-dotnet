@@ -1,4 +1,5 @@
 ﻿using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -103,6 +104,23 @@ public class Component
     }
 
     /// <summary>
+    /// Creates a <see cref="Component"/> from a file in the WebAssembly text format.
+    /// </summary>
+    /// <param name="engine">The engine to use for the component.</param>
+    /// <param name="path">The path to the file.</param>
+    /// <returns>Returns a new <see cref="Component"/>.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if an argument is null.</exception>
+    public static Component FromTextFile(Engine engine, string path)
+    {
+        if (path is null)
+        {
+            throw new ArgumentNullException(nameof(path));
+        }
+
+        return FromText(engine, File.ReadAllText(path));
+    }
+
+    /// <summary>
     /// This function serializes compiled component artifacts as blob data.
     /// </summary>
     /// <returns>If the conversion is successful, the serialized compiled component.</returns>
@@ -170,22 +188,59 @@ public class Component
         return new Component(handle);
     }
 
+    /// <summary>
+    /// Looks up an export of this component by name.
+    /// </summary>
+    /// <param name="name">The name of the export.</param>
+    /// <returns>The export index, or null if there is no such export.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="name"/> is null.</exception>
     public ComponentExport? GetExport(string name)
     {
-        var ret = Native.wasmtime_component_get_export_index(NativeHandle, null, name, (nuint)name.Length);
-        if (ret == IntPtr.Zero)
-            return null;
-
-        return new ComponentExport(ret);
+        return GetExport(name, null);
     }
 
-    public ComponentExport? GetExport(string name, ComponentExport instance_export_index)
+    /// <summary>
+    /// Looks up an export of this component by name, within an exported instance.
+    /// </summary>
+    /// <param name="name">The name of the export.</param>
+    /// <param name="instance_export_index">The instance export to look within, or null for the root.</param>
+    /// <returns>The export index, or null if there is no such export.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="name"/> is null.</exception>
+    public ComponentExport? GetExport(string name, ComponentExport? instance_export_index)
     {
-        var ret = Native.wasmtime_component_get_export_index(NativeHandle, instance_export_index.NativeHandle, name, (nuint)name.Length);
-        if (ret == IntPtr.Zero)
-            return null;
+        if (name is null)
+        {
+            throw new ArgumentNullException(nameof(name));
+        }
 
-        return new ComponentExport(ret);
+        // The parent is optional, and a null SafeHandle cannot be marshalled, so pass it as a raw pointer.
+        var parentHandle = instance_export_index?.NativeHandle;
+        var parentHandleAddedRef = false;
+        var nameBytes = Encoding.UTF8.GetBytes(name);
+
+        try
+        {
+            parentHandle?.DangerousAddRef(ref parentHandleAddedRef);
+            var parent = parentHandle?.DangerousGetHandle() ?? IntPtr.Zero;
+
+            unsafe
+            {
+                fixed (byte* namePtr = nameBytes)
+                {
+                    var ret = Native.wasmtime_component_get_export_index(
+                        NativeHandle, parent, namePtr, (nuint)nameBytes.Length);
+
+                    return ret == IntPtr.Zero ? null : new ComponentExport(ret);
+                }
+            }
+        }
+        finally
+        {
+            if (parentHandleAddedRef)
+            {
+                parentHandle!.DangerousRelease();
+            }
+        }
     }
 
     internal class Handle
@@ -222,6 +277,9 @@ public class Component
         public static extern IntPtr wasmtime_component_deserialize_file(Engine.Handle engine, string path, out IntPtr handle);
 
         [DllImport(Engine.LibraryName)]
-        public static extern IntPtr wasmtime_component_get_export_index(Handle component, ComponentExport.Handle? instance_export_index, string name, nuint name_len);
+        public static extern unsafe IntPtr wasmtime_component_get_export_index(Handle component, IntPtr instance_export_index, byte* name, nuint name_len);
+
+        [DllImport(Engine.LibraryName)]
+        public static extern unsafe IntPtr wasmtime_wat2wasm(byte* text, nuint len, out ByteArray bytes);
     }
 }
