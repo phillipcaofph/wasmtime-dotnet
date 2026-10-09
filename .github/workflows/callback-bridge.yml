@@ -1,0 +1,89 @@
+name: Host callback isolation library
+on:
+  workflow_call:
+    inputs:
+      artifact-prefix:
+        description: Prefix for the per-RID artifacts
+        type: string
+        default: callback-bridge
+  pull_request:
+    paths:
+      - 'src/native/callback-bridge/**'
+      - '.github/workflows/callback-bridge.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Native regression tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Build and test
+        shell: bash
+        run: |
+          cmake -S src/native/callback-bridge -B build-tests -DCMAKE_BUILD_TYPE=Release -DCALLBACK_BRIDGE_BUILD_TESTS=ON
+          cmake --build build-tests --config Release
+          ctest --test-dir build-tests -C Release --output-on-failure
+
+  build:
+    name: Build ${{ matrix.rid }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: linux-x64
+            os: ubuntu-22.04
+            library: libwasmtime_callback_bridge.so
+          - rid: linux-arm64
+            os: ubuntu-22.04-arm
+            library: libwasmtime_callback_bridge.so
+          - rid: osx-x64
+            os: macos-15
+            library: libwasmtime_callback_bridge.dylib
+            cmake-args: -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+          - rid: osx-arm64
+            os: macos-15
+            library: libwasmtime_callback_bridge.dylib
+            cmake-args: -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          - rid: win-x64
+            os: windows-2025
+            library: wasmtime_callback_bridge.dll
+            cmake-args: -A x64
+          - rid: win-arm64
+            os: windows-2025
+            library: wasmtime_callback_bridge.dll
+            cmake-args: -A ARM64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Build
+        shell: bash
+        run: |
+          cmake -S src/native/callback-bridge -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake-args }}
+          cmake --build build --config Release
+          mkdir -p "artifact/${{ matrix.rid }}"
+          cp "build/out/${{ matrix.library }}" "artifact/${{ matrix.rid }}/"
+      - name: Check exports
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          lib="artifact/${{ matrix.rid }}/${{ matrix.library }}"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            lipo -info "$lib"
+            nm -gU "$lib" | grep -q _bridge_set_store_op
+          else
+            nm -D --defined-only "$lib" | grep -q bridge_set_store_op
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.artifact-prefix || 'callback-bridge' }}-${{ matrix.rid }}
+          path: artifact
+          if-no-files-found: error

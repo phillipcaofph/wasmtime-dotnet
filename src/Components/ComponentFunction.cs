@@ -1,6 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Wasmtime.Components;
 
@@ -82,17 +87,34 @@ public class ComponentFunction
             throw new ArgumentNullException(nameof(arguments));
         }
 
+        // Count is read once, so a list that changes cannot desynchronize validation and marshalling.
         var argumentCount = arguments.Count;
-        if (argumentCount != ParameterCount)
+        ValidateArguments(arguments, argumentCount);
+        store.BeginComponentOperation();
+        Exception? failure;
+        ComponentValue? result;
+        try
         {
-            throw new ArgumentException(
-                $"The function takes {ParameterCount} argument(s) but {argumentCount} were given.",
-                nameof(arguments));
+            failure = CallCore(arguments, argumentCount, out result);
+        }
+        finally
+        {
+            store.EndComponentOperation();
         }
 
-        var resultCount = HasResult ? 1 : 0;
+        ThrowIfFailed(failure);
+        return result;
+    }
 
-        using (var scope = new ComponentValueMarshaller.AllocationScope())
+    /// <summary>Calls the function, returning the failure instead of throwing it.</summary>
+    /// <remarks>See <see cref="ThrowIfFailed"/> for why failures are not thrown through cleanup.</remarks>
+    private Exception? CallCore(IReadOnlyList<ComponentValue> arguments, int argumentCount, out ComponentValue? result)
+    {
+        result = null;
+        var resultCount = HasResult ? 1 : 0;
+        var scope = new ComponentValueMarshaller.AllocationScope();
+        Exception? failure = null;
+        try
         {
             var argumentBuffer = IntPtr.Zero;
             if (argumentCount > 0)
@@ -100,11 +122,6 @@ public class ComponentFunction
                 argumentBuffer = scope.Allocate(argumentCount * ComponentValueMarshaller.ValueSize);
                 for (var i = 0; i < argumentCount; i++)
                 {
-                    if (arguments[i] is null)
-                    {
-                        throw new ArgumentException($"Argument {i} is null.", nameof(arguments));
-                    }
-
                     ComponentValueMarshaller.Write(
                         arguments[i],
                         argumentBuffer + (i * ComponentValueMarshaller.ValueSize),
@@ -118,9 +135,10 @@ public class ComponentFunction
                 ? IntPtr.Zero
                 : scope.Allocate(resultCount * ComponentValueMarshaller.ValueSize);
 
+            var context = store.Context.handle;
             var error = Native.wasmtime_component_func_call(
                 in func,
-                store.Context.handle,
+                context,
                 argumentBuffer,
                 (nuint)argumentCount,
                 resultBuffer,
@@ -130,23 +148,298 @@ public class ComponentFunction
 
             if (error != IntPtr.Zero)
             {
-                throw WasmtimeException.FromOwnedError(error);
+                failure = HostCallbackDispatcher.AttachCause(WasmtimeException.FromOwnedError(error), context);
             }
-
-            if (resultCount == 0)
+            else if (resultCount != 0)
             {
-                return null;
-            }
-
-            try
-            {
-                return ComponentValueMarshaller.Read(resultBuffer);
-            }
-            finally
-            {
-                ComponentValueNative.wasmtime_component_val_delete(resultBuffer);
+                failure = ReadResult(resultBuffer, out result);
             }
         }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        scope.Dispose();
+        return failure;
+    }
+
+    private void ValidateArguments(IReadOnlyList<ComponentValue> arguments, int argumentCount)
+    {
+        if (argumentCount != ParameterCount)
+        {
+            throw new ArgumentException(
+                $"The function takes {ParameterCount} argument(s) but {argumentCount} were given.",
+                nameof(arguments));
+        }
+
+        for (var i = 0; i < argumentCount; i++)
+        {
+            if (arguments[i] is null)
+            {
+                throw new ArgumentException($"Argument {i} is null.", nameof(arguments));
+            }
+        }
+    }
+
+    /// <summary>Reads and then deletes a result Wasmtime wrote, returning a failure instead of throwing.</summary>
+    private static Exception? ReadResult(IntPtr resultBuffer, out ComponentValue? result)
+    {
+        result = null;
+        Exception? failure = null;
+        try
+        {
+            result = ComponentValueMarshaller.Read(resultBuffer);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        ComponentValueNative.wasmtime_component_val_delete(resultBuffer);
+        return failure;
+    }
+
+    /// <summary>
+    /// Rethrows a failure captured by a component operation, once all of its cleanup has run.
+    /// </summary>
+    /// <remarks>
+    /// Component calls and instantiation never throw through cleanup that calls native code. On
+    /// .NET 9, a garbage collection while a <c>finally</c> block runs during exception unwinding can
+    /// leave a stale object reference in the enclosing method's frame, which a later cleanup step
+    /// then dereferences. Capturing the failure, cleaning up on the normal path and rethrowing
+    /// afterwards avoids that, and the original stack trace is preserved.
+    /// </remarks>
+    internal static void ThrowIfFailed(Exception? failure)
+    {
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    }
+
+    /// <summary>
+    /// Invokes this function using Wasmtime's asynchronous component API.
+    /// </summary>
+    /// <param name="arguments">The arguments, which must match <see cref="ParameterCount"/>.</param>
+    /// <returns>The result, or null if the function does not return one.</returns>
+    /// <exception cref="InvalidOperationException">The engine was not configured for async components.</exception>
+    /// <exception cref="ArgumentException">The wrong number of arguments was given.</exception>
+    /// <exception cref="WasmtimeException">The function traps or fails.</exception>
+    /// <remarks>
+    /// The engine must be configured with <see cref="Config.WithComponentModelAsync(bool)"/>.
+    /// Do not use this store for any other operation until the returned task completes.
+    /// Cancellation disposes the native call future; it does not roll back guest side effects.
+    /// The guest runs on a Wasmtime fiber stack. Host functions are isolated from it by default;
+    /// see <see cref="ComponentLinker.IsolateHostCallbacks"/>.
+    /// </remarks>
+    public Task<ComponentValue?> CallAsync(params ComponentValue[] arguments) =>
+        CallAsync((IReadOnlyList<ComponentValue>)arguments, CancellationToken.None);
+
+    /// <summary>
+    /// Invokes this function using Wasmtime's asynchronous component API.
+    /// </summary>
+    /// <param name="arguments">The arguments, which must match <see cref="ParameterCount"/>.</param>
+    /// <param name="cancellationToken">A token that cancels polling and disposes the native call future.</param>
+    /// <returns>The result, or null if the function does not return one.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="arguments"/> is null.</exception>
+    /// <exception cref="ArgumentException">Thrown if the wrong number of arguments is given.</exception>
+    /// <exception cref="OperationCanceledException">The call was canceled while polling.</exception>
+    /// <exception cref="WasmtimeException">The function traps or fails.</exception>
+    /// <remarks>
+    /// Do not use this store for any other operation until the returned task completes.
+    /// The guest runs on a Wasmtime fiber stack. Host functions are isolated from it by default;
+    /// see <see cref="ComponentLinker.IsolateHostCallbacks"/>.
+    /// </remarks>
+    public async Task<ComponentValue?> CallAsync(
+        IReadOnlyList<ComponentValue> arguments,
+        CancellationToken cancellationToken = default)
+    {
+        if (arguments is null)
+        {
+            throw new ArgumentNullException(nameof(arguments));
+        }
+
+        if (!store.IsComponentModelAsyncEnabled)
+        {
+            throw new InvalidOperationException(
+                "Asynchronous component calls require an engine configured with WithComponentModelAsync(true).");
+        }
+
+        var argumentCount = arguments.Count;
+        ValidateArguments(arguments, argumentCount);
+        cancellationToken.ThrowIfCancellationRequested();
+        store.BeginComponentOperation();
+
+        // Failures are captured and rethrown once cleanup has run; see ThrowIfFailed.
+        var resultCount = HasResult ? 1 : 0;
+        var scope = new ComponentValueMarshaller.AllocationScope();
+        var errorBuffer = Marshal.AllocHGlobal(IntPtr.Size);
+        Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
+        var future = IntPtr.Zero;
+        ComponentValue? result = null;
+        Exception? failure = null;
+        try
+        {
+            // The native future borrows this struct until deletion, beyond the P/Invoke's pin.
+            var functionBuffer = scope.Allocate(Marshal.SizeOf<Native.Func>());
+            Marshal.StructureToPtr(func, functionBuffer, false);
+            var argumentBuffer = argumentCount == 0
+                ? IntPtr.Zero
+                : scope.Allocate(checked(argumentCount * ComponentValueMarshaller.ValueSize));
+            for (var i = 0; i < argumentCount; i++)
+            {
+                ComponentValueMarshaller.Write(
+                    arguments[i],
+                    argumentBuffer + (i * ComponentValueMarshaller.ValueSize),
+                    scope);
+            }
+
+            var resultBuffer = resultCount == 0
+                ? IntPtr.Zero
+                : scope.Allocate(ComponentValueMarshaller.ValueSize);
+
+            var context = store.Context.handle;
+            future = Native.wasmtime_component_func_call_async(
+                functionBuffer,
+                context,
+                argumentBuffer,
+                (nuint)argumentCount,
+                resultBuffer,
+                (nuint)resultCount,
+                errorBuffer);
+
+            if (future == IntPtr.Zero)
+            {
+                var error = Marshal.ReadIntPtr(errorBuffer);
+                Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
+                failure = error != IntPtr.Zero
+                    ? WasmtimeException.FromOwnedError(error)
+                    : new InvalidOperationException("Wasmtime failed to create an asynchronous component call.");
+            }
+            else
+            {
+                await PollFutureAsync(future, store, context, cancellationToken).ConfigureAwait(false);
+                Native.wasmtime_call_future_delete(future);
+                future = IntPtr.Zero;
+                var error = Marshal.ReadIntPtr(errorBuffer);
+                if (error != IntPtr.Zero)
+                {
+                    Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
+                    failure = HostCallbackDispatcher.AttachCause(WasmtimeException.FromOwnedError(error), context);
+                }
+                else
+                {
+                    if (resultCount != 0)
+                    {
+                        failure = ReadResult(resultBuffer, out result);
+                    }
+
+                    failure ??= HostCallbackDispatcher.TakeLateHostFailure(context);
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        if (future != IntPtr.Zero)
+        {
+            Native.wasmtime_call_future_delete(future);
+        }
+
+        var pendingError = Marshal.ReadIntPtr(errorBuffer);
+        if (pendingError != IntPtr.Zero)
+        {
+            Native.wasmtime_error_delete(pendingError);
+        }
+
+        Marshal.FreeHGlobal(errorBuffer);
+        scope.Dispose();
+        GC.KeepAlive(this);
+        GC.KeepAlive(store);
+        store.EndComponentOperation();
+        ThrowIfFailed(failure);
+        return result;
+    }
+
+    internal static async Task PollFutureAsync(IntPtr future, Store store, IntPtr context, CancellationToken cancellationToken)
+    {
+        // The poll session is disposed on the normal path; see ThrowIfFailed.
+        var owner = HostCallbackDispatcher.BeginPolling(context);
+        Exception? failure = null;
+        try
+        {
+            var backoff = new PollBackoff();
+            var fuel = store.FuelAsyncYieldsEnabled ? store.Context.GetFuel() : 0;
+            while (true)
+            {
+                // Wasmtime does not borrow the Store between polls, so callbacks' Store operations run here.
+                owner?.Serve();
+                var started = Stopwatch.GetTimestamp();
+                if (Native.wasmtime_call_future_poll(future))
+                {
+                    break;
+                }
+
+                if (store.AsyncYieldsEnabled && !HostCallbackDispatcher.HasPendingWork(context))
+                {
+                    // The guest may have suspended at an epoch or fuel yield point, so it can resume
+                    // immediately; hop through the thread pool so other work gets a turn first.
+                    var progressed = PollBackoff.RanGuest(Stopwatch.GetTimestamp() - started) |
+                        ConsumedFuel(store, ref fuel);
+                    if (backoff.ShouldHop(progressed))
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        await default(ThreadPoolHop);
+                        continue;
+                    }
+                }
+
+                var signalled = await HostCallbackDispatcher
+                    .WaitForProgressAsync(context, backoff.Delay, cancellationToken)
+                    .ConfigureAwait(false);
+                backoff.OnWaited(signalled);
+            }
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        owner?.Dispose();
+        ThrowIfFailed(failure);
+    }
+
+    /// <summary>True when the guest consumed fuel since <paramref name="fuel"/> was last read.</summary>
+    private static bool ConsumedFuel(Store store, ref ulong fuel)
+    {
+        if (!store.FuelAsyncYieldsEnabled)
+        {
+            return false;
+        }
+
+        var previous = fuel;
+        fuel = store.Context.GetFuel();
+        return fuel < previous;
+    }
+
+    private readonly struct ThreadPoolHop : ICriticalNotifyCompletion
+    {
+        public ThreadPoolHop GetAwaiter() => this;
+
+        public bool IsCompleted => false;
+
+        public void GetResult()
+        {
+        }
+
+        public void OnCompleted(Action continuation) =>
+            ThreadPool.QueueUserWorkItem(static state => ((Action)state!)(), continuation);
+
+        public void UnsafeOnCompleted(Action continuation) =>
+            ThreadPool.UnsafeQueueUserWorkItem(static state => ((Action)state!)(), continuation);
     }
 
     private static bool ReadHasResult(IntPtr type)
@@ -177,9 +470,9 @@ public class ComponentFunction
     {
         /// <summary>
         /// Mirrors <c>wasmtime_component_func_t</c>. The first two fields sit in an anonymous
-        /// struct, so the trailing field lands at offset 16 and the whole thing is 24 bytes.
+        /// struct, so the trailing fields land at offsets 16 and 24 and the whole thing is 32 bytes.
         /// </summary>
-        [StructLayout(LayoutKind.Explicit, Size = 24)]
+        [StructLayout(LayoutKind.Explicit, Size = 32)]
         internal struct Func
         {
             [FieldOffset(0)]
@@ -190,6 +483,9 @@ public class ComponentFunction
 
             [FieldOffset(16)]
             public uint Private2;
+
+            [FieldOffset(24)]
+            public IntPtr Private3;
         }
 
         [DllImport(Engine.LibraryName)]
@@ -200,6 +496,26 @@ public class ComponentFunction
             nuint args_size,
             IntPtr results,
             nuint results_size);
+
+        [DllImport(Engine.LibraryName)]
+        public static extern IntPtr wasmtime_component_func_call_async(
+            IntPtr func,
+            IntPtr context,
+            IntPtr args,
+            nuint args_size,
+            IntPtr results,
+            nuint results_size,
+            IntPtr error_ret);
+
+        [DllImport(Engine.LibraryName)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool wasmtime_call_future_poll(IntPtr future);
+
+        [DllImport(Engine.LibraryName)]
+        public static extern void wasmtime_call_future_delete(IntPtr future);
+
+        [DllImport(Engine.LibraryName)]
+        public static extern void wasmtime_error_delete(IntPtr error);
 
         [DllImport(Engine.LibraryName)]
         public static extern IntPtr wasmtime_component_func_type(in Func func, IntPtr context);

@@ -85,8 +85,29 @@ namespace Wasmtime
             Native.wasmtime_context_set_epoch_deadline(handle, deadline);
         }
 
+        internal void SetEpochDeadlineAsyncYieldAndUpdate(ulong ticksBeyondCurrent)
+        {
+            Native.wasmtime_context_epoch_deadline_async_yield_and_update(handle, ticksBeyondCurrent);
+        }
+
+        internal void SetFuelAsyncYieldInterval(ulong interval)
+        {
+            var error = Native.wasmtime_context_fuel_async_yield_interval(handle, interval);
+            if (error != IntPtr.Zero)
+            {
+                throw WasmtimeException.FromOwnedError(error);
+            }
+        }
+
         private static class Native
         {
+            // async.h declares a wasmtime_error_t* result, but the implementation returns nothing.
+            [DllImport(Engine.LibraryName)]
+            public static extern void wasmtime_context_epoch_deadline_async_yield_and_update(IntPtr handle, ulong delta);
+
+            [DllImport(Engine.LibraryName)]
+            public static extern IntPtr wasmtime_context_fuel_async_yield_interval(IntPtr handle, ulong interval);
+
             [DllImport(Engine.LibraryName)]
             public static extern IntPtr wasmtime_context_gc(IntPtr handle);
 
@@ -136,6 +157,7 @@ namespace Wasmtime
                 throw new ArgumentNullException(nameof(engine));
             }
 
+            IsComponentModelAsyncEnabled = engine.IsComponentModelAsyncEnabled;
             this.data = data;
 
             // Allocate a weak GCHandle, so that it does not participate in keeping the Store alive.
@@ -167,14 +189,27 @@ namespace Wasmtime
         {
             get
             {
-                ulong fuel = Context.GetFuel();
+                ulong fuel = 0;
+                if (Components.HostCallbackDispatcher.TryOwnerOperation(
+                        contextHandle, Components.StoreOperation.GetFuel, ref fuel))
+                {
+                    System.GC.KeepAlive(this);
+                    return fuel;
+                }
+
+                fuel = Context.GetFuel();
                 System.GC.KeepAlive(this);
                 return fuel;
             }
 
             set
             {
-                Context.SetFuel(value);
+                if (!Components.HostCallbackDispatcher.TryOwnerOperation(
+                        contextHandle, Components.StoreOperation.SetFuel, ref value))
+                {
+                    Context.SetFuel(value);
+                }
+
                 System.GC.KeepAlive(this);
             }
         }
@@ -229,7 +264,13 @@ namespace Wasmtime
         /// </summary>
         public void GC()
         {
-            Context.GC();
+            ulong unused = 0;
+            if (!Components.HostCallbackDispatcher.TryOwnerOperation(
+                    contextHandle, Components.StoreOperation.GC, ref unused))
+            {
+                Context.GC();
+            }
+
             System.GC.KeepAlive(this);
         }
 
@@ -249,8 +290,79 @@ namespace Wasmtime
         /// <param name="ticksBeyondCurrent"></param>
         public void SetEpochDeadline(ulong ticksBeyondCurrent)
         {
-            Context.SetEpochDeadline(ticksBeyondCurrent);
+            if (!Components.HostCallbackDispatcher.TryOwnerOperation(
+                    contextHandle, Components.StoreOperation.SetEpochDeadline, ref ticksBeyondCurrent))
+            {
+                Context.SetEpochDeadline(ticksBeyondCurrent);
+            }
+
             System.GC.KeepAlive(this);
+        }
+
+        /// <summary>
+        /// Configures the epoch deadline so that reaching it suspends an asynchronous call
+        /// instead of trapping, then moves the deadline <paramref name="ticksBeyondCurrent"/>
+        /// ticks beyond the current epoch.
+        /// </summary>
+        /// <param name="ticksBeyondCurrent">The number of epoch ticks until the next suspension.</param>
+        /// <remarks>
+        /// <para>
+        /// This time-slices asynchronous component calls (<c>ComponentFunction.CallAsync</c> and
+        /// <c>ComponentLinker.InstantiateAsync</c>): each suspension returns control to the .NET
+        /// caller, which resumes the call on the next poll. Unlike
+        /// <see cref="SetEpochDeadlineCallback"/>, no managed code runs on the WebAssembly
+        /// stack, so it is safe with Wasmtime's fiber stacks.
+        /// </para>
+        /// <para>
+        /// Requires an engine configured with epoch interruption and <see cref="Config.WithComponentModelAsync"/>. It
+        /// replaces any epoch deadline callback. Synchronous calls that reach the deadline trap.
+        /// </para>
+        /// </remarks>
+        /// <exception cref="InvalidOperationException">The engine was not configured with <see cref="Config.WithComponentModelAsync"/>.</exception>
+        public void SetEpochDeadlineAsyncYieldAndUpdate(ulong ticksBeyondCurrent)
+        {
+            ThrowIfNotAsync();
+            Context.SetEpochDeadlineAsyncYieldAndUpdate(ticksBeyondCurrent);
+            epochAsyncYields = true;
+            System.GC.KeepAlive(this);
+        }
+
+        /// <summary>
+        /// Configures asynchronous calls to suspend each time the given amount of fuel has been
+        /// consumed, so long-running WebAssembly periodically returns control to the .NET caller.
+        /// </summary>
+        /// <param name="interval">The amount of fuel consumed between suspensions, or 0 to disable.</param>
+        /// <remarks>
+        /// Requires an engine configured with fuel consumption and <see cref="Config.WithComponentModelAsync"/>. No
+        /// managed code runs on the WebAssembly stack. Every suspension costs a round trip
+        /// through the .NET scheduler, so prefer intervals of at least a few hundred thousand.
+        /// </remarks>
+        /// <exception cref="InvalidOperationException">The engine was not configured with <see cref="Config.WithComponentModelAsync"/>.</exception>
+        /// <exception cref="WasmtimeException">The engine does not consume fuel.</exception>
+        public void SetFuelAsyncYieldInterval(ulong interval)
+        {
+            ThrowIfNotAsync();
+            Context.SetFuelAsyncYieldInterval(interval);
+            fuelAsyncYields = interval != 0;
+            System.GC.KeepAlive(this);
+        }
+
+        /// <summary>
+        /// True when asynchronous calls may suspend at epoch or fuel yield points, so a poll that
+        /// makes no progress can be resumed immediately.
+        /// </summary>
+        internal bool AsyncYieldsEnabled => epochAsyncYields || fuelAsyncYields;
+
+        /// <summary>True when asynchronous calls suspend at fuel intervals, so fuel consumption is enabled.</summary>
+        internal bool FuelAsyncYieldsEnabled => fuelAsyncYields;
+
+        private void ThrowIfNotAsync()
+        {
+            if (!IsComponentModelAsyncEnabled)
+            {
+                throw new InvalidOperationException(
+                    "Yielding requires an engine configured with Config.WithComponentModelAsync(true).");
+            }
         }
 
         /// <summary>
@@ -269,8 +381,19 @@ namespace Wasmtime
         /// <param name="store">The store whose epoch deadline was reached.</param>
         /// <returns>The new deadline, in ticks beyond the current epoch, after which execution resumes.</returns>
         /// <remarks>
-        /// The callback runs on the thread executing the WebAssembly code. Throwing from it terminates
+        /// <para>
+        /// The callback normally runs on the thread executing the WebAssembly code. Throwing from it terminates
         /// the execution; the exception becomes the InnerException of the resulting <see cref="WasmtimeException"/>.
+        /// </para>
+        /// <para>
+        /// When the engine enables asynchronous component support and
+        /// <see cref="Components.HostCallbackIsolation.IsSupported"/> is true, the callback instead runs on an
+        /// isolated host callback thread while the WebAssembly stack waits in native code, because that stack
+        /// may be a Wasmtime fiber the .NET runtime cannot safely scan. The store passed to the callback then
+        /// only supports <see cref="Fuel"/>, <see cref="GC()"/> and <see cref="SetEpochDeadline"/>; return the
+        /// new deadline rather than touching other store state. Without isolation, use
+        /// <see cref="SetEpochDeadlineAsyncYieldAndUpdate"/> for asynchronous calls instead.
+        /// </para>
         /// </remarks>
         public delegate ulong EpochDeadlineCallback(Store store);
 
@@ -296,6 +419,13 @@ namespace Wasmtime
                 throw new ArgumentNullException(nameof(callback));
             }
 
+            if (IsComponentModelAsyncEnabled && Components.HostCallbackDispatcher.IsSupported &&
+                Components.HostCallbackDispatcher.SetEpochDeadlineCallback(NativeHandle, callback))
+            {
+                epochAsyncYields = false;
+                return;
+            }
+
             unsafe
             {
                 Native.WasmtimeEpochDeadlineCallback trampoline =
@@ -311,13 +441,16 @@ namespace Wasmtime
                     Finalizer
                 );
             }
+
+            epochAsyncYields = false;
         }
 
-        private static unsafe IntPtr InvokeEpochDeadlineCallback(EpochDeadlineCallback callback, IntPtr context, ulong* epochDeadlineDelta)
+        internal static unsafe IntPtr InvokeEpochDeadlineCallback(EpochDeadlineCallback callback, IntPtr context, ulong* epochDeadlineDelta)
         {
             try
             {
-                // The update kind is left at "continue"; yielding requires async support, which this binding does not enable.
+                // The update kind is left at "continue". Async calls that should yield use
+                // SetEpochDeadlineAsyncYieldAndUpdate, which runs no managed code on the fiber.
                 *epochDeadlineDelta = callback(new StoreContext(context).Store);
                 return IntPtr.Zero;
             }
@@ -351,6 +484,19 @@ namespace Wasmtime
         /// <inheritdoc/>
         public void Dispose()
         {
+            var state = System.Threading.Interlocked.CompareExchange(ref componentOperationState, 2, 0);
+            if (state == 1)
+            {
+                throw new InvalidOperationException(
+                    "A store cannot be disposed while a component operation is in progress.");
+            }
+
+            if (state == 2)
+            {
+                return;
+            }
+
+            Components.HostCallbackDispatcher.ReleaseContext(contextHandle);
             handle.Dispose();
         }
 
@@ -363,9 +509,41 @@ namespace Wasmtime
                     throw new ObjectDisposedException(typeof(Store).FullName);
                 }
 
+                Components.HostCallbackDispatcher.ThrowIfServing(contextHandle);
                 return handle;
             }
         }
+
+        internal bool IsComponentModelAsyncEnabled { get; }
+
+        private bool epochAsyncYields;
+        private bool fuelAsyncYields;
+
+        internal void BeginComponentOperation()
+        {
+            var state = System.Threading.Interlocked.CompareExchange(ref componentOperationState, 1, 0);
+            if (state == 2)
+            {
+                throw new ObjectDisposedException(typeof(Store).FullName);
+            }
+
+            if (state != 0)
+            {
+                throw new InvalidOperationException(
+                    "A component operation is already in progress on this store.");
+            }
+
+            Components.HostCallbackDispatcher.BeginOperation(contextHandle);
+        }
+
+        internal void EndComponentOperation()
+        {
+            Components.HostCallbackDispatcher.EndOperation(contextHandle);
+            System.Threading.Volatile.Write(ref componentOperationState, 0);
+        }
+
+        /// <summary>Gets the native context handle without dispatcher access checks.</summary>
+        internal IntPtr ContextHandleUnchecked => contextHandle;
 
         /// <summary>
         /// Gets the context of the store.
@@ -386,6 +564,7 @@ namespace Wasmtime
                     throw new ObjectDisposedException(typeof(Store).FullName);
                 }
 
+                Components.HostCallbackDispatcher.ThrowIfServing(contextHandle);
                 return new StoreContext(contextHandle);
             }
         }
@@ -434,6 +613,7 @@ namespace Wasmtime
         private readonly Handle handle;
 
         private object? data;
+        private int componentOperationState;
 
         private static readonly Native.Finalizer Finalizer = (p) => GCHandle.FromIntPtr(p).Free();
         

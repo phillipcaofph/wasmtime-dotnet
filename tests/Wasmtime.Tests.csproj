@@ -2,7 +2,9 @@
 
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework Condition="'$(TestTargetFramework)' != ''">$(TestTargetFramework)</TargetFramework>
     <IsPackable>false</IsPackable>
+    <DefaultItemExcludes>$(DefaultItemExcludes);**/bin/**;**/obj/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
@@ -18,7 +20,16 @@
 
   <ItemGroup>
     <ProjectReference Include="..\src\Wasmtime.csproj" />
+    <ProjectReference Include="FiberProbe/Wasmtime.FiberProbe.csproj" ReferenceOutputAssembly="false" />
+    <Compile Remove="FiberProbe/**/*.cs" />
   </ItemGroup>
+
+  <Target Name="CopyFiberProbe" AfterTargets="Build">
+    <ItemGroup>
+      <FiberProbeOutput Include="FiberProbe/bin/$(Configuration)/$(TargetFramework)/*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(FiberProbeOutput)" DestinationFolder="$(OutDir)FiberProbe" />
+  </Target>
 
   <ItemGroup>
     <None Update="Modules/*.wat" CopyToOutputDirectory="PreserveNewest" />

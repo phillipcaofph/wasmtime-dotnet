@@ -7,6 +7,49 @@ namespace Wasmtime.Tests
 {
     public sealed class ConfigTests
     {
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void ItSetsMacosMachPorts(bool enable)
+        {
+            using var config = new Config();
+            config.WithMacosMachPorts(enable);
+        }
+
+        [Fact]
+        public void ItDisablesComponentModelAsyncForDefaultEngines()
+        {
+            using var defaultEngine = new Engine();
+            using var configuredEngine = new Engine(new Config());
+            using var asyncEngine = new Engine(new Config().WithComponentModel(true).WithComponentModelAsync(true));
+
+            defaultEngine.IsComponentModelAsyncEnabled.Should().BeFalse();
+            configuredEngine.IsComponentModelAsyncEnabled.Should().BeFalse();
+            asyncEngine.IsComponentModelAsyncEnabled.Should().BeTrue();
+        }
+
+        [Fact]
+        public void ItRequiresReferenceTypesForComponentModelAsync()
+        {
+            using var config = new Config().WithReferenceTypes(false);
+
+            Action act = () => config.WithComponentModelAsync(true);
+
+            act.Should().Throw<InvalidOperationException>()
+                .WithMessage("Component-model async execution requires WebAssembly reference types.");
+        }
+
+        [Fact]
+        public void ItCannotDisableReferenceTypesAfterEnablingComponentModelAsync()
+        {
+            using var config = new Config().WithComponentModelAsync(true);
+
+            Action act = () => config.WithReferenceTypes(false);
+
+            act.Should().Throw<InvalidOperationException>()
+                .WithMessage("Component-model async execution requires WebAssembly reference types.");
+        }
+
         [Fact]
         public void ItSetsCompilerStrategy()
         {

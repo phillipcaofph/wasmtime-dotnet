@@ -2,6 +2,8 @@ using System;
 using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
 namespace Wasmtime.Components;
@@ -18,6 +20,21 @@ public delegate void ComponentFunctionCallback(
     Span<ComponentValue> results);
 
 /// <summary>
+/// An asynchronous host implementation of a component function.
+/// </summary>
+/// <param name="arguments">A copy of the arguments passed by the guest.</param>
+/// <param name="cancellationToken">Cancelled when Wasmtime drops the pending call.</param>
+/// <returns>The results, one per component function result (an empty array for none).</returns>
+/// <remarks>
+/// The <see cref="Store"/> that called the function cannot be used from the callback or any
+/// of its continuations, except for <see cref="Store.Fuel"/>, <see cref="Store.GC"/> and
+/// <see cref="Store.SetEpochDeadline"/> while the call is running.
+/// </remarks>
+public delegate Task<ComponentValue[]> ComponentAsyncFunctionCallback(
+    ComponentValue[] arguments,
+    CancellationToken cancellationToken);
+
+/// <summary>
 /// An instance being defined within a <see cref="ComponentLinker"/>, used to define names into
 /// a namespace.
 /// </summary>
@@ -30,13 +47,15 @@ public sealed class ComponentLinkerInstance : IDisposable
 {
     private readonly Handle handle;
     private readonly Action onDisposed;
+    private readonly bool isolateHostCallbacks;
     private ComponentLinkerInstance? child;
     private bool disposed;
 
-    internal ComponentLinkerInstance(IntPtr handle, Action onDisposed)
+    internal ComponentLinkerInstance(IntPtr handle, Action onDisposed, bool isolateHostCallbacks = false)
     {
         this.handle = new Handle(handle);
         this.onDisposed = onDisposed;
+        this.isolateHostCallbacks = isolateHostCallbacks;
     }
 
     internal Handle NativeHandle
@@ -86,7 +105,7 @@ public sealed class ComponentLinkerInstance : IDisposable
                     throw WasmtimeException.FromOwnedError(error);
                 }
 
-                child = new ComponentLinkerInstance(nested, () => child = null);
+                child = new ComponentLinkerInstance(nested, () => child = null, isolateHostCallbacks);
                 return child;
             }
         }
@@ -133,6 +152,10 @@ public sealed class ComponentLinkerInstance : IDisposable
     /// </summary>
     /// <param name="name">The name of the function.</param>
     /// <param name="callback">The implementation of the function.</param>
+    /// <remarks>
+    /// When the owning linker had <see cref="ComponentLinker.IsolateHostCallbacks"/> enabled
+    /// before this instance was obtained, the callback runs on an isolated worker thread.
+    /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown if an argument is null.</exception>
     public void DefineFunction(string name, ComponentFunctionCallback callback)
     {
@@ -146,6 +169,59 @@ public sealed class ComponentLinkerInstance : IDisposable
             throw new ArgumentNullException(nameof(callback));
         }
 
+        if (isolateHostCallbacks)
+        {
+            HostCallbackDispatcher.DefineFunction(NativeHandle, name, callback);
+            return;
+        }
+
+        DefineDirectFunction(name, callback);
+    }
+
+    /// <summary>
+    /// Defines a function implemented asynchronously by the host. The callback always runs
+    /// isolated from Wasmtime fiber stacks, see <see cref="HostCallbackIsolation"/>.
+    /// </summary>
+    /// <param name="name">The name of the function.</param>
+    /// <param name="callback">The implementation of the function.</param>
+    /// <remarks>
+    /// <para>
+    /// The guest is suspended while the returned task is pending, so the component must be
+    /// instantiated with <see cref="ComponentLinker.InstantiateAsync"/> on a Store whose engine
+    /// enables asynchronous support, and the function must be called with
+    /// <see cref="ComponentFunction.CallAsync(ComponentValue[])"/>.
+    /// </para>
+    /// <para>
+    /// If the task fails after the guest suspended, Wasmtime cannot trap the call. The guest
+    /// sees placeholder results and the failure is thrown from the pending
+    /// <see cref="ComponentFunction.CallAsync(ComponentValue[])"/> instead; a host import returning <c>bool</c>
+    /// receives a deliberately mistyped value so the call traps.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">Thrown if an argument is null.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// Thrown when <see cref="HostCallbackIsolation.IsSupported"/> is false.
+    /// </exception>
+    public void DefineAsyncFunction(string name, ComponentAsyncFunctionCallback callback)
+    {
+        if (name is null)
+        {
+            throw new ArgumentNullException(nameof(name));
+        }
+
+        if (callback is null)
+        {
+            throw new ArgumentNullException(nameof(callback));
+        }
+
+        HostCallbackDispatcher.DefineAsyncFunction(NativeHandle, name, callback);
+    }
+
+    internal void DefineIsolatedFunction(string name, ComponentFunctionCallback callback) =>
+        HostCallbackDispatcher.DefineFunction(NativeHandle, name, callback);
+
+    internal void DefineDirectFunction(string name, ComponentFunctionCallback callback)
+    {
         var current = NativeHandle;
         var nameBytes = Encoding.UTF8.GetBytes(name);
 
@@ -172,7 +248,7 @@ public sealed class ComponentLinkerInstance : IDisposable
         }
     }
 
-    private static IntPtr Invoke(
+    internal static IntPtr Invoke(
         ComponentFunctionCallback callback,
         string name,
         IntPtr args,
@@ -183,6 +259,9 @@ public sealed class ComponentLinkerInstance : IDisposable
         ComponentValue[]? arguments = null;
         ComponentValue[]? produced = null;
 
+        // The exception is converted after cleanup instead of inside the catch block; see
+        // ComponentFunction.ThrowIfFailed.
+        Exception? failure = null;
         try
         {
             arguments = argumentCount == 0
@@ -211,25 +290,23 @@ public sealed class ComponentLinkerInstance : IDisposable
                     produced[i],
                     results + (i * ComponentValueMarshaller.ValueSize));
             }
-
-            return IntPtr.Zero;
         }
         catch (Exception ex)
         {
-            return HandleCallbackException(ex);
+            failure = ex;
         }
-        finally
-        {
-            if (arguments is { Length: > 0 })
-            {
-                ArrayPool<ComponentValue>.Shared.Return(arguments, clearArray: true);
-            }
 
-            if (produced is { Length: > 0 })
-            {
-                ArrayPool<ComponentValue>.Shared.Return(produced, clearArray: true);
-            }
+        if (arguments is { Length: > 0 })
+        {
+            ArrayPool<ComponentValue>.Shared.Return(arguments, clearArray: true);
         }
+
+        if (produced is { Length: > 0 })
+        {
+            ArrayPool<ComponentValue>.Shared.Return(produced, clearArray: true);
+        }
+
+        return failure is null ? IntPtr.Zero : HandleCallbackException(failure);
     }
 
     /// <summary>
