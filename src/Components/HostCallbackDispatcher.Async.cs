@@ -50,17 +50,14 @@ internal static unsafe partial class HostCallbackDispatcher
     }
 
     /// <summary>
-    /// Throws when a host callback failed after its asynchronous call suspended. Wasmtime's C
-    /// API cannot report such failures, so a call may otherwise appear to succeed.
+    /// Returns the failure of a host callback that failed after its asynchronous call suspended,
+    /// or null. Wasmtime's C API cannot report such failures, so a call may otherwise appear to
+    /// succeed.
     /// </summary>
-    internal static void ThrowIfHostFailed(IntPtr context)
-    {
-        if (initialized && causes.TryRemove(context, out var cause))
-        {
-            throw new WasmtimeException(
-                $"A host import failed after the call suspended: {cause.Message}", cause);
-        }
-    }
+    internal static WasmtimeException? TakeLateHostFailure(IntPtr context) =>
+        initialized && causes.TryRemove(context, out var cause)
+            ? new WasmtimeException($"A host import failed after the call suspended: {cause.Message}", cause)
+            : null;
 
     internal static bool IsContextTracked(IntPtr context) => signals.ContainsKey(context);
 
@@ -285,7 +282,7 @@ internal static unsafe partial class HostCallbackDispatcher
     private static void StartAsync(IntPtr job, Registration registration, IntPtr context, IntPtr type,
         IntPtr args, int nargs, IntPtr staged, int nresults, IntPtr request)
     {
-        Task<ComponentValue[]> task;
+        Task<ComponentValue[]>? task = null;
         var cancellation = new CancellationTokenSource();
         var signal = signals.GetOrAdd(context, key => new ProgressSignal(key));
         // The function type is only valid while the native stub is blocked.
@@ -293,6 +290,8 @@ internal static unsafe partial class HostCallbackDispatcher
         var previousServing = serving.Value;
         var previousSession = session.Value;
         var previous = current;
+        // Failures are handled after the catch block; see ComponentFunction.ThrowIfFailed.
+        Exception? startFailure = null;
         try
         {
             // Wasmtime frees the arguments once the stub returns, so copy them now.
@@ -320,10 +319,7 @@ internal static unsafe partial class HostCallbackDispatcher
         }
         catch (Exception exception)
         {
-            inflight.TryRemove(request, out _);
-            causes[context] = exception;
-            bridge_async_started(job, ComponentLinkerInstance.Native.wasmtime_error_new(exception.Message));
-            return;
+            startFailure = exception;
         }
         finally
         {
@@ -332,9 +328,17 @@ internal static unsafe partial class HostCallbackDispatcher
             session.Value = previousSession;
         }
 
+        if (startFailure is not null)
+        {
+            inflight.TryRemove(request, out _);
+            causes[context] = startFailure;
+            bridge_async_started(job, ComponentLinkerInstance.Native.wasmtime_error_new(startFailure.Message));
+            return;
+        }
+
         Interlocked.Increment(ref signal.Pending);
         bridge_async_started(job, IntPtr.Zero);
-        task.ContinueWith(
+        task!.ContinueWith(
             completed => FinishAsync(completed, request, context, staged, nresults, poisonBool, signal),
             CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
     }
@@ -367,6 +371,10 @@ internal static unsafe partial class HostCallbackDispatcher
         catch (Exception exception)
         {
             failure = exception;
+        }
+
+        if (failure is not null)
+        {
             for (var i = 0; i < written; i++)
             {
                 wasmtime_component_val_delete(staged + (i * ComponentValueMarshaller.ValueSize));

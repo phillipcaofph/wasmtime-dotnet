@@ -182,6 +182,10 @@ public class ComponentLinker
         }
 
         store.BeginComponentOperation();
+
+        // Failures are captured and rethrown once cleanup has run; see ComponentFunction.ThrowIfFailed.
+        ComponentInstance? result = null;
+        Exception? failure = null;
         try
         {
             var context = store.Context.handle;
@@ -192,15 +196,21 @@ public class ComponentLinker
 
             if (error != IntPtr.Zero)
             {
-                throw HostCallbackDispatcher.AttachCause(WasmtimeException.FromOwnedError(error), context);
+                failure = HostCallbackDispatcher.AttachCause(WasmtimeException.FromOwnedError(error), context);
             }
-
-            return new ComponentInstance(store, instance);
+            else
+            {
+                result = new ComponentInstance(store, instance);
+            }
         }
-        finally
+        catch (Exception exception)
         {
-            store.EndComponentOperation();
+            failure = exception;
         }
+
+        store.EndComponentOperation();
+        ComponentFunction.ThrowIfFailed(failure);
+        return result!;
     }
 
     /// <summary>
@@ -242,16 +252,17 @@ public class ComponentLinker
 
         cancellationToken.ThrowIfCancellationRequested();
         store.BeginComponentOperation();
-        var instanceBuffer = IntPtr.Zero;
-        var errorBuffer = IntPtr.Zero;
+
+        // Failures are captured and rethrown once cleanup has run; see ComponentFunction.ThrowIfFailed.
+        var instanceBuffer = Marshal.AllocHGlobal(Marshal.SizeOf<ComponentInstance.Native.Instance>());
+        var errorBuffer = Marshal.AllocHGlobal(IntPtr.Size);
+        Marshal.StructureToPtr(default(ComponentInstance.Native.Instance), instanceBuffer, false);
+        Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
         var future = IntPtr.Zero;
+        ComponentInstance? result = null;
+        Exception? failure = null;
         try
         {
-            instanceBuffer = Marshal.AllocHGlobal(Marshal.SizeOf<ComponentInstance.Native.Instance>());
-            errorBuffer = Marshal.AllocHGlobal(IntPtr.Size);
-            Marshal.StructureToPtr(default(ComponentInstance.Native.Instance), instanceBuffer, false);
-            Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
-
             var context = store.Context.handle;
             future = Native.wasmtime_component_linker_instantiate_async(
                 NativeHandle,
@@ -263,16 +274,12 @@ public class ComponentLinker
             if (future == IntPtr.Zero)
             {
                 var error = Marshal.ReadIntPtr(errorBuffer);
-                if (error != IntPtr.Zero)
-                {
-                    Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
-                    throw WasmtimeException.FromOwnedError(error);
-                }
-
-                throw new InvalidOperationException("Wasmtime failed to create an asynchronous instantiation future.");
+                Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
+                failure = error != IntPtr.Zero
+                    ? WasmtimeException.FromOwnedError(error)
+                    : new InvalidOperationException("Wasmtime failed to create an asynchronous instantiation future.");
             }
-
-            try
+            else
             {
                 await ComponentFunction.PollFutureAsync(future, store, context, cancellationToken).ConfigureAwait(false);
                 ComponentFunction.Native.wasmtime_call_future_delete(future);
@@ -281,53 +288,43 @@ public class ComponentLinker
                 if (error != IntPtr.Zero)
                 {
                     Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
-                    throw HostCallbackDispatcher.AttachCause(WasmtimeException.FromOwnedError(error), context);
+                    failure = HostCallbackDispatcher.AttachCause(WasmtimeException.FromOwnedError(error), context);
                 }
-
-                HostCallbackDispatcher.ThrowIfHostFailed(context);
-                var instance = Marshal.PtrToStructure<ComponentInstance.Native.Instance>(instanceBuffer);
-                return new ComponentInstance(store, instance);
-            }
-            finally
-            {
-                if (future != IntPtr.Zero)
+                else
                 {
-                    ComponentFunction.Native.wasmtime_call_future_delete(future);
-                    future = IntPtr.Zero;
-                }
-                var error = Marshal.ReadIntPtr(errorBuffer);
-                if (error != IntPtr.Zero)
-                {
-                    Marshal.WriteIntPtr(errorBuffer, IntPtr.Zero);
-                    ComponentFunction.Native.wasmtime_error_delete(error);
+                    failure = HostCallbackDispatcher.TakeLateHostFailure(context);
+                    if (failure is null)
+                    {
+                        var instance = Marshal.PtrToStructure<ComponentInstance.Native.Instance>(instanceBuffer);
+                        result = new ComponentInstance(store, instance);
+                    }
                 }
             }
         }
-        finally
+        catch (Exception exception)
         {
-            if (future != IntPtr.Zero)
-            {
-                ComponentFunction.Native.wasmtime_call_future_delete(future);
-            }
-            if (errorBuffer != IntPtr.Zero)
-            {
-                var error = Marshal.ReadIntPtr(errorBuffer);
-                if (error != IntPtr.Zero)
-                {
-                    ComponentFunction.Native.wasmtime_error_delete(error);
-                }
-                Marshal.FreeHGlobal(errorBuffer);
-            }
-            if (instanceBuffer != IntPtr.Zero)
-            {
-                Marshal.FreeHGlobal(instanceBuffer);
-            }
-
-            GC.KeepAlive(this);
-            GC.KeepAlive(component);
-            GC.KeepAlive(store);
-            store.EndComponentOperation();
+            failure = exception;
         }
+
+        if (future != IntPtr.Zero)
+        {
+            ComponentFunction.Native.wasmtime_call_future_delete(future);
+        }
+
+        var pendingError = Marshal.ReadIntPtr(errorBuffer);
+        if (pendingError != IntPtr.Zero)
+        {
+            ComponentFunction.Native.wasmtime_error_delete(pendingError);
+        }
+
+        Marshal.FreeHGlobal(errorBuffer);
+        Marshal.FreeHGlobal(instanceBuffer);
+        GC.KeepAlive(this);
+        GC.KeepAlive(component);
+        GC.KeepAlive(store);
+        store.EndComponentOperation();
+        ComponentFunction.ThrowIfFailed(failure);
+        return result!;
     }
 
     /// <inheritdoc/>

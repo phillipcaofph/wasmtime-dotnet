@@ -256,6 +256,9 @@ public sealed class ComponentLinkerInstance : IDisposable
         ComponentValue[]? arguments = null;
         ComponentValue[]? produced = null;
 
+        // The exception is converted after cleanup instead of inside the catch block; see
+        // ComponentFunction.ThrowIfFailed.
+        Exception? failure = null;
         try
         {
             arguments = argumentCount == 0
@@ -284,25 +287,23 @@ public sealed class ComponentLinkerInstance : IDisposable
                     produced[i],
                     results + (i * ComponentValueMarshaller.ValueSize));
             }
-
-            return IntPtr.Zero;
         }
         catch (Exception ex)
         {
-            return HandleCallbackException(ex);
+            failure = ex;
         }
-        finally
-        {
-            if (arguments is { Length: > 0 })
-            {
-                ArrayPool<ComponentValue>.Shared.Return(arguments, clearArray: true);
-            }
 
-            if (produced is { Length: > 0 })
-            {
-                ArrayPool<ComponentValue>.Shared.Return(produced, clearArray: true);
-            }
+        if (arguments is { Length: > 0 })
+        {
+            ArrayPool<ComponentValue>.Shared.Return(arguments, clearArray: true);
         }
+
+        if (produced is { Length: > 0 })
+        {
+            ArrayPool<ComponentValue>.Shared.Return(produced, clearArray: true);
+        }
+
+        return failure is null ? IntPtr.Zero : HandleCallbackException(failure);
     }
 
     /// <summary>
