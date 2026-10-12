@@ -1,0 +1,71 @@
+name: Publish experimental NuGet package
+
+on:
+  push:
+    tags:
+      - "nuget-native-bridge-*"
+
+permissions:
+  contents: read
+
+jobs:
+  callback-bridge:
+    if: github.repository == 'phillipcaofph/wasmtime-dotnet'
+    uses: ./.github/workflows/callback-bridge.yml
+
+  publish:
+    if: github.repository == 'phillipcaofph/wasmtime-dotnet'
+    needs: callback-bridge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5.3.0
+        with:
+          dotnet-version: "10.0.x"
+      - name: Validate package version
+        id: version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#nuget-native-bridge-}"
+          if [[ ! "$version" =~ ^49\.0\.2-native-bridge\.[0-9]+$ ]]; then
+            echo "Tag must be nuget-native-bridge-49.0.2-native-bridge.<number>." >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - name: Download host callback isolation libraries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: callback-bridge-*
+          path: ${{ runner.temp }}/callback-bridge
+          merge-multiple: true
+      - name: Pack
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          dotnet pack src/Wasmtime.csproj \
+            --configuration Release \
+            /p:Packing=true \
+            /p:PackageId=Wasmtime.Experimental \
+            "/p:WasmtimePackageVersion=$PACKAGE_VERSION" \
+            /p:WasmtimeVersion=49.0.2 \
+            /p:ReleaseURLBase=https://github.com/bytecodealliance/wasmtime/releases/download/v49.0.2 \
+            /p:ReleaseFileNameBase=wasmtime-v49.0.2 \
+            "/p:CallbackBridgeNativeDirectory=$RUNNER_TEMP/callback-bridge"
+      - name: NuGet login
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+      - name: Publish to NuGet
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          dotnet nuget push \
+            "src/bin/Release/Wasmtime.Experimental.$PACKAGE_VERSION.nupkg" \
+            --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate

@@ -162,3 +162,21 @@ commit to make for the release.
 
 When the release is published on GitHub, an action should automatically start
 to build and publish the package to NuGet.
+
+### Publishing the experimental native bridge package
+
+The `native-bridge-publish` branch publishes the `native-bridge` binding, with the host callback
+isolation library, as a prerelease of `Wasmtime.Experimental`. It packages the stock Wasmtime
+49.0.2 C API assets. Push a unique tag such as `nuget-native-bridge-49.0.2-native-bridge.1` on
+this branch. The experimental workflow builds the host callback isolation library for every
+supported RID (`callback-bridge.yml`), then packs it with the native assets into
+`Wasmtime.Experimental` and publishes it to NuGet.
+
+Configure NuGet [Trusted Publishing](https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing)
+for repository owner `phillipcaofph`, repository `wasmtime-dotnet`, and workflow
+`publish-experimental.yml`. Store the NuGet account username (not email) in the GitHub
+`NUGET_USER` secret. The workflow uses GitHub Actions OIDC to obtain a temporary publishing key;
+it does not require a long-lived NuGet API key. Use a new `.native-bridge.N` suffix for each
+package version because NuGet package versions cannot be overwritten; the `native-bridge` label
+keeps these versions apart from the `bridge-experiement` prereleases published from
+`experiment/thread-backed-fibers`. This package is separate from the official `Wasmtime` package.
