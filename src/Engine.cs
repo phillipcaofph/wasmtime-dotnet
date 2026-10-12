@@ -14,10 +14,7 @@ namespace Wasmtime
         /// <summary>
         /// Constructs a new default engine.
         /// </summary>
-        public Engine()
-        {
-            handle = new Handle(Native.wasm_engine_new());
-        }
+        public Engine() : this(new Config()) { }
 
         /// <summary>
         /// Constructs a new engine using the given configuration.
@@ -26,9 +23,20 @@ namespace Wasmtime
         /// <remarks>This method will dispose the given configuration.</remarks>
         public Engine(Config config)
         {
+            if (config is null)
+            {
+                throw new ArgumentNullException(nameof(config));
+            }
+
+            IsComponentModelAsyncEnabled = config.ComponentModelAsyncEnabled;
             handle = new Handle(Native.wasm_engine_new_with_config(config.NativeHandle));
             config.NativeHandle.SetHandleAsInvalid();
         }
+
+        /// <summary>
+        /// Gets whether asynchronous component execution was enabled when this engine was created.
+        /// </summary>
+        public bool IsComponentModelAsyncEnabled { get; }
 
         /// <inheritdoc/>
         public void Dispose()

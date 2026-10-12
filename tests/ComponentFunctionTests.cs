@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using FluentAssertions;
 using Wasmtime.Components;
 using Xunit;
@@ -32,6 +33,12 @@ namespace Wasmtime.Tests
         {
             using var component = fixture.LoadComponent("tiny.wat");
             return linker.Instantiate(store, component);
+        }
+
+        [Fact]
+        public void ItMatchesTheNativeFunctionHandleLayout()
+        {
+            Marshal.SizeOf<ComponentFunction.Native.Func>().Should().Be(32);
         }
 
         [Fact]
