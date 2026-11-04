@@ -345,11 +345,166 @@ namespace Wasmtime.Tests
         {
             using var scope = new ComponentValueMarshaller.AllocationScope();
             var pointer = scope.Allocate(ComponentValueMarshaller.ValueSize);
-            System.Runtime.InteropServices.Marshal.WriteByte(pointer, (byte)ComponentValueKind.Resource);
+            System.Runtime.InteropServices.Marshal.WriteByte(pointer, (byte)ComponentValueKind.Map);
 
             var act = () => ComponentValueMarshaller.Read(pointer);
 
-            act.Should().Throw<NotSupportedException>().WithMessage("*Resource*");
+            act.Should().Throw<NotSupportedException>().WithMessage("*Map*");
+        }
+
+        private sealed class Thing
+        {
+        }
+
+        private sealed class DisposableThing : IDisposable
+        {
+            public int Disposals { get; private set; }
+
+            public void Dispose() => Disposals++;
+        }
+
+        [Fact]
+        public void ResourceFactoriesRejectNull()
+        {
+            var type = new ComponentHostResourceType<Thing>();
+
+            FluentActions.Invoking(() => ComponentValue.Resource(type, null!)).Should().Throw<ArgumentNullException>();
+            FluentActions.Invoking(() => ComponentValue.Own(type, null!)).Should().Throw<ArgumentNullException>();
+            FluentActions.Invoking(() => ComponentValue.Borrow(type, null!)).Should().Throw<ArgumentNullException>();
+            FluentActions.Invoking(() => ComponentValue.Resource<Thing>(null!, new Thing()))
+                .Should().Throw<ArgumentNullException>();
+            FluentActions.Invoking(() => ComponentValue.Own<Thing>(null!, new Thing()))
+                .Should().Throw<ArgumentNullException>();
+            FluentActions.Invoking(() => ComponentValue.Borrow<Thing>(null!, new Thing()))
+                .Should().Throw<ArgumentNullException>();
+        }
+
+        [Fact]
+        public void ResourceAccessorsThrowForOtherKinds()
+        {
+            var type = new ComponentHostResourceType<Thing>();
+            var value = ComponentValue.U32(1);
+
+            value.Invoking(v => v.GetResourceType()).Should().Throw<InvalidOperationException>()
+                .WithMessage("Expected component value kind Resource*");
+            value.Invoking(v => v.AsHostResource(type)).Should().Throw<InvalidOperationException>()
+                .WithMessage("Expected component value kind Resource*");
+            value.Invoking(v => v.TakeHostResource(type)).Should().Throw<InvalidOperationException>()
+                .WithMessage("Expected component value kind Resource*");
+            value.Invoking(v => v.AsResource()).Should().Throw<InvalidOperationException>()
+                .WithMessage("Expected component value kind Resource*");
+            value.Invoking(v => v.TakeResource()).Should().Throw<InvalidOperationException>()
+                .WithMessage("Expected component value kind Resource*");
+            value.Invoking(v => v.DisposeResources()).Should().NotThrow();
+            value.ResourceOwnership.Should().Be(ComponentResourceOwnership.None);
+            value.IsHostResource().Should().BeFalse();
+            value.TryAsHostResource(type, out var thing).Should().BeFalse();
+            thing.Should().BeNull();
+        }
+
+        [Fact]
+        public void ResourceValuesReportTheirOwnershipAndType()
+        {
+            var type = new ComponentHostResourceType<Thing>();
+            var thing = new Thing();
+
+            ComponentValue.Resource(type, thing).ResourceOwnership.Should().Be(ComponentResourceOwnership.None);
+            ComponentValue.Own(type, thing).ResourceOwnership.Should().Be(ComponentResourceOwnership.Own);
+            ComponentValue.Borrow(type, thing).ResourceOwnership.Should().Be(ComponentResourceOwnership.Borrow);
+
+            var value = ComponentValue.Resource(type, thing);
+            value.Kind.Should().Be(ComponentValueKind.Resource);
+            value.GetResourceType().Should().BeSameAs(type);
+            value.IsHostResource().Should().BeTrue();
+            value.IsHostResource(type).Should().BeTrue();
+            value.AsHostResource(type).Should().BeSameAs(thing);
+            value.TryAsHostResource(type, out var found).Should().BeTrue();
+            found.Should().BeSameAs(thing);
+        }
+
+        [Fact]
+        public void TakingAValueBuiltByTheHostIsRejected()
+        {
+            var type = new ComponentHostResourceType<Thing>();
+
+            ComponentValue.Own(type, new Thing()).Invoking(v => v.TakeHostResource(type))
+                .Should().Throw<InvalidOperationException>();
+        }
+
+        [Fact]
+        public void AsHostResourceRejectsOtherHostType()
+        {
+            var first = new ComponentHostResourceType<Thing>();
+            var second = new ComponentHostResourceType<Thing>();
+            var value = ComponentValue.Resource(first, new Thing());
+
+            value.Invoking(v => v.AsHostResource(second)).Should().Throw<InvalidOperationException>();
+            value.IsHostResource(second).Should().BeFalse();
+            value.TryAsHostResource(second, out _).Should().BeFalse();
+        }
+
+        [Fact]
+        public void HostResourceTypesHaveUniqueIdentity()
+        {
+            var first = new ComponentHostResourceType<Thing>();
+            var second = new ComponentHostResourceType<Thing>();
+
+            first.Should().NotBe(second);
+            first.Equals(second).Should().BeFalse();
+            first.Equals(first).Should().BeTrue();
+            first.GetHashCode().Should().NotBe(second.GetHashCode());
+            first.IsHostDefined.Should().BeTrue();
+            first.ValueType.Should().Be(typeof(Thing));
+            first.Name.Should().BeNull();
+        }
+
+        [Fact]
+        public void NullDestructorUsesDispose()
+        {
+            var disposable = new ComponentHostResourceType<DisposableThing>();
+            var thing = new DisposableThing();
+
+            disposable.Destroy(thing);
+
+            thing.Disposals.Should().Be(1);
+
+            var calls = 0;
+            var custom = new ComponentHostResourceType<DisposableThing>(_ => calls++);
+            var other = new DisposableThing();
+            custom.Destroy(other);
+
+            calls.Should().Be(1);
+            other.Disposals.Should().Be(0);
+        }
+
+        [Fact]
+        public void ToStringDescribesResources()
+        {
+            using var engine = new Engine(new Config().WithComponentModel(true));
+            using var linker = new ComponentLinker(engine);
+            var type = new ComponentHostResourceType<Thing>();
+            using (var root = linker.Root())
+            using (var host = root.AddInstance("host"))
+            {
+                host.DefineResource("counter", type);
+            }
+
+            type.Name.Should().Be("counter");
+            ComponentValue.Own(type, new Thing()).ToString().Should().StartWith("own<counter#");
+            ComponentValue.Borrow(type, new Thing()).ToString().Should().StartWith("borrow<counter#");
+            ComponentValue.Resource(type, new Thing()).ToString().Should().StartWith("resource<counter#");
+            type.ToString().Should().StartWith("counter (Thing, host #");
+        }
+
+        [Fact]
+        public void WritingAResourceWithoutATransactionIsRejected()
+        {
+            using var scope = new ComponentValueMarshaller.AllocationScope();
+            var pointer = scope.Allocate(ComponentValueMarshaller.ValueSize);
+            var value = ComponentValue.Resource(new ComponentHostResourceType<Thing>(), new Thing());
+
+            FluentActions.Invoking(() => ComponentValueMarshaller.Write(value, pointer, scope))
+                .Should().Throw<NotSupportedException>();
         }
 
         /// <summary>

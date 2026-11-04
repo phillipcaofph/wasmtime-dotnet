@@ -53,7 +53,20 @@ public enum ComponentValueKind : byte
     Result = 19,
     /// <summary>A set of flag names.</summary>
     Flags = 20,
-    /// <summary>A resource handle. Not yet supported by this binding.</summary>
+    /// <summary>
+    /// An <c>own</c> or <c>borrow</c> resource handle: a host object of a <see cref="ComponentHostResourceType{T}"/>
+    /// (<see cref="ComponentValue.Resource{T}(ComponentHostResourceType{T}, T)"/>,
+    /// <see cref="ComponentValue.AsHostResource{T}(ComponentHostResourceType{T})"/>) or a
+    /// <see cref="ComponentResource"/> for guest-defined and other native resource types
+    /// (<see cref="ComponentValue.Resource(ComponentResource)"/>, <see cref="ComponentValue.AsResource"/>).
+    /// </summary>
+    /// <remarks>
+    /// Supported in host function arguments and results, export call arguments and results, and nested in
+    /// lists, records, tuples, options, results and variants (not maps). See
+    /// <see cref="ComponentValue.ResourceOwnership"/> for own versus borrow, and
+    /// <see cref="ComponentValue.TakeHostResource{T}(ComponentHostResourceType{T})"/> and
+    /// <see cref="ComponentValue.TakeResource"/> for claiming owned callback arguments.
+    /// </remarks>
     Resource = 21,
     /// <summary>A map. Not yet supported by this binding.</summary>
     Map = 22,
@@ -65,11 +78,11 @@ public enum ComponentValueKind : byte
 /// </summary>
 /// <remarks>
 /// Create values with the static factory methods and read them back with the typed accessors,
-/// each of which throws if the value has a different <see cref="Kind"/>. The
-/// <see cref="ComponentValueKind.Resource"/> and
-/// <see cref="ComponentValueKind.Map"/> kinds are not yet supported.
+/// each of which throws if the value has a different <see cref="Kind"/>. Resources
+/// (<see cref="ComponentValueKind.Resource"/>) are supported; the <see cref="ComponentValueKind.Map"/> kind
+/// is not yet supported.
 /// </remarks>
-public sealed class ComponentValue
+public sealed partial class ComponentValue
 {
     private ComponentValue(ComponentValueKind kind)
     {
@@ -549,6 +562,8 @@ public sealed class ComponentValue
                 return Flag ? $"some({Payload})" : "none";
             case ComponentValueKind.Result:
                 return Flag ? $"ok({Payload})" : $"err({Payload})";
+            case ComponentValueKind.Resource:
+                return DescribeResource();
             default:
                 return Integer.ToString(CultureInfo.InvariantCulture);
         }

@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -30,13 +31,15 @@ public sealed class ComponentLinkerInstance : IDisposable
 {
     private readonly Handle handle;
     private readonly Action onDisposed;
+    private readonly ComponentLinker? owner;
     private ComponentLinkerInstance? child;
     private bool disposed;
 
-    internal ComponentLinkerInstance(IntPtr handle, Action onDisposed)
+    internal ComponentLinkerInstance(IntPtr handle, Action onDisposed, ComponentLinker? owner = null)
     {
         this.handle = new Handle(handle);
         this.onDisposed = onDisposed;
+        this.owner = owner;
     }
 
     internal Handle NativeHandle
@@ -86,7 +89,7 @@ public sealed class ComponentLinkerInstance : IDisposable
                     throw WasmtimeException.FromOwnedError(error);
                 }
 
-                child = new ComponentLinkerInstance(nested, () => child = null);
+                child = new ComponentLinkerInstance(nested, () => child = null, owner);
                 return child;
             }
         }
@@ -149,8 +152,10 @@ public sealed class ComponentLinkerInstance : IDisposable
         var current = NativeHandle;
         var nameBytes = Encoding.UTF8.GetBytes(name);
 
+        // The function's type is the same on every call, so its resource plan is built once.
+        var planCache = new StrongBox<ResourcePlan?>();
         Native.ComponentFuncCallback trampoline = (env, context, type, args, nargs, results, nresults) =>
-            Invoke(callback, name, args, (int)nargs, results, (int)nresults);
+            Invoke(callback, name, context, type, planCache, args, (int)nargs, results, (int)nresults);
 
         unsafe
         {
@@ -172,9 +177,137 @@ public sealed class ComponentLinkerInstance : IDisposable
         }
     }
 
+    /// <summary>
+    /// Defines <paramref name="type"/> as the resource named <paramref name="name"/> in this instance.
+    /// </summary>
+    /// <param name="name">
+    /// The exact export name in the component's import instance type, for example <c>counter</c>.
+    /// </param>
+    /// <param name="type">The host resource type.</param>
+    /// <remarks>
+    /// <para>
+    /// The same type may be defined under other names, instances and linkers; they alias. <c>(eq …)</c>
+    /// aliases in the component need no definition.
+    /// </para>
+    /// <para>
+    /// When a guest drops an owned handle, the type's destructor runs on the thread running the
+    /// WebAssembly code.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="WasmtimeException">Wasmtime rejected the definition, for example a duplicate name.</exception>
+    public void DefineResource(string name, ComponentHostResourceType type)
+    {
+        if (name is null)
+        {
+            throw new ArgumentNullException(nameof(name));
+        }
+
+        if (type is null)
+        {
+            throw new ArgumentNullException(nameof(type));
+        }
+
+        var current = NativeHandle;
+        var nameBytes = Encoding.UTF8.GetBytes(name);
+
+        ComponentResourceNative.ResourceDestructor trampoline = (env, context, rep) =>
+            InvokeDestructor(type, context, rep);
+
+        unsafe
+        {
+            fixed (byte* namePtr = nameBytes)
+            {
+                var data = GCHandle.ToIntPtr(GCHandle.Alloc(trampoline));
+                IntPtr error;
+                try
+                {
+                    // From here Wasmtime owns data and runs the finalizer, even on error.
+                    error = ComponentResourceNative.wasmtime_component_linker_instance_add_resource(
+                        current,
+                        namePtr,
+                        (nuint)nameBytes.Length,
+                        type.NativeHandle,
+                        trampoline,
+                        data,
+                        Function.Finalizer);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Marshalling failed before Wasmtime took ownership of data.
+                    GCHandle.FromIntPtr(data).Free();
+                    throw;
+                }
+
+                if (error != IntPtr.Zero)
+                {
+                    throw WasmtimeException.FromOwnedError(error);
+                }
+            }
+        }
+
+        type.RecordName(name);
+        owner?.AddHostResourceType(type);
+    }
+
+    /// <summary>
+    /// Creates a new host resource type with <paramref name="destructor"/>, defines it as
+    /// <paramref name="name"/> in this instance, and returns it.
+    /// </summary>
+    /// <typeparam name="T">The type of the host objects.</typeparam>
+    /// <param name="name">The exact export name in the component's import instance type.</param>
+    /// <param name="destructor">
+    /// Runs when a guest-owned object is destroyed, or null to use <see cref="IDisposable.Dispose"/> when
+    /// <typeparamref name="T"/> implements it.
+    /// </param>
+    /// <returns>The new resource type.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="name"/> is null.</exception>
+    /// <exception cref="WasmtimeException">Wasmtime rejected the definition.</exception>
+    public ComponentHostResourceType<T> DefineResource<T>(string name, ComponentResourceDestructor<T>? destructor = null)
+        where T : class
+    {
+        var type = new ComponentHostResourceType<T>(destructor);
+        DefineResource(name, type);
+        return type;
+    }
+
+    /// <summary>
+    /// Runs the destructor for the host object behind <paramref name="rep"/>, which a guest dropped.
+    /// </summary>
+    private static IntPtr InvokeDestructor(ComponentHostResourceType type, IntPtr context, uint rep)
+    {
+        try
+        {
+            var store = new StoreContext(context).Store;
+            var value = store.ComponentResourceTable.ReleaseFromGuest(type, rep);
+            type.Destroy(value);
+            return IntPtr.Zero;
+        }
+        catch (Exception ex)
+        {
+            return HandleCallbackException(ex);
+        }
+    }
+
+    /// <summary>
+    /// Runs a host callback: reads the arguments, calls the user delegate and writes the results.
+    /// </summary>
+    /// <param name="callback">The user delegate.</param>
+    /// <param name="name">The function name, for diagnostics.</param>
+    /// <param name="context">The Store context Wasmtime passed to the callback.</param>
+    /// <param name="type">The function type Wasmtime passed to the callback, used to check returned resources.</param>
+    /// <param name="planCache">The function's resource plan, cached across calls.</param>
+    /// <param name="args">The arguments.</param>
+    /// <param name="argumentCount">The number of arguments.</param>
+    /// <param name="results">The results to write.</param>
+    /// <param name="resultCount">The number of results.</param>
+    /// <returns>Null on success, otherwise an owned <c>wasmtime_error_t*</c>.</returns>
     private static IntPtr Invoke(
         ComponentFunctionCallback callback,
         string name,
+        IntPtr context,
+        IntPtr type,
+        StrongBox<ResourcePlan?> planCache,
         IntPtr args,
         int argumentCount,
         IntPtr results,
@@ -182,6 +315,7 @@ public sealed class ComponentLinkerInstance : IDisposable
     {
         ComponentValue[]? arguments = null;
         ComponentValue[]? produced = null;
+        var resources = new CallbackResources(context);
 
         try
         {
@@ -190,14 +324,20 @@ public sealed class ComponentLinkerInstance : IDisposable
                 : ArrayPool<ComponentValue>.Shared.Rent(argumentCount);
             for (var i = 0; i < argumentCount; i++)
             {
-                arguments[i] = ComponentValueMarshaller.Read(args + (i * ComponentValueMarshaller.ValueSize));
+                arguments[i] = ComponentValueMarshaller.Read(args + (i * ComponentValueMarshaller.ValueSize), resources);
             }
+
+            // Converts every resource argument before user code runs; borrows are released here.
+            resources.ResolveArguments();
 
             produced = resultCount == 0
                 ? Array.Empty<ComponentValue>()
                 : ArrayPool<ComponentValue>.Shared.Rent(resultCount);
             Array.Clear(produced, 0, resultCount);
             callback(arguments.AsSpan(0, argumentCount), produced.AsSpan(0, resultCount));
+
+            // A resource of the wrong type must fail here, while it is still the host's.
+            resources.CheckResultResources(type, produced.AsSpan(0, resultCount), planCache);
 
             for (var i = 0; i < resultCount; i++)
             {
@@ -209,13 +349,34 @@ public sealed class ComponentLinkerInstance : IDisposable
 
                 ComponentValueMarshaller.WriteOwned(
                     produced[i],
-                    results + (i * ComponentValueMarshaller.ValueSize));
+                    results + (i * ComponentValueMarshaller.ValueSize),
+                    resources);
             }
 
+            // Release unclaimed owned arguments before completing the results: the results' reservations
+            // already exist, so an argument handed back is kept. If a destructor fails, the callback fails and
+            // nothing it returned is delivered, so the returned objects are destroyed now.
+            if (resources.EndCallback() is { } failure)
+            {
+                resources.AbortResults();
+                return HandleCallbackException(failure);
+            }
+
+            resources.CompleteResults();
             return IntPtr.Zero;
         }
         catch (Exception ex)
         {
+            try
+            {
+                resources.AbortResults();
+                resources.EndCallback();
+            }
+            catch (Exception)
+            {
+                // The callback's own failure is the one reported.
+            }
+
             return HandleCallbackException(ex);
         }
         finally

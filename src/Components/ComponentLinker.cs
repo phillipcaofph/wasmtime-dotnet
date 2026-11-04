@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
@@ -12,6 +13,8 @@ public class ComponentLinker
     : IDisposable
 {
     private readonly Handle handle;
+    private readonly object definitionsGate = new();
+    private ComponentHostResourceType[] hostResourceTypes = Array.Empty<ComponentHostResourceType>();
     private ComponentLinkerInstance? root;
 
     /// <summary>
@@ -74,9 +77,38 @@ public class ComponentLinker
         var current = NativeHandle;
         root = new ComponentLinkerInstance(
             Native.wasmtime_component_linker_root(current),
-            () => root = null);
+            () => root = null,
+            this);
 
         return root;
+    }
+
+    /// <summary>Every binding host resource type defined anywhere in this linker.</summary>
+    internal IReadOnlyList<ComponentHostResourceType> HostResourceTypes
+    {
+        get
+        {
+            lock (definitionsGate)
+            {
+                return hostResourceTypes;
+            }
+        }
+    }
+
+    internal void AddHostResourceType(ComponentHostResourceType type)
+    {
+        lock (definitionsGate)
+        {
+            if (Array.IndexOf(hostResourceTypes, type) >= 0)
+            {
+                return;
+            }
+
+            var types = new ComponentHostResourceType[hostResourceTypes.Length + 1];
+            hostResourceTypes.CopyTo(types, 0);
+            types[types.Length - 1] = type;
+            hostResourceTypes = types;
+        }
     }
 
     /// <summary>
@@ -125,6 +157,10 @@ public class ComponentLinker
     /// <returns>The instantiated component.</returns>
     /// <exception cref="ArgumentNullException">Thrown if an argument is null.</exception>
     /// <exception cref="WasmtimeException">Thrown if an import could not be satisfied.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown if another thread is running a component operation on the store, or
+    /// <see cref="Store.ReleaseComponentResources"/> was called.
+    /// </exception>
     public ComponentInstance Instantiate(Store store, Component component)
     {
         if (store is null)
@@ -137,17 +173,28 @@ public class ComponentLinker
             throw new ArgumentNullException(nameof(component));
         }
 
-        var error = Native.wasmtime_component_linker_instantiate(
-            NativeHandle, store.Context.handle, component.NativeHandle, out var instance);
-
-        GC.KeepAlive(store);
-
-        if (error != IntPtr.Zero)
+        store.BeginComponentOperation(nested: true);
+        try
         {
-            throw WasmtimeException.FromOwnedError(error);
-        }
+            // Lets the Store recognise this linker's host resource types in values it reads.
+            store.AddComponentHostResourceTypes(HostResourceTypes);
 
-        return new ComponentInstance(store, instance);
+            var error = Native.wasmtime_component_linker_instantiate(
+                NativeHandle, store.Context.handle, component.NativeHandle, out var instance);
+
+            GC.KeepAlive(store);
+
+            if (error != IntPtr.Zero)
+            {
+                throw WasmtimeException.FromOwnedError(error);
+            }
+
+            return new ComponentInstance(store, instance);
+        }
+        finally
+        {
+            store.EndComponentOperation();
+        }
     }
 
     /// <inheritdoc/>
