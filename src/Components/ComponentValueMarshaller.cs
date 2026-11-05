@@ -48,6 +48,7 @@ internal static class ComponentValueMarshaller
     public sealed class AllocationScope : IDisposable
     {
         private readonly List<IntPtr> allocations = new List<IntPtr>();
+        private List<KeyValuePair<IntPtr, Action<IntPtr>>>? natives;
         private bool disposed;
 
         /// <summary>
@@ -73,6 +74,24 @@ internal static class ComponentValueMarshaller
             return pointer;
         }
 
+        /// <summary>
+        /// Ties a native object to this scope: <paramref name="releaser"/> runs on it when the scope is
+        /// disposed, in reverse order of tracking and before the scope's own memory is freed.
+        /// </summary>
+        /// <param name="pointer">The native object.</param>
+        /// <param name="releaser">Releases the object, for example <c>wasmtime_component_resource_any_delete</c>.</param>
+        public void TrackNative(IntPtr pointer, Action<IntPtr> releaser)
+        {
+            if (disposed)
+            {
+                releaser(pointer);
+                throw new ObjectDisposedException(nameof(AllocationScope));
+            }
+
+            (natives ??= new List<KeyValuePair<IntPtr, Action<IntPtr>>>())
+                .Add(new KeyValuePair<IntPtr, Action<IntPtr>>(pointer, releaser));
+        }
+
         /// <inheritdoc/>
         public void Dispose()
         {
@@ -82,7 +101,23 @@ internal static class ComponentValueMarshaller
             }
 
             disposed = true;
+            ReleaseNatives();
             FreeAllocations();
+        }
+
+        private void ReleaseNatives()
+        {
+            if (natives is null)
+            {
+                return;
+            }
+
+            for (var i = natives.Count - 1; i >= 0; i--)
+            {
+                natives[i].Value(natives[i].Key);
+            }
+
+            natives = null;
         }
 
         private void FreeAllocations()
@@ -102,7 +137,25 @@ internal static class ComponentValueMarshaller
     /// <param name="value">The value to write.</param>
     /// <param name="destination">A pointer to <see cref="ValueSize"/> bytes of storage.</param>
     /// <param name="scope">The scope owning any secondary allocations the value needs.</param>
-    public static void Write(ComponentValue value, IntPtr destination, AllocationScope scope)
+    /// <remarks>Resource values need <see cref="Write(ComponentValue, IntPtr, AllocationScope, ResourcePlanNode?, ResourceCallTransaction?)"/>.</remarks>
+    public static void Write(ComponentValue value, IntPtr destination, AllocationScope scope) =>
+        Write(value, destination, scope, null, null);
+
+    /// <summary>
+    /// Writes a value into caller-owned native storage, routing resource values through
+    /// <paramref name="transaction"/>.
+    /// </summary>
+    /// <param name="value">The value to write.</param>
+    /// <param name="destination">A pointer to <see cref="ValueSize"/> bytes of storage.</param>
+    /// <param name="scope">The scope owning any secondary allocations the value needs.</param>
+    /// <param name="node">Where resources occur in the value's type, or null when none do.</param>
+    /// <param name="transaction">The call's resource transaction, or null when resources are not allowed.</param>
+    public static void Write(
+        ComponentValue value,
+        IntPtr destination,
+        AllocationScope scope,
+        ResourcePlanNode? node,
+        ResourceCallTransaction? transaction)
     {
         if (WritePrimitive(value, destination))
         {
@@ -120,18 +173,25 @@ internal static class ComponentValueMarshaller
                 break;
 
             case ComponentValueKind.List:
+                WriteVector(value.Items, payload, scope,
+                    node?.Kind == PlanKind.List ? node : null, transaction, isList: true);
+                break;
+
             case ComponentValueKind.Tuple:
-                WriteVector(value.Items, payload, scope);
+                WriteVector(value.Items, payload, scope,
+                    node?.Kind == PlanKind.Tuple ? node : null, transaction, isList: false);
                 break;
 
             case ComponentValueKind.Record:
-                WriteRecord(value.Fields, payload, scope);
+                WriteRecord(value.Fields, payload, scope, node, transaction);
                 break;
 
             case ComponentValueKind.Variant:
                 WriteName(value.Text!, payload, scope);
                 Marshal.WriteIntPtr(payload + NameSize,
-                    value.Payload is null ? IntPtr.Zero : WriteBoxed(value.Payload, scope));
+                    value.Payload is null
+                        ? IntPtr.Zero
+                        : WriteBoxed(value.Payload, scope, node?.Named(PlanKind.Variant, value.Text!), transaction));
                 break;
 
             case ComponentValueKind.Flags:
@@ -145,14 +205,21 @@ internal static class ComponentValueMarshaller
                 break;
 
             case ComponentValueKind.Option:
-                Marshal.WriteIntPtr(payload, value.Flag ? WriteBoxed(value.Payload!, scope) : IntPtr.Zero);
+                Marshal.WriteIntPtr(payload, value.Flag
+                    ? WriteBoxed(value.Payload!, scope, node?.Kind == PlanKind.Option ? node.Some : null, transaction)
+                    : IntPtr.Zero);
                 break;
 
             case ComponentValueKind.Result:
                 Marshal.WriteByte(payload, (byte)(value.Flag ? 1 : 0));
+                var arm = node?.Kind == PlanKind.Result ? (value.Flag ? node.Ok : node.Err) : null;
                 Marshal.WriteIntPtr(
                     payload + VectorDataOffset,
-                    value.Payload is null ? IntPtr.Zero : WriteBoxed(value.Payload, scope));
+                    value.Payload is null ? IntPtr.Zero : WriteBoxed(value.Payload, scope, arm, transaction));
+                break;
+
+            case ComponentValueKind.Resource when transaction is not null:
+                transaction.WriteResource(value, destination, node);
                 break;
 
             default:
@@ -171,14 +238,28 @@ internal static class ComponentValueMarshaller
     /// Heap-backed values are constructed with Wasmtime's allocator so Wasmtime can safely
     /// deallocate the result after the host callback returns.
     /// </remarks>
-    public static void WriteOwned(ComponentValue value, IntPtr destination)
+    public static void WriteOwned(ComponentValue value, IntPtr destination) =>
+        WriteOwned(value, destination, null);
+
+    /// <summary>
+    /// Writes a host callback result into storage whose contents Wasmtime will free, routing resource
+    /// values through <paramref name="resources"/>.
+    /// </summary>
+    /// <param name="value">The value to write.</param>
+    /// <param name="destination">A pointer to <see cref="ValueSize"/> bytes of storage.</param>
+    /// <param name="resources">The callback's resources, or null when resources are not allowed.</param>
+    /// <remarks>
+    /// A resource is written as a <c>bool(false)</c> placeholder plus a fix-up, which the caller turns
+    /// into a native handle once every result has been written.
+    /// </remarks>
+    public static void WriteOwned(ComponentValue value, IntPtr destination, CallbackResources? resources)
     {
         ClearValue(destination);
         try
         {
             if (!WritePrimitive(value, destination))
             {
-                WriteOwnedHeapValue(value, destination);
+                WriteOwnedHeapValue(value, destination, resources);
             }
         }
         catch
@@ -236,7 +317,7 @@ internal static class ComponentValueMarshaller
         return true;
     }
 
-    private static void WriteOwnedHeapValue(ComponentValue value, IntPtr destination)
+    private static void WriteOwnedHeapValue(ComponentValue value, IntPtr destination, CallbackResources? resources)
     {
         var payload = destination + ValuePayloadOffset;
 
@@ -250,11 +331,11 @@ internal static class ComponentValueMarshaller
 
             case ComponentValueKind.List:
             case ComponentValueKind.Tuple:
-                WriteOwnedVector(value.Items, destination, value.Kind);
+                WriteOwnedVector(value.Items, destination, value.Kind, resources);
                 break;
 
             case ComponentValueKind.Record:
-                WriteOwnedRecord(value.Fields, destination);
+                WriteOwnedRecord(value.Fields, destination, resources);
                 break;
 
             case ComponentValueKind.Variant:
@@ -262,7 +343,7 @@ internal static class ComponentValueMarshaller
                 WriteOwnedName(value.Text!, payload);
                 if (value.Payload is not null)
                 {
-                    Marshal.WriteIntPtr(payload + NameSize, WriteOwnedBoxed(value.Payload));
+                    Marshal.WriteIntPtr(payload + NameSize, WriteOwnedBoxed(value.Payload, resources));
                 }
                 break;
 
@@ -286,7 +367,7 @@ internal static class ComponentValueMarshaller
                 Marshal.WriteByte(destination, (byte)value.Kind);
                 if (value.Flag)
                 {
-                    Marshal.WriteIntPtr(payload, WriteOwnedBoxed(value.Payload!));
+                    Marshal.WriteIntPtr(payload, WriteOwnedBoxed(value.Payload!, resources));
                 }
 
                 break;
@@ -296,9 +377,13 @@ internal static class ComponentValueMarshaller
                 Marshal.WriteByte(payload, (byte)(value.Flag ? 1 : 0));
                 if (value.Payload is not null)
                 {
-                    Marshal.WriteIntPtr(payload + VectorDataOffset, WriteOwnedBoxed(value.Payload));
+                    Marshal.WriteIntPtr(payload + VectorDataOffset, WriteOwnedBoxed(value.Payload, resources));
                 }
 
+                break;
+
+            case ComponentValueKind.Resource when resources is not null:
+                resources.WriteResult(value, destination);
                 break;
 
             default:
@@ -325,7 +410,8 @@ internal static class ComponentValueMarshaller
     private static void WriteOwnedVector(
         IReadOnlyList<ComponentValue> items,
         IntPtr destination,
-        ComponentValueKind kind)
+        ComponentValueKind kind,
+        CallbackResources? resources)
     {
         var count = items.Count;
         checked
@@ -352,13 +438,14 @@ internal static class ComponentValueMarshaller
 
         for (var i = 0; i < count; i++)
         {
-            WriteOwned(items[i], element + (i * ValueSize));
+            WriteOwned(items[i], element + (i * ValueSize), resources);
         }
     }
 
     private static void WriteOwnedRecord(
         IReadOnlyList<KeyValuePair<string, ComponentValue>> fields,
-        IntPtr destination)
+        IntPtr destination,
+        CallbackResources? resources)
     {
         var count = fields.Count;
         checked
@@ -383,11 +470,11 @@ internal static class ComponentValueMarshaller
         {
             var currentEntry = entry + (i * RecordEntrySize);
             WriteOwnedName(fields[i].Key, currentEntry);
-            WriteOwned(fields[i].Value, currentEntry + RecordEntryValueOffset);
+            WriteOwned(fields[i].Value, currentEntry + RecordEntryValueOffset, resources);
         }
     }
 
-    private static IntPtr WriteOwnedBoxed(ComponentValue value)
+    private static IntPtr WriteOwnedBoxed(ComponentValue value, CallbackResources? resources)
     {
         unsafe
         {
@@ -396,13 +483,17 @@ internal static class ComponentValueMarshaller
             ClearValue(pointer);
 
             var initialized = false;
+            var mark = resources?.FixupCount ?? 0;
             try
             {
-                WriteOwned(value, pointer);
+                WriteOwned(value, pointer, resources);
                 initialized = true;
 
                 var owned = ComponentValueNative.wasmtime_component_val_new(pointer);
                 initialized = false;
+
+                // The value just moved into a Wasmtime box; fix-ups aimed at it must follow it.
+                resources?.Relocate(mark, pointer, owned);
                 return owned;
             }
             finally
@@ -428,7 +519,15 @@ internal static class ComponentValueMarshaller
     /// </summary>
     /// <param name="source">A pointer to a <c>wasmtime_component_val_t</c>.</param>
     /// <returns>The value that was read.</returns>
-    public static ComponentValue Read(IntPtr source)
+    public static ComponentValue Read(IntPtr source) => Read(source, null);
+
+    /// <summary>
+    /// Reads a value from native storage, handing resource values to <paramref name="reader"/>.
+    /// </summary>
+    /// <param name="source">A pointer to a <c>wasmtime_component_val_t</c>.</param>
+    /// <param name="reader">Converts resources, or null when resources are not allowed.</param>
+    /// <returns>The value that was read.</returns>
+    public static ComponentValue Read(IntPtr source, IResourceReader? reader)
     {
         var kind = (ComponentValueKind)Marshal.ReadByte(source);
         var payload = source + ValuePayloadOffset;
@@ -478,18 +577,18 @@ internal static class ComponentValueMarshaller
                 return ComponentValue.Enum(ReadName(payload));
 
             case ComponentValueKind.List:
-                return ComponentValue.OwnedList(ReadVector(payload));
+                return ComponentValue.OwnedList(ReadVector(payload, reader));
 
             case ComponentValueKind.Tuple:
-                return ComponentValue.OwnedTuple(ReadVector(payload));
+                return ComponentValue.OwnedTuple(ReadVector(payload, reader));
 
             case ComponentValueKind.Record:
-                return ComponentValue.OwnedRecord(ReadRecord(payload));
+                return ComponentValue.OwnedRecord(ReadRecord(payload, reader));
 
             case ComponentValueKind.Variant:
                 var variant = Marshal.ReadIntPtr(payload + NameSize);
                 return ComponentValue.Variant(ReadName(payload),
-                    variant == IntPtr.Zero ? null : Read(variant));
+                    variant == IntPtr.Zero ? null : Read(variant, reader));
 
             case ComponentValueKind.Flags:
                 var count = checked((int)Marshal.ReadIntPtr(payload).ToInt64());
@@ -503,13 +602,16 @@ internal static class ComponentValueMarshaller
 
             case ComponentValueKind.Option:
                 var some = Marshal.ReadIntPtr(payload);
-                return some == IntPtr.Zero ? ComponentValue.None() : ComponentValue.Some(Read(some));
+                return some == IntPtr.Zero ? ComponentValue.None() : ComponentValue.Some(Read(some, reader));
 
             case ComponentValueKind.Result:
                 var isOk = Marshal.ReadByte(payload) != 0;
                 var inner = Marshal.ReadIntPtr(payload + VectorDataOffset);
-                var result = inner == IntPtr.Zero ? null : Read(inner);
+                var result = inner == IntPtr.Zero ? null : Read(inner, reader);
                 return isOk ? ComponentValue.Ok(result) : ComponentValue.Err(result);
+
+            case ComponentValueKind.Resource when reader is not null:
+                return ComponentValue.FromResourceCell(reader.ReadResource(source, Marshal.ReadIntPtr(payload)));
 
             default:
                 throw new NotSupportedException(
@@ -517,10 +619,14 @@ internal static class ComponentValueMarshaller
         }
     }
 
-    private static IntPtr WriteBoxed(ComponentValue value, AllocationScope scope)
+    private static IntPtr WriteBoxed(
+        ComponentValue value,
+        AllocationScope scope,
+        ResourcePlanNode? node,
+        ResourceCallTransaction? transaction)
     {
         var boxed = scope.Allocate(ValueSize);
-        Write(value, boxed, scope);
+        Write(value, boxed, scope, node, transaction);
         return boxed;
     }
 
@@ -542,7 +648,13 @@ internal static class ComponentValueMarshaller
         Marshal.WriteIntPtr(destination + VectorDataOffset, buffer);
     }
 
-    private static void WriteVector(IReadOnlyList<ComponentValue> items, IntPtr destination, AllocationScope scope)
+    private static void WriteVector(
+        IReadOnlyList<ComponentValue> items,
+        IntPtr destination,
+        AllocationScope scope,
+        ResourcePlanNode? node,
+        ResourceCallTransaction? transaction,
+        bool isList)
     {
         // Read once: the buffer size, loop bound and written length must agree even if the list changes.
         var count = items.Count;
@@ -553,7 +665,8 @@ internal static class ComponentValueMarshaller
 
         for (var i = 0; i < count; i++)
         {
-            Write(items[i], element, scope);
+            Write(items[i], element, scope,
+                node is null ? null : isList ? node.Element : node.Child(PlanKind.Tuple, i), transaction);
             element += ValueSize;
         }
 
@@ -564,7 +677,9 @@ internal static class ComponentValueMarshaller
     private static void WriteRecord(
         IReadOnlyList<KeyValuePair<string, ComponentValue>> fields,
         IntPtr destination,
-        AllocationScope scope)
+        AllocationScope scope,
+        ResourcePlanNode? node,
+        ResourceCallTransaction? transaction)
     {
         var count = fields.Count;
         var buffer = scope.Allocate(Math.Max(checked(count * RecordEntrySize), 1));
@@ -573,7 +688,8 @@ internal static class ComponentValueMarshaller
         for (var i = 0; i < count; i++)
         {
             WriteName(fields[i].Key, entry, scope);
-            Write(fields[i].Value, entry + RecordEntryValueOffset, scope);
+            Write(fields[i].Value, entry + RecordEntryValueOffset, scope,
+                node?.Named(PlanKind.Record, fields[i].Key), transaction);
             entry += RecordEntrySize;
         }
 
@@ -589,7 +705,7 @@ internal static class ComponentValueMarshaller
         return data == IntPtr.Zero || size == 0 ? string.Empty : Extensions.PtrToStringUTF8(data, size);
     }
 
-    private static List<ComponentValue> ReadVector(IntPtr source)
+    private static List<ComponentValue> ReadVector(IntPtr source, IResourceReader? reader)
     {
         var size = ReadLength(source);
         var element = Marshal.ReadIntPtr(source + VectorDataOffset);
@@ -597,14 +713,14 @@ internal static class ComponentValueMarshaller
 
         for (var i = 0; i < size; i++)
         {
-            items.Add(Read(element));
+            items.Add(Read(element, reader));
             element += ValueSize;
         }
 
         return items;
     }
 
-    private static List<KeyValuePair<string, ComponentValue>> ReadRecord(IntPtr source)
+    private static List<KeyValuePair<string, ComponentValue>> ReadRecord(IntPtr source, IResourceReader? reader)
     {
         var size = ReadLength(source);
         var entry = Marshal.ReadIntPtr(source + VectorDataOffset);
@@ -614,7 +730,7 @@ internal static class ComponentValueMarshaller
         {
             fields.Add(new KeyValuePair<string, ComponentValue>(
                 ReadName(entry),
-                Read(entry + RecordEntryValueOffset)));
+                Read(entry + RecordEntryValueOffset, reader)));
 
             entry += RecordEntrySize;
         }

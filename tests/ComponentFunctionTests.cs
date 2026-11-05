@@ -151,6 +151,49 @@ namespace Wasmtime.Tests
         }
 
         [Fact]
+        public void ItCallsAnotherInstanceOfTheSameStoreFromAHostCallback()
+        {
+            var add = InstantiateTinyComponent().GetFunction("add")!;
+
+            using (var root = linker.Root())
+            using (var host = root.AddInstance("host"))
+            {
+                host.DefineFunction("transform", (arguments, results) =>
+                    results[0] = add.Call(arguments[0], arguments[0])!);
+                host.DefineFunction("greet", (arguments, results) =>
+                    results[0] = ComponentValue.String(string.Empty));
+            }
+
+            // The start function calls back during instantiation, and "run" calls back during a call.
+            using var component = fixture.LoadComponent("host-import.wat");
+            var instance = linker.Instantiate(store, component);
+
+            instance.GetFunction("run")!.Call(ComponentValue.S32(5))!.AsS32().Should().Be(10);
+        }
+
+        [Fact]
+        public void ItDefersDisposingTheStoreFromAHostCallback()
+        {
+            using (var root = linker.Root())
+            using (var host = root.AddInstance("host"))
+            {
+                host.DefineFunction("transform", (arguments, results) =>
+                {
+                    store.Invoking(s => s.Dispose()).Should().NotThrow();
+                    results[0] = ComponentValue.S32(arguments[0].AsS32() * 2);
+                });
+                host.DefineFunction("greet", (arguments, results) =>
+                    results[0] = ComponentValue.String(string.Empty));
+            }
+
+            using var component = fixture.LoadComponent("host-import.wat");
+            linker.Instantiate(store, component);
+
+            // The instantiation that ran the callback finished, then the Store was disposed.
+            linker.Invoking(l => l.Instantiate(store, component)).Should().Throw<ObjectDisposedException>();
+        }
+
+        [Fact]
         public void ItSurfacesHostExceptionsAsTraps()
         {
             using (var root = linker.Root())

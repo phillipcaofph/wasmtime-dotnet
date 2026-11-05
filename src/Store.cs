@@ -116,7 +116,7 @@ namespace Wasmtime
     /// A Wasmtime store may be sent between threads but cannot be used from more than one thread
     /// simultaneously.
     /// </remarks>
-    public class Store : IDisposable
+    public partial class Store : IDisposable
     {
         /// <summary>
         /// Constructs a new store.
@@ -349,8 +349,17 @@ namespace Wasmtime
         }
 
         /// <inheritdoc/>
+        /// <remarks>
+        /// Called while a component operation is in progress (for example from a host callback), the Store is disposed
+        /// when that operation ends.
+        /// </remarks>
         public void Dispose()
         {
+            if (!CloseComponentOperations())
+            {
+                return;
+            }
+
             handle.Dispose();
         }
 

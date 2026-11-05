@@ -119,3 +119,105 @@ This should result in the following output:
 ```text
 Hello from C#!
 ```
+
+# Component resources
+
+The component model lets a component import and export _resource_ types: opaque handles to
+state that lives on the other side of the boundary. The .NET embedding supports them in
+host imports, export calls and nested values (lists, records, tuples, options, results and
+variants; not maps). A complete program is in
+[`examples/resources`](https://github.com/bytecodealliance/wasmtime-dotnet/tree/main/examples/resources).
+
+## Host resources
+
+A resource type the host implements is a `ComponentHostResourceType<T>`. Its values are
+ordinary .NET objects of type `T`; the binding keeps the table that maps guest handles to
+them. Define the type in a linker instance under the name the component imports, then
+create, read and claim objects in host functions:
+
+```c#
+var counterType = new ComponentHostResourceType<Counter>(counter => counter.Dispose());
+
+using (var root = linker.Root())
+using (var host = root.AddInstance("host"))
+{
+    host.DefineResource("counter", counterType);
+
+    // A callback result always moves the object to the guest.
+    host.DefineFunction("[constructor]counter", (args, results) =>
+        results[0] = ComponentValue.Resource(counterType, new Counter(args[0].AsU32())));
+
+    // `self` is a borrow: a view of the object for the duration of the callback.
+    host.DefineFunction("[method]counter.get", (args, results) =>
+        results[0] = ComponentValue.U32(args[0].AsHostResource(counterType).Value));
+
+    // An owned argument: TakeHostResource claims it, so no destructor runs for it.
+    host.DefineFunction("consume", (args, results) =>
+        results[0] = ComponentValue.U32(args[0].TakeHostResource(counterType).Value));
+}
+```
+
+The destructor passed to the type runs exactly once for each object a guest owns and gives
+up: when the guest drops its handle, when a callback ends without claiming an owned
+argument, or when `Store.ReleaseComponentResources` runs. It runs on the thread running the
+WebAssembly code, and never for objects the host owns.
+
+## Own and borrow
+
+`own<T>` moves an object between the host and the guest; `borrow<T>` lends it for one call.
+
+- `ComponentValue.Resource(type, value)` takes the ownership from the parameter or result it
+  lands in. `ComponentValue.Own(type, value)` and `ComponentValue.Borrow(type, value)` state
+  it, and the binding checks the statement against the function's type before calling.
+- Passing an object to an `own` parameter of an export moves it into the guest, and the
+  guest's eventual drop runs the destructor. An object can be owned by one guest at a time,
+  in any Store; a second move throws before the call.
+- Passing it to a `borrow` parameter lends it: the host still owns it after the call.
+- An `own` result of an export moves the object back to the host. The binding no longer
+  tracks it, so `AsHostResource` (or `TakeHostResource`) simply returns it.
+
+Every resource position of an export call is validated, at every nesting level, before
+anything reaches Wasmtime. A mistake throws a .NET exception and leaves the Store usable.
+
+## Views and Take
+
+Resource arguments of a host callback are _views_:
+
+- `AsHostResource` (host objects) and `AsResource` (other handles) return the value without
+  taking ownership. A view expires when the callback returns; using it afterwards throws
+  `ObjectDisposedException`.
+- `TakeHostResource` and `TakeResource` claim an `own` argument. The host then owns the object
+  (or the `ComponentResource` handle) and decides what happens to it.
+- An `own` argument that is neither taken nor passed back to the guest in the callback's
+  results is released when the callback ends: a host object's destructor runs, and a native
+  handle is dropped. Reading an argument with `AsHostResource` and keeping the object does
+  not claim it.
+
+## Guest and other native resources
+
+Resources that this binding did not define, such as a guest's own resource types, WASI
+streams or `DefineUnknownImportsAsTraps` stubs, appear as `ComponentResource` handles. Each
+handle owns one native value and ends in exactly one way:
+
+- passed to an `own` parameter or returned as an `own` result (`State` becomes `Transferred`);
+- `Drop()`, which drops it now and runs the guest's destructor. It throws if the handle is not
+  live, inside a host callback, or while another component operation is in progress on the
+  Store;
+- `Dispose()`, which never throws for state reasons: it drops now when that is safe and
+  otherwise marks the handle `DropPending`. Pending drops run in
+  `Store.FlushComponentResources()` or `Store.ReleaseComponentResources()`, never inside an
+  unrelated call;
+- the Store's teardown, which only frees native memory.
+
+`ComponentValue.DisposeResources()` disposes every handle in a value tree, for example the
+elements of a `list<own<widget>>` result. A handle finalized while still owned frees its
+memory but leaves the resource allocated in the Store (`ComponentResourceStatistics.LeakedHandles`).
+
+## Tearing down a Store
+
+`Store.Dispose()` runs no destructors and no guest code. When host objects that guests still
+own need deterministic cleanup, call `Store.ReleaseComponentResources()` first: it runs
+pending drops and then the destructor of every host object a guest still owns, throwing an
+`AggregateException` if any of them fail. Afterwards the Store accepts no further component
+operations. `Store.GetComponentResourceStatistics()` reports what is still held, lent or
+pending.

@@ -383,5 +383,52 @@ namespace Wasmtime.Tests
                 result[i].Field("name").AsString().Should().Be($"item-{i}");
             }
         }
+
+        /// <summary>
+        /// A resource slot built the way export arguments are (<c>host_new</c> + <c>host_to_any</c>) must
+        /// survive Wasmtime's own deep copy and deletion, which walk it with Wasmtime's layout.
+        /// </summary>
+        [Fact]
+        public void ResourceSlotRoundTripsThroughValClone()
+        {
+            using var engine = new Engine(new Config().WithComponentModel(true));
+            using var store = new Store(engine);
+
+            var host = ComponentResourceNative.wasmtime_component_resource_host_new(true, 7, 0x7FFF_0001);
+            var error = ComponentResourceNative.wasmtime_component_resource_host_to_any(
+                store.Context.handle, host, out var any);
+            ComponentResourceNative.wasmtime_component_resource_host_delete(host);
+            error.Should().Be(IntPtr.Zero);
+
+            var source = Marshal.AllocHGlobal(ComponentValueMarshaller.ValueSize);
+            var destination = Marshal.AllocHGlobal(ComponentValueMarshaller.ValueSize);
+            try
+            {
+                unsafe
+                {
+                    new Span<byte>((void*)source, ComponentValueMarshaller.ValueSize).Clear();
+                    new Span<byte>((void*)destination, ComponentValueMarshaller.ValueSize).Clear();
+                }
+
+                ResourceMarshalling.WriteResource(source, any);
+                ComponentValueNative.wasmtime_component_val_clone(source, destination);
+
+                Marshal.ReadByte(destination).Should().Be((byte)ComponentValueKind.Resource);
+                var cloned = Marshal.ReadIntPtr(destination + ComponentValueMarshaller.ValuePayloadOffset);
+                cloned.Should().NotBe(IntPtr.Zero);
+                cloned.Should().NotBe(any);
+                ComponentResourceNative.wasmtime_component_resource_any_owned(cloned).Should().BeTrue();
+            }
+            finally
+            {
+                // Each slot owns its own box.
+                ComponentValueNative.wasmtime_component_val_delete(source);
+                ComponentValueNative.wasmtime_component_val_delete(destination);
+                Marshal.FreeHGlobal(source);
+                Marshal.FreeHGlobal(destination);
+            }
+
+            GC.KeepAlive(store);
+        }
     }
 }
